@@ -69,9 +69,9 @@ async function invoke(
   return envelope(await adapter.call(`localink.${name}`, args));
 }
 
-test('tool registry is exact 21 with centralized conservative annotations and no public env', () => {
-  assert.equal(TOOL_NAMES.length, 21);
-  assert.equal(new Set(TOOL_NAMES).size, 21);
+test('tool registry is exact 26 with centralized conservative annotations and no public env', () => {
+  assert.equal(TOOL_NAMES.length, 26);
+  assert.equal(new Set(TOOL_NAMES).size, 26);
   assert.equal(toolAnnotations['localink.files_read_many'].readOnlyHint, true);
   assert.equal(toolAnnotations['localink.files_archive'].destructiveHint, true);
   assert.equal(toolAnnotations['localink.files_archive'].openWorldHint, false);
@@ -338,7 +338,7 @@ test('runtime close terminates managed children deterministically', async () => 
   }
 });
 
-test('official SDK stdio and HTTP expose and call the same exact 21 product tools', async (t) => {
+test('official SDK stdio and HTTP expose and call the same exact 26 product tools', async (t) => {
   const root = await mkdtemp(path.join(tmpdir(), 'localink-product-native-'));
   const stateRoot = path.join(root, 'state');
   const workspaceRoot = path.join(root, 'workspace');

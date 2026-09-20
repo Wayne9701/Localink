@@ -21,7 +21,7 @@ import {
 } from './helpers.js';
 
 test(
-  'stdio: official client initialize, exact 21 tools, all policy/registry/error/bounding paths, clean exit',
+  'stdio: official client initialize, exact 26 tools, all policy/registry/error/bounding paths, clean exit',
   { timeout: 20_000 },
   async (t) => {
     const connection = await fixtureStdioClient();
@@ -221,7 +221,7 @@ test(
 );
 
 test(
-  'stdio product entrypoint exposes exact 21 tools with real runtime health',
+  'stdio product entrypoint exposes exact 26 tools with real runtime health',
   { timeout: 15_000 },
   async (t) => {
     const connection = await stdioClient(true);

@@ -15,6 +15,7 @@ import {
   fixtureToolSchemas,
   INPUT_LIMIT_BYTES,
   PUBLIC_FILE_LIMITS,
+  PUBLIC_GIT_LIMITS,
   PUBLIC_PROCESS_LIMITS,
   toolSchemas,
   type ToolName,
@@ -100,7 +101,11 @@ export class PublicAdapter {
       );
     }
     try {
-      if (Buffer.byteLength(JSON.stringify(args) ?? '') > INPUT_LIMIT_BYTES) {
+      const inputLimit =
+        name === 'localink.git_apply_patch'
+          ? PUBLIC_GIT_LIMITS.patchBytes + 4096
+          : INPUT_LIMIT_BYTES;
+      if (Buffer.byteLength(JSON.stringify(args) ?? '') > inputLimit) {
         throw new LocalinkError('SIZE_LIMIT_EXCEEDED', 'Input too large.');
       }
       const result = await this.dispatch(name as ToolName, args ?? {});
@@ -375,6 +380,64 @@ export class PublicAdapter {
           result.data.graceMs,
           result.data.forceKill,
         );
+      }
+      case 'localink.git_inspect': {
+        const result = toolSchemas[name].safeParse(args);
+        if (!result.success) invalidInput();
+        return nativeRuntime(this.runtime).git.inspect(
+          result.data.workspaceId,
+          result.data.repoPath,
+        );
+      }
+      case 'localink.git_status': {
+        const result = toolSchemas[name].safeParse(args);
+        if (!result.success) invalidInput();
+        return nativeRuntime(this.runtime).git.status(
+          result.data.workspaceId,
+          result.data.repoPath,
+          result.data.limit ?? PUBLIC_GIT_LIMITS.defaultStatusEntries,
+        );
+      }
+      case 'localink.git_diff': {
+        const result = toolSchemas[name].safeParse(args);
+        if (!result.success) invalidInput();
+        return nativeRuntime(this.runtime).git.diff({
+          workspaceId: result.data.workspaceId,
+          scope: result.data.scope,
+          ...(result.data.repoPath === undefined
+            ? {}
+            : { repoPath: result.data.repoPath }),
+          ...(result.data.paths === undefined
+            ? {}
+            : { paths: result.data.paths }),
+          ...(result.data.contextLines === undefined
+            ? {}
+            : { contextLines: result.data.contextLines }),
+          ...(result.data.maxBytes === undefined
+            ? {}
+            : { maxBytes: result.data.maxBytes }),
+        });
+      }
+      case 'localink.git_log': {
+        const result = toolSchemas[name].safeParse(args);
+        if (!result.success) invalidInput();
+        return nativeRuntime(this.runtime).git.log(
+          result.data.workspaceId,
+          result.data.repoPath,
+          result.data.limit ?? PUBLIC_GIT_LIMITS.defaultLogEntries,
+        );
+      }
+      case 'localink.git_apply_patch': {
+        const result = toolSchemas[name].safeParse(args);
+        if (!result.success) invalidInput();
+        return nativeRuntime(this.runtime).git.applyPatch({
+          workspaceId: result.data.workspaceId,
+          patch: result.data.patch,
+          expectedHead: result.data.expectedHead,
+          ...(result.data.repoPath === undefined
+            ? {}
+            : { repoPath: result.data.repoPath }),
+        });
       }
     }
   }

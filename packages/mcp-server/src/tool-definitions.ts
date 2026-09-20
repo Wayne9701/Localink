@@ -18,6 +18,16 @@ export const PUBLIC_PROCESS_LIMITS = {
   defaultOutputBytes: 64 * 1024,
   hardOutputBytes: 512 * 1024,
 } as const;
+export const PUBLIC_GIT_LIMITS = {
+  defaultStatusEntries: 200,
+  hardStatusEntries: 500,
+  defaultDiffBytes: 128 * 1024,
+  hardDiffBytes: 256 * 1024,
+  defaultLogEntries: 20,
+  hardLogEntries: 50,
+  patchBytes: 256 * 1024,
+  paths: 20,
+} as const;
 
 const id = z
   .string()
@@ -33,6 +43,17 @@ const relativePath = z
   .string()
   .max(4096)
   .refine((value) => !value.includes('\0'));
+const gitPath = relativePath.refine(
+  (value) =>
+    value.length > 0 &&
+    !value.startsWith('/') &&
+    !value.startsWith('\\') &&
+    !value.split(/[\\/]+/u).includes('..'),
+);
+const gitBase = {
+  workspaceId,
+  repoPath: relativePath.optional(),
+};
 const search = z.strictObject({
   query: z.string().max(256).optional(),
   limit: z.number().int().min(1).max(50).optional(),
@@ -179,6 +200,48 @@ export const toolSchemas = {
     graceMs: z.number().int().min(0).max(30_000).optional(),
     forceKill: z.boolean().optional(),
   }),
+  'localink.git_inspect': z.strictObject(gitBase),
+  'localink.git_status': z.strictObject({
+    ...gitBase,
+    limit: z
+      .number()
+      .int()
+      .min(1)
+      .max(PUBLIC_GIT_LIMITS.hardStatusEntries)
+      .optional(),
+  }),
+  'localink.git_diff': z.strictObject({
+    ...gitBase,
+    scope: z.enum(['worktree', 'staged']),
+    paths: z.array(gitPath).min(1).max(PUBLIC_GIT_LIMITS.paths).optional(),
+    contextLines: z.number().int().min(0).max(20).optional(),
+    maxBytes: z
+      .number()
+      .int()
+      .min(1)
+      .max(PUBLIC_GIT_LIMITS.hardDiffBytes)
+      .optional(),
+  }),
+  'localink.git_log': z.strictObject({
+    ...gitBase,
+    limit: z
+      .number()
+      .int()
+      .min(1)
+      .max(PUBLIC_GIT_LIMITS.hardLogEntries)
+      .optional(),
+  }),
+  'localink.git_apply_patch': z.strictObject({
+    ...gitBase,
+    patch: z
+      .string()
+      .min(1)
+      .refine(
+        (value) =>
+          Buffer.byteLength(value, 'utf8') <= PUBLIC_GIT_LIMITS.patchBytes,
+      ),
+    expectedHead: z.string().regex(/^[a-f0-9]{40,64}$/u),
+  }),
 } as const;
 
 export const fixtureToolSchemas = {
@@ -226,6 +289,16 @@ export const toolDescriptions: Record<ToolName, string> = {
   'localink.process_poll': 'Poll a managed process receipt.',
   'localink.process_input': 'Write bounded input to a managed host process.',
   'localink.process_stop': 'Stop a managed host process.',
+  'localink.git_inspect':
+    'Inspect a workspace-bound non-bare Git repository without exposing host paths or remotes.',
+  'localink.git_status':
+    'Read bounded structured Git working-tree and index status.',
+  'localink.git_diff':
+    'Read a bounded current worktree or staged Git diff without revision arguments.',
+  'localink.git_log':
+    'Read bounded structured current-HEAD Git history without email or commit body.',
+  'localink.git_apply_patch':
+    'Apply one checked, workspace-bound text patch with an exact HEAD precondition and verification receipt.',
 };
 
 const READ_ONLY = new Set<ToolName>([
@@ -241,6 +314,10 @@ const READ_ONLY = new Set<ToolName>([
   'localink.files_inspect_many',
   'localink.files_search',
   'localink.process_poll',
+  'localink.git_inspect',
+  'localink.git_status',
+  'localink.git_diff',
+  'localink.git_log',
 ]);
 const PROCESS = new Set<ToolName>([
   'localink.process_exec',

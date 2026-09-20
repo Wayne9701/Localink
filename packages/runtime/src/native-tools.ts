@@ -1,3 +1,4 @@
+import { GitService } from '@localink/core';
 import type {
   FilesService,
   PreciseEditInput,
@@ -89,6 +90,7 @@ function publicProcess(
 export class NativeToolFacade {
   readonly #getProcessPolicy: () => ProcessPolicy;
   readonly #environment: NodeJS.ProcessEnv;
+  readonly git: GitService;
 
   constructor(
     readonly workspaces: WorkspaceRegistry,
@@ -99,6 +101,7 @@ export class NativeToolFacade {
   ) {
     this.#getProcessPolicy = getProcessPolicy;
     this.#environment = environment;
+    this.git = new GitService(workspaces);
   }
 
   workspaceList(): PublicWorkspace[] {

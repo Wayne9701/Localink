@@ -4,6 +4,7 @@ export * from './config/config-store.js';
 export * from './contracts/validation.js';
 export * from './config/state-paths.js';
 export * from './files/files-service.js';
+export * from './git/git-service.js';
 export * from './modules/module-registry.js';
 export * from './policy/policy-engine.js';
 export * from './process/process-manager.js';
