@@ -1,0 +1,13 @@
+{
+  "name": "@localink/cli",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "bin": {
+    "localink": "./dist/src/cli.js"
+  },
+  "dependencies": {
+    "@localink/core": "0.1.0",
+    "@localink/sdk": "0.1.0"
+  }
+}

@@ -1,0 +1,23 @@
+{
+  "files": [],
+  "references": [
+    {
+      "path": "./packages/sdk"
+    },
+    {
+      "path": "./packages/core"
+    },
+    {
+      "path": "./packages/cli"
+    },
+    {
+      "path": "./packages/mcp-server"
+    },
+    {
+      "path": "./transports/openai-tunnel"
+    },
+    {
+      "path": "./packages/service"
+    }
+  ]
+}

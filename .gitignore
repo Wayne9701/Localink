@@ -1,0 +1,15 @@
+node_modules/
+**/dist/
+*.tsbuildinfo
+.DS_Store
+.localink/
+coverage/
+*.log
+*.tmp
+.env
+.env.*
+*.pem
+*.p8
+*.key
+credentials*.json
+token*.json

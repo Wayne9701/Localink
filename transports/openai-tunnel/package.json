@@ -1,0 +1,13 @@
+{
+  "name": "@localink/openai-tunnel",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Localink OpenAI Secure MCP Tunnel adapter contract",
+  "exports": "./dist/src/index.js",
+  "types": "./dist/src/index.d.ts",
+  "dependencies": {
+    "@localink/core": "0.1.0",
+    "@localink/sdk": "0.1.0"
+  }
+}
