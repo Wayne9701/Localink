@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
+import { createLocalinkRuntime } from '@localink/runtime';
 
 const cliEntry = fileURLToPath(new URL('../src/cli.js', import.meta.url));
 
@@ -79,6 +80,56 @@ test('CLI persists workspace identity across separate add/list/inspect/remove pr
 
     const empty = await runCli(stateRoot, ['workspace', 'list', '--json']);
     assert.deepEqual(empty.workspaces, []);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('CLI process policy is disabled by default and persists explicit enable/disable with warning', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'localink-cli-policy-'));
+  try {
+    const stateRoot = path.join(root, 'state');
+    assert.deepEqual(await runCli(stateRoot, ['process', 'policy', '--json']), {
+      policy: { version: 1, enabled: false },
+    });
+    const enabled = await runCli(stateRoot, ['process', 'enable', '--json']);
+    assert.deepEqual(enabled.policy, { version: 1, enabled: true });
+    assert.equal(
+      (enabled.warning as Record<string, unknown>).hostProcessExecution,
+      true,
+    );
+    assert.equal(
+      (enabled.warning as Record<string, unknown>).workspaceCwdIsOsSandbox,
+      false,
+    );
+    assert.deepEqual(await runCli(stateRoot, ['process', 'policy', '--json']), {
+      policy: { version: 1, enabled: true },
+    });
+    const workspaceRoot = path.join(root, 'workspace');
+    await mkdir(workspaceRoot);
+    const added = await runCli(stateRoot, [
+      'workspace',
+      'add',
+      'process-test',
+      workspaceRoot,
+      '--json',
+    ]);
+    const runtime = await createLocalinkRuntime({ stateRoot });
+    const receipt = await runtime.native.processExec({
+      workspaceId: String(added.id),
+      command: process.execPath,
+      args: ['-e', "process.stdout.write('cli-enabled')"],
+      timeoutMs: 10_000,
+    });
+    assert.equal(receipt.exitCode, 0);
+    assert.equal(receipt.stdout.text, 'cli-enabled');
+    await runtime.close();
+    assert.deepEqual(
+      await runCli(stateRoot, ['process', 'disable', '--json']),
+      {
+        policy: { version: 1, enabled: false },
+      },
+    );
   } finally {
     await rm(root, { recursive: true, force: true });
   }

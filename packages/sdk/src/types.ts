@@ -108,6 +108,7 @@ export interface ExecInput {
   workspaceId: string;
   cwd?: string;
   env?: Record<string, string>;
+  inheritEnv?: boolean;
   timeoutMs?: number;
   maxOutputBytes?: number;
 }

@@ -101,6 +101,9 @@ function delay(milliseconds: number): Promise<void> {
 export class ProcessManager {
   readonly #workspaces: WorkspaceRegistry;
   readonly #processes = new Map<string, ManagedProcess>();
+  readonly #pendingSpawns = new Set<Promise<ManagedProcess>>();
+  #closing: Promise<void> | undefined;
+  #closed = false;
 
   constructor(workspaces: WorkspaceRegistry) {
     this.#workspaces = workspaces;
@@ -188,7 +191,63 @@ export class ProcessManager {
     return this.#receipt(managed);
   }
 
-  async #spawn(input: ExecInput): Promise<ManagedProcess> {
+  list(): ProcessReceipt[] {
+    return [...this.#processes.values()].map((managed) =>
+      this.#receipt(managed),
+    );
+  }
+
+  stopAll(graceMs: number = DEFAULT_STOP_GRACE_MS): Promise<void> {
+    return Promise.all(
+      [...this.#processes.values()]
+        .filter((managed) => managed.state === 'running')
+        .map((managed) =>
+          this.stop({
+            processId: managed.processId,
+            graceMs,
+            forceKill: true,
+          }),
+        ),
+    ).then(() => {
+      if (
+        [...this.#processes.values()].some(
+          (managed) => managed.state === 'running',
+        )
+      ) {
+        throw new LocalinkError(
+          'IO_ERROR',
+          'One or more managed processes did not stop within the close bound.',
+        );
+      }
+    });
+  }
+
+  close(): Promise<void> {
+    this.#closed = true;
+    this.#closing ??= (async () => {
+      await Promise.allSettled([...this.#pendingSpawns]);
+      await this.stopAll();
+      this.#processes.clear();
+    })();
+    return this.#closing;
+  }
+
+  #spawn(input: ExecInput): Promise<ManagedProcess> {
+    if (this.#closed) {
+      return Promise.reject(
+        new LocalinkError('IO_ERROR', 'Process manager is closed.'),
+      );
+    }
+    const pending = this.#spawnManaged(input);
+    this.#pendingSpawns.add(pending);
+    void pending.then(
+      () => this.#pendingSpawns.delete(pending),
+      () => this.#pendingSpawns.delete(pending),
+    );
+    return pending;
+  }
+
+  async #spawnManaged(input: ExecInput): Promise<ManagedProcess> {
     assertInput(input);
     const limit = outputLimit(input);
     const cwd = await this.#workspaces.resolveCwd(
@@ -197,7 +256,10 @@ export class ProcessManager {
     );
     const child = spawn(input.command, input.args ?? [], {
       cwd,
-      env: { ...process.env, ...input.env },
+      env:
+        input.inheritEnv === false
+          ? input.env
+          : { ...process.env, ...input.env },
       shell: false,
       stdio: ['pipe', 'pipe', 'pipe'],
     });

@@ -43,6 +43,7 @@ test('fresh runtime persists stable canonical workspace identity across restart 
       capabilityCount: 0,
       skillCount: 0,
       state: { ready: true, schemaVersion: 1 },
+      processPolicy: { enabled: false, shell: false, osSandbox: false },
     });
     const added = await first.addWorkspace('primary', workspaceInput);
     assert.equal(added.root, await realpath(workspaceRoot));
@@ -214,5 +215,31 @@ test('environment state root is honored and health never exposes private paths',
     assert.equal(JSON.stringify(await runtime.health()).includes(root), false);
     await runtime.close();
     assert.equal((await runtime.health()).state.ready, false);
+  });
+});
+
+test('process policy defaults disabled, validates schema, and persists across runtime restart', async () => {
+  await withTemp(async (root) => {
+    const stateRoot = path.join(root, 'state');
+    const first = await createLocalinkRuntime({ stateRoot });
+    assert.deepEqual(first.processPolicy(), { version: 1, enabled: false });
+    assert.deepEqual(await first.setProcessEnabled(true), {
+      version: 1,
+      enabled: true,
+    });
+    await first.close();
+
+    const restarted = await createLocalinkRuntime({ stateRoot });
+    assert.deepEqual(restarted.processPolicy(), { version: 1, enabled: true });
+    await restarted.close();
+
+    await writeFile(
+      path.join(stateRoot, 'config', 'process-policy.json'),
+      JSON.stringify({ version: 2, enabled: true }),
+    );
+    await assert.rejects(
+      createLocalinkRuntime({ stateRoot }),
+      hasCode('CONFIG_INVALID'),
+    );
   });
 });

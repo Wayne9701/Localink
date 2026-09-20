@@ -14,9 +14,35 @@ import type { PublicRuntime } from './runtime.js';
 import {
   fixtureToolSchemas,
   INPUT_LIMIT_BYTES,
+  PUBLIC_FILE_LIMITS,
+  PUBLIC_PROCESS_LIMITS,
   toolSchemas,
   type ToolName,
 } from './tool-definitions.js';
+
+function nativeRuntime(runtime: PublicRuntime) {
+  if (runtime.native === undefined) {
+    throw new LocalinkError(
+      'CAPABILITY_UNAVAILABLE',
+      'Native tools are unavailable in this explicit fixture runtime.',
+    );
+  }
+  return runtime.native;
+}
+
+async function itemResult<T>(
+  path: string,
+  operation: () => Promise<T>,
+): Promise<
+  | { path: string; ok: true; value: T }
+  | { path: string; ok: false; error: ReturnType<typeof publicError> }
+> {
+  try {
+    return { path, ok: true, value: await operation() };
+  } catch (error) {
+    return { path, ok: false, error: publicError(error) };
+  }
+}
 
 function capabilityMetadata(item: CapabilityDescriptor): CapabilityDescriptor {
   // Explicit V1 projection: runtime-only extensions must never become public.
@@ -155,6 +181,200 @@ export class PublicAdapter {
             result.data.maxBytes ?? 8192,
           ),
         };
+      }
+      case 'localink.workspace_list': {
+        if (!toolSchemas[name].safeParse(args).success) invalidInput();
+        return { workspaces: nativeRuntime(this.runtime).workspaceList() };
+      }
+      case 'localink.workspace_inspect': {
+        const result = toolSchemas[name].safeParse(args);
+        if (!result.success) invalidInput();
+        return nativeRuntime(this.runtime).workspaceInspect(
+          result.data.workspaceId,
+        );
+      }
+      case 'localink.files_list': {
+        const result = toolSchemas[name].safeParse(args);
+        if (!result.success) invalidInput();
+        const { workspaceId, relativePath, limit } = result.data;
+        return nativeRuntime(this.runtime).files.list(
+          workspaceId,
+          relativePath ?? '',
+          limit,
+        );
+      }
+      case 'localink.files_read_many': {
+        const result = toolSchemas[name].safeParse(args);
+        if (!result.success) invalidInput();
+        const native = nativeRuntime(this.runtime);
+        const maxBytes =
+          result.data.maxBytesPerFile ?? PUBLIC_FILE_LIMITS.defaultReadBytes;
+        return {
+          items: await Promise.all(
+            result.data.paths.map((path) =>
+              itemResult(path, () =>
+                native.files.readText(result.data.workspaceId, path, maxBytes),
+              ),
+            ),
+          ),
+        };
+      }
+      case 'localink.files_inspect_many': {
+        const result = toolSchemas[name].safeParse(args);
+        if (!result.success) invalidInput();
+        const native = nativeRuntime(this.runtime);
+        return {
+          items: await Promise.all(
+            result.data.paths.map((path) =>
+              itemResult(path, async () => {
+                const entry = await native.files.inspect(
+                  result.data.workspaceId,
+                  path,
+                );
+                if (result.data.includeSha256 !== true || entry.kind !== 'file')
+                  return entry;
+                if (entry.size > PUBLIC_FILE_LIMITS.hardReadBytes) {
+                  throw new LocalinkError(
+                    'SIZE_LIMIT_EXCEEDED',
+                    'File exceeds the public inspect hash bound.',
+                  );
+                }
+                return {
+                  ...entry,
+                  sha256: await native.files.sha256(
+                    result.data.workspaceId,
+                    path,
+                  ),
+                };
+              }),
+            ),
+          ),
+        };
+      }
+      case 'localink.files_search': {
+        const result = toolSchemas[name].safeParse(args);
+        if (!result.success) invalidInput();
+        const { workspaceId, query, mode, relativePath, maxMatches } =
+          result.data;
+        const options = {
+          ...(relativePath === undefined ? {} : { relativePath }),
+          maxMatches: maxMatches ?? PUBLIC_FILE_LIMITS.searchMatches,
+        };
+        const files = nativeRuntime(this.runtime).files;
+        return mode === 'path'
+          ? files.searchPaths(workspaceId, query, options)
+          : files.searchContent(workspaceId, query, options);
+      }
+      case 'localink.files_create_text': {
+        const result = toolSchemas[name].safeParse(args);
+        if (!result.success) invalidInput();
+        return nativeRuntime(this.runtime).files.createText(
+          result.data.workspaceId,
+          result.data.relativePath,
+          result.data.text,
+        );
+      }
+      case 'localink.files_precise_edit': {
+        const result = toolSchemas[name].safeParse(args);
+        if (!result.success) invalidInput();
+        return nativeRuntime(this.runtime).preciseEdit({
+          workspaceId: result.data.workspaceId,
+          relativePath: result.data.relativePath,
+          expectedText: result.data.expectedText,
+          replacementText: result.data.replacementText,
+          ...(result.data.expectedSha256 === undefined
+            ? {}
+            : { expectedSha256: result.data.expectedSha256 }),
+          ...(result.data.expectedOccurrences === undefined
+            ? {}
+            : { expectedOccurrences: result.data.expectedOccurrences }),
+        });
+      }
+      case 'localink.files_move': {
+        const result = toolSchemas[name].safeParse(args);
+        if (!result.success) invalidInput();
+        return nativeRuntime(this.runtime).files.move(
+          result.data.workspaceId,
+          result.data.sourceRelativePath,
+          result.data.destinationRelativePath,
+        );
+      }
+      case 'localink.files_archive': {
+        const result = toolSchemas[name].safeParse(args);
+        if (!result.success) invalidInput();
+        const receipt = await nativeRuntime(this.runtime).files.archive(
+          result.data.workspaceId,
+          result.data.relativePath,
+        );
+        return {
+          workspaceId: receipt.workspaceId,
+          originalRelativePath: receipt.originalRelativePath,
+          byteLength: receipt.byteLength,
+          sha256: receipt.sha256,
+          movedAt: receipt.movedAt,
+          crossDeviceFallback: receipt.crossDeviceFallback,
+          archived: true,
+        };
+      }
+      case 'localink.process_exec': {
+        const result = toolSchemas[name].safeParse(args);
+        if (!result.success) invalidInput();
+        return nativeRuntime(this.runtime).processExec({
+          workspaceId: result.data.workspaceId,
+          command: result.data.command,
+          ...(result.data.args === undefined ? {} : { args: result.data.args }),
+          ...(result.data.cwd === undefined ? {} : { cwd: result.data.cwd }),
+          timeoutMs:
+            result.data.timeoutMs ?? PUBLIC_PROCESS_LIMITS.defaultExecTimeoutMs,
+          maxOutputBytes:
+            result.data.maxOutputBytes ??
+            PUBLIC_PROCESS_LIMITS.defaultOutputBytes,
+        });
+      }
+      case 'localink.process_start': {
+        const result = toolSchemas[name].safeParse(args);
+        if (!result.success) invalidInput();
+        return nativeRuntime(this.runtime).processStart({
+          workspaceId: result.data.workspaceId,
+          command: result.data.command,
+          ...(result.data.args === undefined ? {} : { args: result.data.args }),
+          ...(result.data.cwd === undefined ? {} : { cwd: result.data.cwd }),
+          ...(result.data.timeoutMs === undefined
+            ? {}
+            : { timeoutMs: result.data.timeoutMs }),
+          ...(result.data.killOnTimeout === undefined
+            ? {}
+            : { killOnTimeout: result.data.killOnTimeout }),
+          maxOutputBytes:
+            result.data.maxOutputBytes ??
+            PUBLIC_PROCESS_LIMITS.defaultOutputBytes,
+        });
+      }
+      case 'localink.process_poll': {
+        const result = toolSchemas[name].safeParse(args);
+        if (!result.success) invalidInput();
+        return nativeRuntime(this.runtime).processPoll(result.data.processId);
+      }
+      case 'localink.process_input': {
+        const result = toolSchemas[name].safeParse(args);
+        if (
+          !result.success ||
+          Buffer.byteLength(result.data.data) > PUBLIC_PROCESS_LIMITS.inputBytes
+        )
+          invalidInput();
+        return nativeRuntime(this.runtime).processInput(
+          result.data.processId,
+          result.data.data,
+        );
+      }
+      case 'localink.process_stop': {
+        const result = toolSchemas[name].safeParse(args);
+        if (!result.success) invalidInput();
+        return nativeRuntime(this.runtime).processStop(
+          result.data.processId,
+          result.data.graceMs,
+          result.data.forceKill,
+        );
       }
     }
   }

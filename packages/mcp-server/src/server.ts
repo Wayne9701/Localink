@@ -4,6 +4,7 @@ import type { PublicRuntime } from './runtime.js';
 import {
   fixtureToolSchemas,
   TOOL_NAMES,
+  toolAnnotations,
   toolDescriptions,
   toolSchemas,
 } from './tool-definitions.js';
@@ -30,10 +31,7 @@ export function createPublicServer(
       {
         description: toolDescriptions[name],
         inputSchema: schemas[name],
-        annotations: {
-          readOnlyHint: name !== 'localink.capability_invoke',
-          openWorldHint: false,
-        },
+        annotations: toolAnnotations[name],
       },
       (args: unknown) => adapter.call(name, args),
     );

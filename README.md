@@ -15,6 +15,8 @@ Implemented and retained:
 - macOS service / recovery foundation;
 - process-scoped real runtime assembly;
 - persistent workspace identity shared by CLI and MCP product entrypoints;
+- 21 bounded ChatGPT-facing Workspace, Files, Process, registry and Skill tools;
+- persistent local-admin Process policy, disabled by default;
 - deterministic tests and portability checks.
 
 Platform integrations such as Lark, BigQuery and Bilibili are external Shared MCP assets. Localink may bridge them for ChatGPT, but does not own or reimplement their platform business logic.
@@ -57,11 +59,21 @@ node packages/cli/dist/src/cli.js workspace add <name> <absolute-root> --json
 node packages/cli/dist/src/cli.js workspace list --json
 node packages/cli/dist/src/cli.js workspace inspect <id> --json
 node packages/cli/dist/src/cli.js workspace remove <id> --json
+node packages/cli/dist/src/cli.js process policy --json
+node packages/cli/dist/src/cli.js process enable --json
+node packages/cli/dist/src/cli.js process disable --json
 ```
 
 Workspace configuration defaults to `~/.localink/config/workspaces.json`.
 `LOCALINK_STATE_ROOT` selects an isolated state root for tests or development.
 Each runtime process loads configuration once; live service reload is deferred.
+
+Public Process tools are disabled by default. `process enable` is a persistent
+local-admin gate for host process execution. Localink uses `shell: false` and a
+workspace-bound cwd, but that cwd boundary is not an OS sandbox: an executable
+can still access resources outside the workspace. Public Process schemas do not
+accept environment variables and children receive only a small non-sensitive
+environment allowlist.
 
 ## Tool-surface principle
 

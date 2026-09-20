@@ -3,7 +3,7 @@ import { mkdir } from 'node:fs/promises';
 import path from 'node:path';
 import test from 'node:test';
 import { LocalinkError, type ProcessReceipt } from '@localink/sdk';
-import { ProcessManager } from '../src/index.js';
+import { ProcessManager, WorkspaceRegistry } from '../src/index.js';
 import { withFixture } from './helpers.js';
 
 function hasCode(code: string): (error: unknown) => boolean {
@@ -123,5 +123,62 @@ test('process IDs are local-only and workspace cwd cannot escape', async () => {
       }),
       hasCode('NOT_FOUND'),
     );
+  });
+});
+
+test('process manager close gracefully stops all children and is deterministic', async () => {
+  await withFixture(async ({ workspaces, workspaceId }) => {
+    const processes = new ProcessManager(workspaces);
+    await Promise.all([
+      processes.start({
+        command: process.execPath,
+        args: ['-e', 'setInterval(() => undefined, 1000)'],
+        workspaceId,
+      }),
+      processes.start({
+        command: process.execPath,
+        args: ['-e', 'setInterval(() => undefined, 1000)'],
+        workspaceId,
+      }),
+    ]);
+    assert.equal(processes.list().length, 2);
+    await Promise.all([processes.close(), processes.close()]);
+    assert.deepEqual(processes.list(), []);
+    await assert.rejects(
+      processes.start({ command: process.execPath, workspaceId }),
+      hasCode('IO_ERROR'),
+    );
+  });
+});
+
+test('process manager close waits for an in-flight spawn before cleanup', async () => {
+  await withFixture(async ({ workspaces, workspaceId }) => {
+    let release = (): void => undefined;
+    let entered = (): void => undefined;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const startedResolving = new Promise<void>((resolve) => {
+      entered = resolve;
+    });
+    class DelayedRegistry extends WorkspaceRegistry {
+      override async resolveCwd(id: string, cwd = ''): Promise<string> {
+        entered();
+        await gate;
+        return workspaces.resolveCwd(id, cwd);
+      }
+    }
+    const processes = new ProcessManager(new DelayedRegistry());
+    const starting = processes.start({
+      command: process.execPath,
+      args: ['-e', 'setInterval(() => undefined, 1000)'],
+      workspaceId,
+    });
+    await startedResolving;
+    const closing = processes.close();
+    release();
+    await starting;
+    await closing;
+    assert.deepEqual(processes.list(), []);
   });
 });

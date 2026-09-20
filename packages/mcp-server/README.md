@@ -26,8 +26,8 @@ node packages/mcp-server/dist/src/stdio.js
 
 Use `node` as the host command and the entry path as its argument, with the
 repository as cwd. stdout is protocol-only; errors use fixed, redacted stderr
-messages. EOF, SIGINT and SIGTERM close the connection and runtime. The M1
-public surface does not expose Files or Process tools.
+messages. EOF, SIGINT and SIGTERM close the connection and runtime, including
+managed active child processes.
 
 ## HTTP development
 
@@ -47,18 +47,28 @@ server/adapter over one process-scoped runtime. Runtime state persists across
 requests; caller context does not. There is no persistent MCP session and no
 `Mcp-Session-Id` dependency.
 
-## Public tools: exactly six
+## Public tools: exactly 21
 
-| Tool                           | Input / purpose                                                                  |
-| ------------------------------ | -------------------------------------------------------------------------------- |
-| `localink.health_status`       | `{}`; real runtime readiness and bounded registry counts                         |
-| `localink.capability_search`   | Optional `query` (256 characters), `limit` (1–50, default 20)                    |
-| `localink.capability_describe` | `capabilityId`; projected V1 descriptor                                          |
-| `localink.capability_invoke`   | `capabilityId`, JSON `input`; always invokes through Core                        |
-| `localink.skill_search`        | Same bounded query/limit; Registry assets only                                   |
-| `localink.skill_read`          | `skillId`, optional `maxBytes` (1–16384, default 8192); untrusted asset boundary |
+| Tool                                                       | Input / purpose                                                                           |
+| ---------------------------------------------------------- | ----------------------------------------------------------------------------------------- |
+| `localink.health_status`                                   | `{}`; real runtime readiness and bounded registry counts                                  |
+| `localink.capability_search`                               | Optional `query` (256 characters), `limit` (1–50, default 20)                             |
+| `localink.capability_describe`                             | `capabilityId`; projected V1 descriptor                                                   |
+| `localink.capability_invoke`                               | `capabilityId`, JSON `input`; always invokes through Core                                 |
+| `localink.skill_search`                                    | Same bounded query/limit; Registry assets only                                            |
+| `localink.skill_read`                                      | `skillId`, optional `maxBytes` (1–16384, default 8192); untrusted asset boundary          |
+| `localink.workspace_list` / `workspace_inspect`            | Public-safe metadata; never absolute roots                                                |
+| `localink.files_list`                                      | Bounded workspace-relative directory list                                                 |
+| `localink.files_read_many`                                 | Ordered 1–20 text reads with isolated item errors; 64 KiB default / 256 KiB hard per file |
+| `localink.files_inspect_many`                              | Ordered 1–50 metadata reads; optional hash bounded to 256 KiB files                       |
+| `localink.files_search`                                    | Path or content mode; at most 50 matches                                                  |
+| `localink.files_create_text`                               | No-overwrite create with hash receipt                                                     |
+| `localink.files_precise_edit`                              | Exact occurrence and optional SHA-256 preconditions                                       |
+| `localink.files_move` / `files_archive`                    | No-overwrite move and redacted recoverable archive receipt                                |
+| `localink.process_exec` / `process_start`                  | Local-policy-gated host execution; `shell: false`; no public env input                    |
+| `localink.process_poll` / `process_input` / `process_stop` | Managed process lifecycle                                                                 |
 
-M1 real runtime capability and Skill registries are intentionally empty. The
+M2 real runtime capability and Skill registries are intentionally empty. The
 fixture runtime and synthetic invocation context exist only behind explicit
 test entrypoints. They remain available for policy, identity, verification,
 error, bounding and Skill-contract regression tests and are never selected by a
@@ -87,7 +97,8 @@ npm run test:mcp
 Tests require permission to bind localhost. No public network endpoint is
 needed.
 
-M1 includes **no Secure MCP Tunnel dogfood, live macOS Service, real
-OAuth/Keychain, business Module, production Skill, or public Files/Process/Git
-tools**. Workspace configuration persists for new runtime processes; long-lived
+M2 includes **no Git tools, Secure MCP Tunnel dogfood, live macOS Service,
+External MCP Bridge, Shared Skill filesystem adapter, Installer, Codex Agent,
+Browser, PTY, delete tool, blind replace tool, or batch mutation**. Workspace
+and process-policy configuration persists for new runtime processes; long-lived
 service hot reload and restart orchestration are deferred to M5.

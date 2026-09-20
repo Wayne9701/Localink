@@ -19,16 +19,28 @@ import {
   type WorkspaceConfig,
   validateWorkspaceConfig,
 } from './workspace-config.js';
+import {
+  PROCESS_POLICY_SCHEMA_VERSION,
+  type ProcessPolicy,
+  validateProcessPolicy,
+} from './process-policy.js';
+import { NativeToolFacade } from './native-tools.js';
 
 export interface WorkspaceConfigStore {
   read(): Promise<WorkspaceConfig | undefined>;
   write(value: WorkspaceConfig): Promise<WorkspaceConfig>;
 }
 
+export interface ProcessPolicyStore {
+  read(): Promise<ProcessPolicy | undefined>;
+  write(value: ProcessPolicy): Promise<ProcessPolicy>;
+}
+
 export interface LocalinkRuntimeOptions {
   readonly stateRoot?: string;
   readonly environment?: NodeJS.ProcessEnv;
   readonly workspaceStore?: WorkspaceConfigStore;
+  readonly processPolicyStore?: ProcessPolicyStore;
 }
 
 export interface LocalinkRuntimeHealth {
@@ -40,6 +52,11 @@ export interface LocalinkRuntimeHealth {
   readonly state: {
     readonly ready: boolean;
     readonly schemaVersion: typeof WORKSPACE_SCHEMA_VERSION;
+  };
+  readonly processPolicy: {
+    readonly enabled: boolean;
+    readonly shell: false;
+    readonly osSandbox: false;
   };
 }
 
@@ -65,7 +82,10 @@ export class LocalinkRuntime {
   readonly modules: ModuleRegistry;
   readonly capabilities: CapabilityRegistry;
   readonly skills: SkillRegistry;
+  readonly native: NativeToolFacade;
   readonly #workspaceStore: WorkspaceConfigStore;
+  readonly #processPolicyStore: ProcessPolicyStore;
+  #processPolicy: ProcessPolicy;
   #mutationTail: Promise<void> = Promise.resolve();
   #closed = false;
 
@@ -73,6 +93,9 @@ export class LocalinkRuntime {
     statePaths: StatePaths,
     workspaces: WorkspaceRegistry,
     workspaceStore: WorkspaceConfigStore,
+    processPolicyStore: ProcessPolicyStore,
+    processPolicy: ProcessPolicy,
+    environment: NodeJS.ProcessEnv,
   ) {
     this.statePaths = statePaths;
     this.workspaces = workspaces;
@@ -84,6 +107,15 @@ export class LocalinkRuntime {
     });
     this.skills = new SkillRegistry();
     this.#workspaceStore = workspaceStore;
+    this.#processPolicyStore = processPolicyStore;
+    this.#processPolicy = processPolicy;
+    this.native = new NativeToolFacade(
+      this.workspaces,
+      this.files,
+      this.processes,
+      () => this.processPolicy(),
+      environment,
+    );
   }
 
   static async create(
@@ -93,12 +125,26 @@ export class LocalinkRuntime {
     const workspaceStore =
       options.workspaceStore ??
       new ConfigStore(statePaths, 'workspaces', validateWorkspaceConfig);
+    const processPolicyStore =
+      options.processPolicyStore ??
+      new ConfigStore(statePaths, 'process-policy', validateProcessPolicy);
     const workspaces = new WorkspaceRegistry();
     const config = await workspaceStore.read();
     for (const record of config?.workspaces ?? []) {
       await workspaces.restore(record);
     }
-    return new LocalinkRuntime(statePaths, workspaces, workspaceStore);
+    const processPolicy = (await processPolicyStore.read()) ?? {
+      version: PROCESS_POLICY_SCHEMA_VERSION,
+      enabled: false,
+    };
+    return new LocalinkRuntime(
+      statePaths,
+      workspaces,
+      workspaceStore,
+      processPolicyStore,
+      processPolicy,
+      options.environment ?? process.env,
+    );
   }
 
   async addWorkspace(name: string, root: string): Promise<WorkspaceRecord> {
@@ -137,7 +183,27 @@ export class LocalinkRuntime {
         ready: !this.#closed,
         schemaVersion: WORKSPACE_SCHEMA_VERSION,
       },
+      processPolicy: {
+        enabled: this.#processPolicy.enabled,
+        shell: false,
+        osSandbox: false,
+      },
     };
+  }
+
+  processPolicy(): ProcessPolicy {
+    return { ...this.#processPolicy };
+  }
+
+  async setProcessEnabled(enabled: boolean): Promise<ProcessPolicy> {
+    return this.#mutate(async () => {
+      const policy = await this.#processPolicyStore.write({
+        version: PROCESS_POLICY_SCHEMA_VERSION,
+        enabled,
+      });
+      this.#processPolicy = policy;
+      return { ...policy };
+    });
   }
 
   validateInput(capabilityId: string): void {
@@ -147,6 +213,7 @@ export class LocalinkRuntime {
   async close(): Promise<void> {
     await this.#mutationTail;
     this.#closed = true;
+    await this.processes.close();
   }
 
   async #persist(workspaces: WorkspaceRecord[]): Promise<void> {

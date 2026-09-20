@@ -111,15 +111,24 @@ export async function stdioClient(modern = false) {
   const stateRoot = await mkdtemp(
     path.join(tmpdir(), 'localink-mcp-stdio-state-'),
   );
-  const connection = await connectStdio(stdioEntry, modern, {
-    ...currentEnvironment(),
-    LOCALINK_STATE_ROOT: stateRoot,
-  });
+  const connection = await stdioClientForStateRoot(stateRoot, modern);
   return {
     ...connection,
     stateRoot,
     cleanup: () => rm(stateRoot, { recursive: true, force: true }),
   };
+}
+
+export async function stdioClientForStateRoot(
+  stateRoot: string,
+  modern = false,
+  environment: Record<string, string> = {},
+) {
+  return connectStdio(stdioEntry, modern, {
+    ...currentEnvironment(),
+    ...environment,
+    LOCALINK_STATE_ROOT: stateRoot,
+  });
 }
 
 export async function fixtureStdioClient(modern = false) {

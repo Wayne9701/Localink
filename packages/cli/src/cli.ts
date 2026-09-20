@@ -88,6 +88,28 @@ async function main(): Promise<void> {
       output({ workspaces: runtime.workspaces.list() });
       return;
     }
+    if (args.length === 2 && args[0] === 'process' && args[1] === 'policy') {
+      output({ policy: runtime.processPolicy() });
+      return;
+    }
+    if (args.length === 2 && args[0] === 'process' && args[1] === 'enable') {
+      output({
+        policy: await runtime.setProcessEnabled(true),
+        warning: {
+          hostProcessExecution: true,
+          shell: false,
+          workspaceCwdIsOsSandbox: false,
+          commandMayAccessOutsideWorkspace: true,
+          message:
+            'Enables host process execution. shell remains false, but workspace cwd restriction is not an OS sandbox and commands may access resources outside the workspace.',
+        },
+      });
+      return;
+    }
+    if (args.length === 2 && args[0] === 'process' && args[1] === 'disable') {
+      output({ policy: await runtime.setProcessEnabled(false) });
+      return;
+    }
     if (
       args.length === 3 &&
       args[0] === 'workspace' &&
@@ -108,7 +130,7 @@ async function main(): Promise<void> {
     }
     throw new LocalinkError(
       'INVALID_ARGUMENT',
-      'Usage: localink core self-test --json | runtime health --json | workspace add <name> <absolute-root> --json | workspace list --json | workspace inspect <id> --json | workspace remove <id> --json',
+      'Usage: localink core self-test --json | runtime health --json | workspace add <name> <absolute-root> --json | workspace list --json | workspace inspect <id> --json | workspace remove <id> --json | process policy --json | process enable --json | process disable --json',
     );
   } finally {
     await runtime.close();
