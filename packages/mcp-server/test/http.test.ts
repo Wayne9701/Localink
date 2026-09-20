@@ -1,11 +1,21 @@
 import assert from 'node:assert/strict';
+import { spawn } from 'node:child_process';
 import { createServer } from 'node:net';
 import { request } from 'node:http';
+import { once } from 'node:events';
+import { mkdtemp, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
 import test from 'node:test';
+import { fileURLToPath } from 'node:url';
 import { createFixtureRuntime } from '../src/fixture-runtime.js';
 import { startHttpServer, httpOptionsFromEnv } from '../src/http.js';
 import { PROTOCOL_VERSION } from '../src/server.js';
-import { at, call, httpClient, invoke, stdioClient } from './helpers.js';
+import { at, call, fixtureStdioClient, httpClient, invoke } from './helpers.js';
+
+const httpEntry = fileURLToPath(
+  new URL('../src/http-entry.js', import.meta.url),
+);
 
 test(
   'HTTP: modern per-request adapters, shared app state, isolated context, failures/abort/close and released port',
@@ -31,6 +41,7 @@ test(
           return runtime.health();
         },
       },
+      testFixtureContext: true,
     });
     t.after(async () => {
       release?.();
@@ -41,9 +52,9 @@ test(
     t.after(() => a.client.close());
     const b = await httpClient(listening.url);
     t.after(() => b.client.close());
-    const stdio = await stdioClient();
+    const stdio = await fixtureStdioClient();
     t.after(() => stdio.client.close());
-    assert.equal(a.client.getServerVersion()?.name, 'localink-fixture');
+    assert.equal(a.client.getServerVersion()?.name, 'localink');
     assert.equal(a.transport.protocolVersion, PROTOCOL_VERSION);
     const oversized = await a.client.callTool({
       name: 'localink.capability_invoke',
@@ -240,7 +251,12 @@ test(
       assert.throws(() => httpOptionsFromEnv(env), RangeError);
     }
     assert.deepEqual(httpOptionsFromEnv({}), { host: '127.0.0.1', port: 4318 });
-    const server = await startHttpServer({ port: 0 });
+    const runtime = await createFixtureRuntime();
+    const server = await startHttpServer({
+      port: 0,
+      runtime,
+      testFixtureContext: true,
+    });
     t.after(() => server.close());
     for (const headers of [
       { host: 'example.invalid' },
@@ -296,5 +312,55 @@ test(
       at(await call(client, 'health_status'), 'data', 'mode'),
       'fixture',
     );
+  },
+);
+
+test(
+  'HTTP product entrypoint creates one real process runtime and reports runtime health',
+  { timeout: 15_000 },
+  async (t) => {
+    const stateRoot = await mkdtemp(
+      path.join(tmpdir(), 'localink-http-state-'),
+    );
+    const child = spawn(process.execPath, [httpEntry], {
+      stdio: ['ignore', 'ignore', 'pipe'],
+      env: {
+        ...process.env,
+        LOCALINK_STATE_ROOT: stateRoot,
+        LOCALINK_MCP_PORT: '0',
+      },
+    });
+    t.after(async () => {
+      if (child.exitCode === null && child.signalCode === null) child.kill();
+      await rm(stateRoot, { recursive: true, force: true });
+    });
+    let stderr = '';
+    const url = await new Promise<URL>((resolve, reject) => {
+      const onData = (chunk: Buffer) => {
+        stderr += chunk.toString();
+        const match = stderr.match(
+          /Localink MCP listening at (http:\/\/[^\s]+)/u,
+        );
+        if (match?.[1] !== undefined) resolve(new URL(match[1]));
+      };
+      child.stderr.on('data', onData);
+      child.once('error', reject);
+      child.once('exit', (code) => {
+        reject(new Error(`HTTP entrypoint exited before listening: ${code}`));
+      });
+    });
+    const connection = await httpClient(url);
+    await connection.client.close();
+    const second = await httpClient(url);
+    const health = await call(second.client, 'health_status');
+    assert.equal(second.client.getServerVersion()?.name, 'localink');
+    assert.equal(at(health, 'data', 'mode'), 'runtime');
+    assert.equal(at(health, 'data', 'workspaceCount'), 0);
+    assert.equal(at(health, 'data', 'state', 'ready'), true);
+    assert.equal(JSON.stringify(health).includes(stateRoot), false);
+    await second.client.close();
+    const closed = once(child, 'close');
+    child.kill('SIGTERM');
+    assert.deepEqual(await closed, [0, null]);
   },
 );

@@ -13,6 +13,8 @@ Implemented and retained:
 - MCP stdio / HTTP transport;
 - OpenAI Secure MCP Tunnel adapter foundation;
 - macOS service / recovery foundation;
+- process-scoped real runtime assembly;
+- persistent workspace identity shared by CLI and MCP product entrypoints;
 - deterministic tests and portability checks.
 
 Platform integrations such as Lark, BigQuery and Bilibili are external Shared MCP assets. Localink may bridge them for ChatGPT, but does not own or reimplement their platform business logic.
@@ -36,7 +38,7 @@ npm run check
 The active roadmap still needs design/implementation for:
 
 - Git basics;
-- stronger CLI / doctor;
+- compound doctor;
 - lightweight External MCP Bridge;
 - Shared Skill adapter;
 - live service + tunnel dogfood;
@@ -50,8 +52,16 @@ PTY, browser/UI automation and richer process features are demand-driven rather 
 ```sh
 npm run build
 node packages/cli/dist/src/cli.js core self-test --json
+node packages/cli/dist/src/cli.js runtime health --json
+node packages/cli/dist/src/cli.js workspace add <name> <absolute-root> --json
 node packages/cli/dist/src/cli.js workspace list --json
+node packages/cli/dist/src/cli.js workspace inspect <id> --json
+node packages/cli/dist/src/cli.js workspace remove <id> --json
 ```
+
+Workspace configuration defaults to `~/.localink/config/workspaces.json`.
+`LOCALINK_STATE_ROOT` selects an isolated state root for tests or development.
+Each runtime process loads configuration once; live service reload is deferred.
 
 ## Tool-surface principle
 

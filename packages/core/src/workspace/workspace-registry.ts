@@ -120,6 +120,75 @@ export class WorkspaceRegistry {
     }
   }
 
+  async restore(record: WorkspaceRecord): Promise<WorkspaceRecord> {
+    if (
+      typeof record.id !== 'string' ||
+      record.id.length === 0 ||
+      record.id.includes('\0') ||
+      typeof record.name !== 'string' ||
+      record.name.trim().length === 0 ||
+      record.name.includes('\0') ||
+      typeof record.createdAt !== 'string' ||
+      Number.isNaN(Date.parse(record.createdAt))
+    ) {
+      throw new LocalinkError(
+        'INVALID_ARGUMENT',
+        'Persisted workspace record is invalid.',
+      );
+    }
+    if (!path.isAbsolute(record.root)) {
+      throw new LocalinkError(
+        'INVALID_ARGUMENT',
+        'Persisted workspace root must be an absolute host path.',
+      );
+    }
+    if (this.#records.has(record.id)) {
+      throw new LocalinkError(
+        'ALREADY_EXISTS',
+        'Workspace ID is already registered.',
+        { workspaceId: record.id },
+      );
+    }
+
+    try {
+      const canonicalRoot = await realpath(record.root);
+      const rootStat = await stat(canonicalRoot);
+      if (!rootStat.isDirectory()) {
+        throw new LocalinkError(
+          'INVALID_ARGUMENT',
+          'Workspace root must be a directory.',
+          { root: record.root },
+        );
+      }
+      await access(canonicalRoot, constants.R_OK);
+      if (
+        [...this.#records.values()].some(
+          (entry) => entry.root === canonicalRoot,
+        )
+      ) {
+        throw new LocalinkError(
+          'ALREADY_EXISTS',
+          'Workspace root is already registered.',
+        );
+      }
+      const restored: WorkspaceRecord = {
+        id: record.id,
+        name: record.name,
+        root: canonicalRoot,
+        createdAt: record.createdAt,
+      };
+      this.#records.set(restored.id, restored);
+      return { ...restored };
+    } catch (error) {
+      if (nodeErrorCode(error) === 'ENOENT') {
+        throw new LocalinkError('NOT_FOUND', 'Workspace root does not exist.', {
+          root: record.root,
+        });
+      }
+      throw wrapIoError('Unable to restore workspace.', error);
+    }
+  }
+
   list(): WorkspaceRecord[] {
     return [...this.#records.values()]
       .map((record) => ({ ...record }))

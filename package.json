@@ -22,7 +22,9 @@
     "test:portability": "node --test tests/portability/*.test.mjs",
     "smoke:files": "npm run build && node tests/smoke/files-smoke.mjs",
     "smoke:process": "npm run build && node tests/smoke/process-smoke.mjs",
-    "check": "npm run build && npm run typecheck && npm run lint && npm run format:check && npm test && npm run test:portability && npm run test:mcp && npm run test:tunnel && npm run test:service",
+    "check": "npm run build && npm run typecheck && npm run lint && npm run format:check && npm test && npm run test:runtime && npm run test:cli && npm run test:portability && npm run test:mcp && npm run test:tunnel && npm run test:service",
+    "test:runtime": "node --test packages/runtime/dist/test/*.test.js",
+    "test:cli": "node --test packages/cli/dist/test/*.test.js",
     "test:mcp": "node --test packages/mcp-server/dist/test/*.test.js",
     "test:tunnel": "node --test transports/openai-tunnel/dist/test/*.test.js",
     "test:service": "node --test packages/service/dist/test/*.test.js"

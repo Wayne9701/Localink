@@ -27,15 +27,16 @@ const fixtureContext = z.strictObject({
     .optional(),
 });
 
+const capabilityInvoke = z.strictObject({
+  capabilityId: id,
+  input: z.json(),
+});
+
 export const toolSchemas = {
   'localink.health_status': z.strictObject({}),
   'localink.capability_search': search,
   'localink.capability_describe': z.strictObject({ capabilityId: id }),
-  'localink.capability_invoke': z.strictObject({
-    capabilityId: id,
-    input: z.json(),
-    fixtureContext: fixtureContext.optional(),
-  }),
+  'localink.capability_invoke': capabilityInvoke,
   'localink.skill_search': search,
   'localink.skill_read': z.strictObject({
     skillId: id,
@@ -48,16 +49,23 @@ export const toolSchemas = {
   }),
 } as const;
 
+export const fixtureToolSchemas = {
+  ...toolSchemas,
+  'localink.capability_invoke': capabilityInvoke.extend({
+    fixtureContext: fixtureContext.optional(),
+  }),
+} as const;
+
 export type ToolName = keyof typeof toolSchemas;
 export const TOOL_NAMES = Object.keys(toolSchemas) as ToolName[];
 export const toolDescriptions: Record<ToolName, string> = {
-  'localink.health_status': 'Read bounded Localink fixture runtime health.',
+  'localink.health_status': 'Read bounded Localink runtime health.',
   'localink.capability_search':
     'Search bounded capability metadata in the registry.',
   'localink.capability_describe':
     'Describe one capability using V1 public metadata.',
   'localink.capability_invoke':
-    'Invoke a fixture capability through Core policy and verification. Context is synthetic, not authentication.',
+    'Invoke a capability through Localink policy and verification. Supplied context is not authentication.',
   'localink.skill_search':
     'Search registered, untrusted Skill assets; never execute them.',
   'localink.skill_read':

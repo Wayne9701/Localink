@@ -1,5 +1,7 @@
 import assert from 'node:assert/strict';
+import { readFile } from 'node:fs/promises';
 import test from 'node:test';
+import { fileURLToPath } from 'node:url';
 import { LocalinkError } from '@localink/sdk';
 import { SecretValue } from '@localink/core';
 import { boundedResult, RESULT_LIMITS } from '../src/bounded-result.js';
@@ -121,5 +123,20 @@ test('capability metadata projects V1 fields instead of leaking runtime extensio
   ]) {
     assert.equal(result.isError, false);
     assert.ok(!JSON.stringify(result).includes(SECRET_LIKE_FIXTURE));
+  }
+});
+
+test('product entrypoint sources contain no fixture runtime fallback', async () => {
+  for (const relativePath of [
+    '../../src/stdio.ts',
+    '../../src/http.ts',
+    '../../src/http-entry.ts',
+  ]) {
+    const source = await readFile(
+      fileURLToPath(new URL(relativePath, import.meta.url)),
+      'utf8',
+    );
+    assert.equal(source.includes('createFixtureRuntime'), false);
+    assert.equal(source.includes('fixture-runtime'), false);
   }
 });

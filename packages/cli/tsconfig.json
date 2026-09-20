@@ -5,6 +5,10 @@
     "outDir": "dist",
     "tsBuildInfoFile": "dist/cli.tsbuildinfo"
   },
-  "include": ["src/**/*.ts"],
-  "references": [{ "path": "../sdk" }, { "path": "../core" }]
+  "include": ["src/**/*.ts", "test/**/*.ts"],
+  "references": [
+    { "path": "../sdk" },
+    { "path": "../core" },
+    { "path": "../runtime" }
+  ]
 }

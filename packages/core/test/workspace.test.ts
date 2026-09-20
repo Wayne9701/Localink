@@ -97,3 +97,22 @@ test('nonexistent destination validates nearest existing canonical parent', asyn
     );
   });
 });
+
+test('workspace registry restores persisted identity and rejects duplicate ID or canonical root', async () => {
+  await withFixture(async (fixture) => {
+    const source = fixture.workspaces.inspect(fixture.workspaceId);
+    const restoredRegistry = new (
+      await import('../src/workspace/workspace-registry.js')
+    ).WorkspaceRegistry();
+    const restored = await restoredRegistry.restore(source);
+    assert.deepEqual(restored, source);
+    await assert.rejects(
+      restoredRegistry.restore(source),
+      hasCode('ALREADY_EXISTS'),
+    );
+    await assert.rejects(
+      restoredRegistry.restore({ ...source, id: 'different-id' }),
+      hasCode('ALREADY_EXISTS'),
+    );
+  });
+});

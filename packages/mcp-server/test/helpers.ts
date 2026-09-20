@@ -1,4 +1,7 @@
 import assert from 'node:assert/strict';
+import { mkdtemp, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
   Client,
@@ -10,6 +13,9 @@ import { PROTOCOL_VERSION } from '../src/server.js';
 
 export const stdioEntry = fileURLToPath(
   new URL('../src/stdio.js', import.meta.url),
+);
+export const fixtureStdioEntry = fileURLToPath(
+  new URL('./fixture-stdio-entry.js', import.meta.url),
 );
 
 export function object(value: unknown): Record<string, unknown> {
@@ -56,11 +62,24 @@ export async function invoke(
   });
 }
 
-export async function stdioClient(modern = false) {
+function currentEnvironment(): Record<string, string> {
+  return Object.fromEntries(
+    Object.entries(process.env).filter(
+      (entry): entry is [string, string] => entry[1] !== undefined,
+    ),
+  );
+}
+
+async function connectStdio(
+  entry: string,
+  modern: boolean,
+  environment?: Record<string, string>,
+) {
   const transport = new StdioClientTransport({
     command: process.execPath,
-    args: [stdioEntry],
+    args: [entry],
     stderr: 'pipe',
+    ...(environment === undefined ? {} : { env: environment }),
   });
   const client = new Client(
     { name: 'localink-e2e', version: '1.0.0' },
@@ -86,6 +105,25 @@ export async function stdioClient(modern = false) {
       return stderr;
     },
   };
+}
+
+export async function stdioClient(modern = false) {
+  const stateRoot = await mkdtemp(
+    path.join(tmpdir(), 'localink-mcp-stdio-state-'),
+  );
+  const connection = await connectStdio(stdioEntry, modern, {
+    ...currentEnvironment(),
+    LOCALINK_STATE_ROOT: stateRoot,
+  });
+  return {
+    ...connection,
+    stateRoot,
+    cleanup: () => rm(stateRoot, { recursive: true, force: true }),
+  };
+}
+
+export async function fixtureStdioClient(modern = false) {
+  return connectStdio(fixtureStdioEntry, modern);
 }
 
 export async function httpClient(url: URL) {

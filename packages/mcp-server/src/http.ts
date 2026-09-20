@@ -7,19 +7,22 @@ import {
 } from '@modelcontextprotocol/node';
 import type { NodeIncomingMessageLike } from '@modelcontextprotocol/node';
 import type { PublicRuntime } from './runtime.js';
-import { createFixtureRuntime } from './fixture-runtime.js';
 import { createPublicServer } from './server.js';
 import { logTransportFailure } from './errors.js';
 import { assertResultLimit, RESULT_LIMITS } from './bounded-result.js';
 
-export interface HttpOptions {
+export interface HttpListenerOptions {
   host?: '127.0.0.1' | '::1';
   port?: number;
-  runtime?: PublicRuntime;
   resultLimit?: number;
 }
 
-export async function startHttpServer(options: HttpOptions = {}) {
+export interface HttpOptions extends HttpListenerOptions {
+  runtime: PublicRuntime;
+  testFixtureContext?: boolean;
+}
+
+export async function startHttpServer(options: HttpOptions) {
   assertResultLimit(options.resultLimit ?? RESULT_LIMITS.defaultBytes);
   const host = options.host ?? '127.0.0.1';
   const port = options.port ?? 4318;
@@ -31,12 +34,16 @@ export async function startHttpServer(options: HttpOptions = {}) {
   ) {
     throw new RangeError('Invalid loopback host or port.');
   }
-  const runtime = options.runtime ?? (await createFixtureRuntime());
+  const runtime = options.runtime;
   let adaptersCreated = 0;
   const handler = createMcpHandler(
     () => {
       adaptersCreated++;
-      return createPublicServer(runtime, options.resultLimit);
+      return createPublicServer(
+        runtime,
+        options.resultLimit,
+        options.testFixtureContext ?? false,
+      );
     },
     { legacy: 'reject', onerror: logTransportFailure },
   );
@@ -105,7 +112,9 @@ export async function startHttpServer(options: HttpOptions = {}) {
   };
 }
 
-export function httpOptionsFromEnv(env: NodeJS.ProcessEnv): HttpOptions {
+export function httpOptionsFromEnv(
+  env: NodeJS.ProcessEnv,
+): HttpListenerOptions {
   const host = env.LOCALINK_MCP_HOST ?? '127.0.0.1';
   const rawPort = env.LOCALINK_MCP_PORT ?? '4318';
   if (

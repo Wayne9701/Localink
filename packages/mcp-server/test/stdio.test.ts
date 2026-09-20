@@ -1,6 +1,9 @@
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { once } from 'node:events';
+import { mkdtemp, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
 import test from 'node:test';
 import { Client } from '@modelcontextprotocol/client';
 import { StdioServerTransport } from '@modelcontextprotocol/server/stdio';
@@ -11,6 +14,7 @@ import {
   at,
   call,
   envelope,
+  fixtureStdioClient,
   invoke,
   stdioClient,
   stdioEntry,
@@ -20,12 +24,12 @@ test(
   'stdio: official client initialize, exact six tools, all policy/registry/error/bounding paths, clean exit',
   { timeout: 20_000 },
   async (t) => {
-    const connection = await stdioClient();
+    const connection = await fixtureStdioClient();
     const { client, transport } = connection;
     t.after(() => client.close());
     const pid = transport.pid;
     assert.ok(pid);
-    assert.equal(client.getServerVersion()?.name, 'localink-fixture');
+    assert.equal(client.getServerVersion()?.name, 'localink');
     const listed = await client.listTools();
     assert.deepEqual(
       listed.tools.map((tool) => tool.name),
@@ -202,10 +206,11 @@ test(
   'stdio: v2 modern negotiation works with the same public surface',
   { timeout: 15_000 },
   async (t) => {
-    const { client } = await stdioClient(true);
+    const { client } = await fixtureStdioClient(true);
     t.after(() => client.close());
+    const listed = await client.listTools();
     assert.deepEqual(
-      (await client.listTools()).tools.map((tool) => tool.name),
+      listed.tools.map((tool) => tool.name),
       TOOL_NAMES,
     );
     assert.equal(
@@ -216,10 +221,46 @@ test(
 );
 
 test(
+  'stdio product entrypoint exposes exact six tools with real runtime health',
+  { timeout: 15_000 },
+  async (t) => {
+    const connection = await stdioClient(true);
+    const { client } = connection;
+    t.after(async () => {
+      await client.close();
+      await connection.cleanup();
+    });
+    assert.equal(client.getServerVersion()?.name, 'localink');
+    const listed = await client.listTools();
+    assert.deepEqual(
+      listed.tools.map((tool) => tool.name),
+      TOOL_NAMES,
+    );
+    const invokeTool = listed.tools.find(
+      (tool) => tool.name === 'localink.capability_invoke',
+    );
+    assert.equal(JSON.stringify(invokeTool).includes('fixtureContext'), false);
+    const health = await call(client, 'health_status');
+    assert.equal(at(health, 'data', 'mode'), 'runtime');
+    assert.equal(at(health, 'data', 'workspaceCount'), 0);
+    assert.equal(at(health, 'data', 'capabilityCount'), 0);
+    assert.equal(at(health, 'data', 'skillCount'), 0);
+    assert.equal(at(health, 'data', 'state', 'ready'), true);
+    assert.equal(at(health, 'data', 'state', 'schemaVersion'), 1);
+    assert.equal(JSON.stringify(health).includes(connection.stateRoot), false);
+  },
+);
+
+test(
   'stdio: bare EOF exits with code zero and no output or signal',
   { timeout: 5000 },
   async (t) => {
-    const child = spawn(process.execPath, [stdioEntry], { stdio: 'pipe' });
+    const stateRoot = await mkdtemp(path.join(tmpdir(), 'localink-eof-'));
+    t.after(() => rm(stateRoot, { recursive: true, force: true }));
+    const child = spawn(process.execPath, [stdioEntry], {
+      stdio: 'pipe',
+      env: { ...process.env, LOCALINK_STATE_ROOT: stateRoot },
+    });
     t.after(() => {
       if (child.exitCode === null && child.signalCode === null) child.kill();
     });
@@ -243,7 +284,12 @@ test(
   'stdio: initialized child exits on EOF without SDK kill escalation; raw stdout is protocol only',
   { timeout: 5000 },
   async (t) => {
-    const child = spawn(process.execPath, [stdioEntry], { stdio: 'pipe' });
+    const stateRoot = await mkdtemp(path.join(tmpdir(), 'localink-eof-'));
+    t.after(() => rm(stateRoot, { recursive: true, force: true }));
+    const child = spawn(process.execPath, [stdioEntry], {
+      stdio: 'pipe',
+      env: { ...process.env, LOCALINK_STATE_ROOT: stateRoot },
+    });
     t.after(() => {
       if (child.exitCode === null && child.signalCode === null) child.kill();
     });

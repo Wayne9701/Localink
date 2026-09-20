@@ -9,6 +9,7 @@ import {
   WorkspaceRegistry,
   createStatePaths,
 } from '@localink/core';
+import { createLocalinkRuntime } from '@localink/runtime';
 import { LocalinkError, LOCALINK_VERSION } from '@localink/sdk';
 
 function output(value: unknown): void {
@@ -62,27 +63,56 @@ async function main(): Promise<void> {
   const args = process.argv
     .slice(2)
     .filter((argument) => argument !== '--json');
-  const workspaces = new WorkspaceRegistry();
-  if (args[0] === 'core' && args[1] === 'self-test') {
+  if (args.length === 2 && args[0] === 'core' && args[1] === 'self-test') {
     await selfTest();
     return;
   }
-  if (args[0] === 'workspace' && args[1] === 'list') {
-    output({ workspaces: workspaces.list() });
-    return;
+
+  const runtime = await createLocalinkRuntime();
+  try {
+    if (args.length === 2 && args[0] === 'runtime' && args[1] === 'health') {
+      output(await runtime.health());
+      return;
+    }
+    if (
+      args.length === 4 &&
+      args[0] === 'workspace' &&
+      args[1] === 'add' &&
+      args[2] !== undefined &&
+      args[3] !== undefined
+    ) {
+      output(await runtime.addWorkspace(args[2], args[3]));
+      return;
+    }
+    if (args.length === 2 && args[0] === 'workspace' && args[1] === 'list') {
+      output({ workspaces: runtime.workspaces.list() });
+      return;
+    }
+    if (
+      args.length === 3 &&
+      args[0] === 'workspace' &&
+      args[1] === 'inspect' &&
+      args[2] !== undefined
+    ) {
+      output(runtime.workspaces.inspect(args[2]));
+      return;
+    }
+    if (
+      args.length === 3 &&
+      args[0] === 'workspace' &&
+      args[1] === 'remove' &&
+      args[2] !== undefined
+    ) {
+      output(await runtime.removeWorkspace(args[2]));
+      return;
+    }
+    throw new LocalinkError(
+      'INVALID_ARGUMENT',
+      'Usage: localink core self-test --json | runtime health --json | workspace add <name> <absolute-root> --json | workspace list --json | workspace inspect <id> --json | workspace remove <id> --json',
+    );
+  } finally {
+    await runtime.close();
   }
-  if (
-    args[0] === 'workspace' &&
-    args[1] === 'inspect' &&
-    args[2] !== undefined
-  ) {
-    output(workspaces.inspect(args[2]));
-    return;
-  }
-  throw new LocalinkError(
-    'INVALID_ARGUMENT',
-    'Usage: localink core self-test | workspace list | workspace inspect <id>',
-  );
 }
 
 main().catch((error: unknown) => {

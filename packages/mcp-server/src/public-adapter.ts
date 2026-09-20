@@ -12,6 +12,7 @@ import {
 import { invalidInput, publicError } from './errors.js';
 import type { PublicRuntime } from './runtime.js';
 import {
+  fixtureToolSchemas,
   INPUT_LIMIT_BYTES,
   toolSchemas,
   type ToolName,
@@ -53,6 +54,7 @@ export class PublicAdapter {
   constructor(
     readonly runtime: PublicRuntime,
     readonly resultLimit: number = RESULT_LIMITS.defaultBytes,
+    readonly allowFixtureContext = false,
   ) {
     assertResultLimit(resultLimit);
   }
@@ -115,9 +117,22 @@ export class PublicAdapter {
         );
       }
       case 'localink.capability_invoke': {
-        const result = toolSchemas[name].safeParse(args);
+        const result = (
+          this.allowFixtureContext
+            ? fixtureToolSchemas[name]
+            : toolSchemas[name]
+        ).safeParse(args);
         if (!result.success) invalidInput();
-        const { capabilityId, input, fixtureContext } = result.data;
+        const invocation = result.data as {
+          capabilityId: string;
+          input: unknown;
+          fixtureContext?: {
+            policyProfile?: 'open' | 'balanced' | 'strict';
+            identity?: { id: 'alice' | 'bob'; type: 'fixture-user' };
+            grantedScopes?: ('fixture:read' | 'fixture:write')[];
+          };
+        };
+        const { capabilityId, input, fixtureContext } = invocation;
         const context: CapabilityInvokeContext = {
           policyProfile: fixtureContext?.policyProfile ?? 'balanced',
           ...(fixtureContext?.identity === undefined
