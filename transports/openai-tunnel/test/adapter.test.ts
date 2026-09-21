@@ -25,6 +25,7 @@ import {
   executeShortLivedCommand,
   parseDoctorOutput,
   resolveTunnelSecretEnvironment,
+  tunnelAuthFilePath,
   validateTunnelProfile,
 } from '../src/index.js';
 
@@ -50,15 +51,14 @@ async function fakeBinary(directory: string, output: string): Promise<string> {
   return binaryPath;
 }
 
-function profileInput(overrides: Record<string, unknown> = {}) {
+function profileInput(
+  overrides: Record<string, unknown> = {},
+  stateRoot = path.resolve('/tmp/localink-state'),
+) {
   return {
     name: 'localink-test',
     tunnelId: 'tunnel_0123456789abcdef',
-    apiKeySecretRef: {
-      provider: 'memory',
-      namespace: 'openai-tunnel',
-      key: 'runtime-api-key',
-    },
+    apiKeyFilePath: tunnelAuthFilePath(stateRoot),
     localMcpUrl: 'http://127.0.0.1:4318/mcp',
     ...overrides,
   };
@@ -85,7 +85,9 @@ test('current tunnel-client accepts the generated profile schema when installed'
   if (!discovered.available || discovered.binaryPath === undefined) return;
   await withTemporaryDirectory(async (directory) => {
     const sourceStore = new TunnelProfileStore(path.join(directory, 'source'));
-    const profile = await sourceStore.write(profileInput());
+    const profile = await sourceStore.write(
+      profileInput({}, path.join(directory, 'source')),
+    );
     const targetDirectory = path.join(directory, 'validated-profiles');
     const result = await executeShortLivedCommand({
       command: discovered.binaryPath ?? '',
@@ -105,7 +107,7 @@ test('current tunnel-client accepts the generated profile schema when installed'
         path.join(targetDirectory, 'localink-validation.yaml'),
         'utf8',
       ),
-      /env:CONTROL_PLANE_API_KEY/u,
+      /file:.*openai-tunnel-runtime\.key/u,
     );
   });
 });
@@ -160,10 +162,20 @@ test('command builders preserve exact argv and never construct a shell command',
     command: binaryPath,
     args: ['doctor', '--profile', 'localink-test', '--explain'],
   });
-  assert.deepEqual(buildRunCommand(binaryPath, 'localink-test'), {
-    command: binaryPath,
-    args: ['run', '--profile', 'localink-test'],
-  });
+  const profileDirectory = path.resolve('/tmp/profile dir');
+  assert.deepEqual(
+    buildRunCommand(binaryPath, 'localink-test', profileDirectory),
+    {
+      command: binaryPath,
+      args: [
+        'run',
+        '--profile',
+        'localink-test',
+        '--profile-dir',
+        profileDirectory,
+      ],
+    },
+  );
   assert.deepEqual(
     buildDoctorCommand(binaryPath, 'localink-test', {
       profileDirectory: path.resolve('/tmp/profile dir'),
@@ -178,7 +190,7 @@ test('command builders preserve exact argv and never construct a shell command',
     },
   );
   assert.throws(
-    () => buildRunCommand(binaryPath, 'safe; touch injected'),
+    () => buildRunCommand(binaryPath, 'safe; touch injected', profileDirectory),
     (error) =>
       error instanceof TunnelAdapterError && error.code === 'PROFILE_INVALID',
   );
@@ -187,13 +199,17 @@ test('command builders preserve exact argv and never construct a shell command',
 test('profile writer creates and atomically replaces loopback-only YAML', async () => {
   await withTemporaryDirectory(async (directory) => {
     const store = new TunnelProfileStore(directory);
-    const first = await store.write(profileInput());
+    const first = await store.write(profileInput({}, directory));
     const source = await readFile(first.profilePath, 'utf8');
     assert.match(source, /base_url: "https:\/\/api\.openai\.com"/u);
-    assert.match(source, /api_key: "env:CONTROL_PLANE_API_KEY"/u);
+    assert.match(
+      source,
+      new RegExp(`api_key: "file:${tunnelAuthFilePath(directory)}"`, 'u'),
+    );
+    assert.doesNotMatch(source, /CONTROL_PLANE_API_KEY/u);
     assert.match(source, /url: "http:\/\/127\.0\.0\.1:4318\/mcp"/u);
     assert.doesNotMatch(source, /synthetic-secret-value/u);
-    assert.doesNotMatch(source, /runtime-api-key|openai-tunnel|memory/u);
+    assert.doesNotMatch(source, /runtime-api-key|memory/u);
     assert.equal(
       JSON.stringify(first).includes('synthetic-secret-value'),
       false,
@@ -202,7 +218,7 @@ test('profile writer creates and atomically replaces loopback-only YAML', async 
     assert.equal(first.replaced, false);
 
     const second = await store.write(
-      profileInput({ healthListenAddress: 'localhost:0' }),
+      profileInput({ healthListenAddress: 'localhost:0' }, directory),
       { expectedSha256: first.sha256 },
     );
     assert.equal(second.replaced, true);
@@ -214,7 +230,9 @@ test('profile writer creates and atomically replaces loopback-only YAML', async 
       [],
     );
     await assert.rejects(
-      store.write(profileInput(), { expectedSha256: first.sha256 }),
+      store.write(profileInput({}, directory), {
+        expectedSha256: first.sha256,
+      }),
       (error) =>
         error instanceof TunnelAdapterError && error.code === 'PROFILE_STALE',
     );

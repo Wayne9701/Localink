@@ -1,11 +1,9 @@
 import path from 'node:path';
 import { spawn, type ChildProcess } from 'node:child_process';
 import { once } from 'node:events';
-import type { SecretProvider } from '@localink/sdk';
 import {
   CONTROL_PLANE_API_KEY_ENV,
   buildRunCommand,
-  resolveTunnelSecretEnvironment,
 } from '@localink/openai-tunnel';
 import { ServiceFoundationError } from './errors.js';
 import type { TunnelLaunchReceipt, TunnelWrapperInput } from './types.js';
@@ -77,7 +75,6 @@ function ownedChild(child: ChildProcess): TunnelOwnedChild {
 
 export async function runTunnelWrapper(
   input: TunnelWrapperInput,
-  provider: SecretProvider,
   launcher: TunnelChildLauncher,
   options: {
     readonly signalEmitter?: NodeJS.Process;
@@ -93,7 +90,7 @@ export async function runTunnelWrapper(
   if (input.baseEnvironment?.[CONTROL_PLANE_API_KEY_ENV] !== undefined) {
     throw new ServiceFoundationError(
       'TUNNEL_LAUNCH_FAILED',
-      'Tunnel API key must come from the configured SecretProvider.',
+      'Tunnel API key environment injection is forbidden.',
     );
   }
   const command = buildRunCommand(
@@ -101,26 +98,14 @@ export async function runTunnelWrapper(
     input.profileName,
     input.profileDirectory,
   );
-  let secretEnvironment;
-  try {
-    secretEnvironment = await resolveTunnelSecretEnvironment(
-      provider,
-      input.secretRef,
-    );
-  } catch {
-    throw new ServiceFoundationError(
-      'TUNNEL_SECRET_UNAVAILABLE',
-      'Tunnel runtime credential is unavailable.',
-    );
-  }
   let launched: TunnelOwnedChild;
   try {
     launched = await launcher.launch(command.command, command.args, {
       cwd: input.workingDirectory,
-      env: secretEnvironment.forSpawn({
+      env: {
         ...input.baseEnvironment,
         ...command.environmentOverrides,
-      }),
+      },
       shell: false,
     });
   } catch {
@@ -157,8 +142,9 @@ export async function runTunnelWrapper(
     ...(launched.pid === undefined ? {} : { pid: launched.pid }),
     command: command.command,
     args: command.args,
-    secretInjected: true,
-    injectedEnvironmentKeys: [CONTROL_PLANE_API_KEY_ENV],
+    secretInjected: false,
+    authSource: 'file-reference',
+    injectedEnvironmentKeys: [],
     exitCode: exited.exitCode,
     signal: exited.signal,
   };

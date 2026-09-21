@@ -11,6 +11,14 @@ export interface SecurityExecutor {
 }
 
 export class SystemSecurityExecutor implements SecurityExecutor {
+  readonly #timeoutMs: number;
+
+  constructor(timeoutMs = 5_000) {
+    if (!Number.isInteger(timeoutMs) || timeoutMs < 1_000 || timeoutMs > 60_000)
+      throw new Error('Invalid security command timeout.');
+    this.#timeoutMs = timeoutMs;
+  }
+
   execute(
     command: typeof SECURITY_BINARY,
     args: readonly string[],
@@ -20,7 +28,7 @@ export class SystemSecurityExecutor implements SecurityExecutor {
         command,
         [...args],
         {
-          timeout: 5_000,
+          timeout: this.#timeoutMs,
           maxBuffer: 64 * 1024,
           windowsHide: true,
           env: { PATH: '/usr/bin:/bin', LANG: 'C', LC_ALL: 'C' },

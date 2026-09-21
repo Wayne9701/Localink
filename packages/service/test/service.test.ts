@@ -2,22 +2,19 @@ import assert from 'node:assert/strict';
 import { execFile } from 'node:child_process';
 import { EventEmitter } from 'node:events';
 import {
+  chmod,
   mkdir,
   mkdtemp,
   readFile,
   rm,
   stat,
+  symlink,
   writeFile,
 } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
-import type {
-  SecretMutationReceipt,
-  SecretProvider,
-  SecretRef,
-  SecretValueHandle,
-} from '@localink/sdk';
+import { tunnelAuthFilePath } from '@localink/openai-tunnel';
 import {
   DEFAULT_RECOVERY_POLICY,
   LaunchctlExecutor,
@@ -40,6 +37,8 @@ import {
   decideRecovery,
   dispatchServiceEntrypoint,
   executeRecoveryOnce,
+  inspectTunnelAuthFile,
+  migrateLegacyKeychainTunnelAuth,
   readServiceSnapshot,
   readTunnelServiceConfig,
   renderLaunchAgentPlist,
@@ -54,48 +53,6 @@ import {
   type ServiceStatus,
   type TunnelChildLauncher,
 } from '../src/index.js';
-
-class SyntheticSecret implements SecretValueHandle {
-  readonly #value: string;
-
-  constructor(value: string) {
-    this.#value = value;
-  }
-
-  reveal(): string {
-    return this.#value;
-  }
-
-  toJSON(): '[REDACTED]' {
-    return '[REDACTED]';
-  }
-}
-
-class FakeSecretProvider implements SecretProvider {
-  readonly id: string;
-  readonly #value: string | undefined;
-  getCount = 0;
-
-  constructor(id: string, value?: string) {
-    this.id = id;
-    this.#value = value;
-  }
-
-  async get(ref: SecretRef): Promise<SecretValueHandle | undefined> {
-    this.getCount += 1;
-    return ref.provider === this.id && this.#value !== undefined
-      ? new SyntheticSecret(this.#value)
-      : undefined;
-  }
-
-  async set(): Promise<SecretMutationReceipt> {
-    throw new Error('not implemented by deterministic fake');
-  }
-
-  async delete(): Promise<SecretMutationReceipt> {
-    throw new Error('not implemented by deterministic fake');
-  }
-}
 
 async function withTemporaryDirectory(
   worker: (directory: string) => Promise<void>,
@@ -339,9 +296,8 @@ test('install and uninstall plans are pure and preserve user data and secrets', 
   });
 });
 
-test('tunnel wrapper reveals a synthetic secret only inside the injected launch boundary', async () => {
+test('tunnel wrapper uses fixed argv without reading or injecting a secret', async () => {
   await withTemporaryDirectory(async (root) => {
-    const syntheticSecret = 'synthetic-service-secret';
     const calls: Array<{
       command: string;
       args: readonly string[];
@@ -362,33 +318,33 @@ test('tunnel wrapper reveals a synthetic secret only inside the injected launch 
         };
       },
     };
-    const provider = new FakeSecretProvider('fake', syntheticSecret);
     const receipt = await runTunnelWrapper(
       {
         binaryPath: path.join(root, 'bin', 'tunnel-client'),
         profileName: 'localink',
         profileDirectory: path.join(root, 'profiles'),
         workingDirectory: root,
-        secretRef: { provider: 'fake', key: 'runtime-api-key' },
         baseEnvironment: { LANG: 'C' },
       },
-      provider,
       launcher,
     );
-    assert.equal(provider.getCount, 1);
     assert.equal(calls.length, 1);
-    assert.equal(calls[0]?.env.CONTROL_PLANE_API_KEY, syntheticSecret);
+    assert.equal(calls[0]?.env.CONTROL_PLANE_API_KEY, undefined);
     assert.equal(calls[0]?.shell, false);
-    assert.deepEqual(calls[0]?.args, ['run', '--profile', 'localink']);
-    assert.equal(JSON.stringify(receipt).includes(syntheticSecret), false);
-    assert.equal(JSON.stringify(receipt).includes('runtime-api-key'), false);
-    assert.deepEqual(receipt.injectedEnvironmentKeys, [
-      'CONTROL_PLANE_API_KEY',
+    assert.deepEqual(calls[0]?.args, [
+      'run',
+      '--profile',
+      'localink',
+      '--profile-dir',
+      path.join(root, 'profiles'),
     ]);
+    assert.equal(receipt.secretInjected, false);
+    assert.equal(receipt.authSource, 'file-reference');
+    assert.deepEqual(receipt.injectedEnvironmentKeys, []);
   });
 });
 
-test('tunnel wrapper fails visibly for missing or mismatched synthetic providers', async () => {
+test('tunnel wrapper rejects auth environment injection before launch', async () => {
   await withTemporaryDirectory(async (root) => {
     const launcher: TunnelChildLauncher = {
       async launch() {
@@ -400,27 +356,13 @@ test('tunnel wrapper fails visibly for missing or mismatched synthetic providers
       profileName: 'localink',
       profileDirectory: path.join(root, 'profiles'),
       workingDirectory: root,
-      secretRef: { provider: 'fake', key: 'runtime-api-key' },
     };
-    for (const provider of [
-      new FakeSecretProvider('fake'),
-      new FakeSecretProvider('other', 'synthetic-service-secret'),
-    ]) {
-      await assert.rejects(
-        runTunnelWrapper(input, provider, launcher),
-        (error) =>
-          error instanceof ServiceFoundationError &&
-          error.code === 'TUNNEL_SECRET_UNAVAILABLE' &&
-          !error.message.includes('synthetic-service-secret'),
-      );
-    }
     await assert.rejects(
       runTunnelWrapper(
         {
           ...input,
           baseEnvironment: { CONTROL_PLANE_API_KEY: 'bypass' },
         },
-        new FakeSecretProvider('fake', 'synthetic-service-secret'),
         launcher,
       ),
       (error) =>
@@ -761,6 +703,8 @@ test('tunnel service config is strict, non-secret, atomic, and fixed to Local MC
       'utf8',
     );
     assert.match(source, /http:\/\/127\.0\.0\.1:4318\/mcp/u);
+    assert.match(source, /"version": 2/u);
+    assert.equal(source.includes('secretRef'), false);
     assert.equal(source.includes('CONTROL_PLANE_API_KEY'), false);
     assert.equal(source.includes('synthetic-secret'), false);
     assert.throws(() =>
@@ -768,6 +712,109 @@ test('tunnel service config is strict, non-secret, atomic, and fixed to Local MC
         tunnelClientPath: '/opt/local/bin/tunnel-client',
       }),
     );
+  });
+});
+
+test('legacy tunnel service config is accepted only for one-way version-two upgrade', async () => {
+  await withTemporaryDirectory(async (root) => {
+    const destination = path.join(root, 'config', 'tunnel-service.json');
+    await mkdir(path.dirname(destination), { recursive: true });
+    await writeFile(
+      destination,
+      JSON.stringify({
+        version: 1,
+        profileName: 'localink',
+        tunnelId: 'tunnel_abcdefgh',
+        localMcpUrl: 'http://127.0.0.1:4318/mcp',
+        healthListenAddress: '127.0.0.1:4319',
+        secretRef: {
+          provider: 'macos-keychain',
+          namespace: 'openai-tunnel',
+          key: 'runtime-api-key',
+        },
+      }),
+    );
+    const upgraded = await readTunnelServiceConfig(root);
+    assert.equal(upgraded?.version, 2);
+    assert.equal(JSON.stringify(upgraded).includes('secretRef'), false);
+    if (upgraded === undefined) throw new Error('Expected upgraded config.');
+    await writeTunnelServiceConfig(root, upgraded);
+    assert.equal(
+      (await readFile(destination, 'utf8')).includes('macos-keychain'),
+      false,
+    );
+  });
+});
+
+test('canonical tunnel auth metadata rejects missing, empty, unsafe mode, and symlink files', async () => {
+  await withTemporaryDirectory(async (root) => {
+    const authFile = tunnelAuthFilePath(root);
+    const secretsDirectory = path.dirname(authFile);
+    assert.equal(
+      authFile,
+      path.join(root, 'secrets', 'openai-tunnel-runtime.key'),
+    );
+    assert.deepEqual(await inspectTunnelAuthFile(root), {
+      available: false,
+      reasonCode: 'AUTH_FILE_MISSING',
+    });
+    await mkdir(secretsDirectory, { mode: 0o700 });
+    await writeFile(authFile, '', { mode: 0o600 });
+    assert.equal(
+      (await inspectTunnelAuthFile(root)).reasonCode,
+      'AUTH_FILE_EMPTY',
+    );
+    await writeFile(authFile, 'synthetic-value', { mode: 0o600 });
+    assert.deepEqual(await inspectTunnelAuthFile(root), {
+      available: true,
+      reasonCode: 'AUTH_FILE_READY',
+    });
+    await chmod(authFile, 0o644);
+    assert.equal(
+      (await inspectTunnelAuthFile(root)).reasonCode,
+      'AUTH_FILE_MODE_INVALID',
+    );
+    await rm(authFile);
+    const target = path.join(root, 'target');
+    await writeFile(target, 'synthetic-value', { mode: 0o600 });
+    await symlink(target, authFile);
+    assert.equal(
+      (await inspectTunnelAuthFile(root)).reasonCode,
+      'AUTH_FILE_SYMLINK',
+    );
+  });
+});
+
+test('one-time Keychain migration reads once and atomically creates a private auth file', async () => {
+  await withTemporaryDirectory(async (root) => {
+    const syntheticValue = 'synthetic-migration-value';
+    let readCount = 0;
+    const result = await migrateLegacyKeychainTunnelAuth(root, {
+      async read(service, account) {
+        readCount += 1;
+        assert.equal(service, 'localink.openai-tunnel');
+        assert.equal(account, 'runtime-api-key');
+        return syntheticValue;
+      },
+    });
+    const authFile = tunnelAuthFilePath(root);
+    assert.equal(readCount, 1);
+    assert.deepEqual(result, { migrated: true, authFileAvailable: true });
+    assert.equal(JSON.stringify(result).includes(syntheticValue), false);
+    assert.equal(JSON.stringify(result).includes(authFile), false);
+    assert.equal(await readFile(authFile, 'utf8'), syntheticValue);
+    assert.equal((await stat(path.dirname(authFile))).mode & 0o777, 0o700);
+    assert.equal((await stat(authFile)).mode & 0o777, 0o600);
+    await assert.rejects(
+      migrateLegacyKeychainTunnelAuth(root, {
+        async read() {
+          readCount += 1;
+          return syntheticValue;
+        },
+      }),
+      /already exists/u,
+    );
+    assert.equal(readCount, 1);
   });
 });
 
@@ -946,9 +993,7 @@ test('long-lived tunnel wrapper waits, forwards signals, and reports child exit 
         profileName: 'localink',
         profileDirectory: path.join(root, 'profiles'),
         workingDirectory: root,
-        secretRef: { provider: 'fake', key: 'runtime-api-key' },
       },
-      new FakeSecretProvider('fake', 'synthetic-secret'),
       launcher,
       { signalEmitter: emitter as unknown as NodeJS.Process, shutdownMs: 50 },
     );

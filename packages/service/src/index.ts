@@ -12,5 +12,6 @@ export * from './recovery-executor.js';
 export * from './snapshot.js';
 export * from './status.js';
 export * from './tunnel-config.js';
+export * from './tunnel-auth-file.js';
 export * from './tunnel-wrapper.js';
 export * from './types.js';

@@ -1,5 +1,3 @@
-import type { SecretRef } from '@localink/sdk';
-
 export const SERVICE_IDS = [
   'localink-core',
   'localink-tunnel',
@@ -86,7 +84,6 @@ export interface TunnelWrapperInput {
   readonly profileName: string;
   readonly profileDirectory: string;
   readonly workingDirectory: string;
-  readonly secretRef: SecretRef;
   readonly baseEnvironment?: Readonly<Record<string, string>>;
 }
 
@@ -96,8 +93,9 @@ export interface TunnelLaunchReceipt {
   readonly pid?: number;
   readonly command: string;
   readonly args: readonly string[];
-  readonly secretInjected: true;
-  readonly injectedEnvironmentKeys: readonly ['CONTROL_PLANE_API_KEY'];
+  readonly secretInjected: false;
+  readonly authSource: 'file-reference';
+  readonly injectedEnvironmentKeys: readonly [];
   readonly exitCode: number | null;
   readonly signal: NodeJS.Signals | null;
 }

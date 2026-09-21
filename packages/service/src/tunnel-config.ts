@@ -2,11 +2,14 @@ import { randomUUID } from 'node:crypto';
 import { mkdir, open, readFile, rename, unlink } from 'node:fs/promises';
 import path from 'node:path';
 import type { SecretRef } from '@localink/sdk';
-import { validateTunnelProfile } from '@localink/openai-tunnel';
+import {
+  tunnelAuthFilePath,
+  validateTunnelProfile,
+} from '@localink/openai-tunnel';
 
-export const TUNNEL_SERVICE_CONFIG_VERSION = 1 as const;
+export const TUNNEL_SERVICE_CONFIG_VERSION = 2 as const;
 export const LOCALINK_TUNNEL_PROFILE = 'localink' as const;
-export const LOCALINK_TUNNEL_SECRET_REF: SecretRef = Object.freeze({
+export const LEGACY_LOCALINK_TUNNEL_SECRET_REF: SecretRef = Object.freeze({
   provider: 'macos-keychain',
   namespace: 'openai-tunnel',
   key: 'runtime-api-key',
@@ -18,7 +21,6 @@ export interface TunnelServiceConfig {
   readonly tunnelId: string;
   readonly localMcpUrl: 'http://127.0.0.1:4318/mcp';
   readonly healthListenAddress: string;
-  readonly secretRef: typeof LOCALINK_TUNNEL_SECRET_REF;
   readonly tunnelClientPath?: string;
 }
 
@@ -44,18 +46,21 @@ export function validateTunnelServiceConfig(
   if (Object.keys(config).some((key) => !allowed.has(key)))
     throw new Error('Tunnel service config contains unknown fields.');
   const secret = config.secretRef;
+  const legacy = config.version === 1;
   if (
-    config.version !== TUNNEL_SERVICE_CONFIG_VERSION ||
+    (!legacy && config.version !== TUNNEL_SERVICE_CONFIG_VERSION) ||
     config.profileName !== LOCALINK_TUNNEL_PROFILE ||
     config.localMcpUrl !== 'http://127.0.0.1:4318/mcp' ||
     typeof config.tunnelId !== 'string' ||
     typeof config.healthListenAddress !== 'string' ||
-    typeof secret !== 'object' ||
-    secret === null ||
-    Array.isArray(secret) ||
-    (secret as Record<string, unknown>).provider !== 'macos-keychain' ||
-    (secret as Record<string, unknown>).namespace !== 'openai-tunnel' ||
-    (secret as Record<string, unknown>).key !== 'runtime-api-key' ||
+    (legacy &&
+      (typeof secret !== 'object' ||
+        secret === null ||
+        Array.isArray(secret) ||
+        (secret as Record<string, unknown>).provider !== 'macos-keychain' ||
+        (secret as Record<string, unknown>).namespace !== 'openai-tunnel' ||
+        (secret as Record<string, unknown>).key !== 'runtime-api-key')) ||
+    (!legacy && secret !== undefined) ||
     (config.tunnelClientPath !== undefined &&
       (typeof config.tunnelClientPath !== 'string' ||
         !path.isAbsolute(config.tunnelClientPath) ||
@@ -66,7 +71,7 @@ export function validateTunnelServiceConfig(
   validateTunnelProfile({
     name: LOCALINK_TUNNEL_PROFILE,
     tunnelId: config.tunnelId,
-    apiKeySecretRef: LOCALINK_TUNNEL_SECRET_REF,
+    apiKeyFilePath: tunnelAuthFilePath('/private/localink-state'),
     localMcpUrl: 'http://127.0.0.1:4318/mcp',
     healthListenAddress: config.healthListenAddress,
   });
@@ -76,7 +81,6 @@ export function validateTunnelServiceConfig(
     tunnelId: config.tunnelId,
     localMcpUrl: 'http://127.0.0.1:4318/mcp',
     healthListenAddress: config.healthListenAddress,
-    secretRef: LOCALINK_TUNNEL_SECRET_REF,
     ...(config.tunnelClientPath === undefined
       ? {}
       : { tunnelClientPath: config.tunnelClientPath }),
@@ -146,7 +150,6 @@ export function createTunnelServiceConfig(
     tunnelId,
     localMcpUrl: 'http://127.0.0.1:4318/mcp',
     healthListenAddress: options.healthListenAddress ?? '127.0.0.1:4319',
-    secretRef: LOCALINK_TUNNEL_SECRET_REF,
     ...(options.tunnelClientPath === undefined
       ? {}
       : { tunnelClientPath: options.tunnelClientPath }),

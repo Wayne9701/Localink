@@ -1,5 +1,3 @@
-import type { SecretRef } from '@localink/sdk';
-
 export const TESTED_LOCAL_TUNNEL_CLIENT_VERSION =
   '0.0.11+8d55683eeef80bc5e360d95abf4692454fafc615' as const;
 export const CONTROL_PLANE_API_KEY_ENV = 'CONTROL_PLANE_API_KEY' as const;
@@ -31,7 +29,7 @@ export interface TunnelBinaryStatus {
 export interface TunnelProfileInput {
   readonly name: string;
   readonly tunnelId: string;
-  readonly apiKeySecretRef: SecretRef;
+  readonly apiKeyFilePath: string;
   readonly localMcpUrl: string;
   readonly controlPlaneBaseUrl?: string;
   readonly healthListenAddress?: string;
@@ -41,8 +39,8 @@ export interface TunnelProfileInput {
 export interface ValidatedTunnelProfile {
   readonly name: string;
   readonly tunnelId: string;
-  readonly apiKeySecretRef: SecretRef;
-  readonly apiKeyEnvironmentReference: `env:${typeof CONTROL_PLANE_API_KEY_ENV}`;
+  readonly apiKeyFilePath: string;
+  readonly apiKeyFileReference: `file:${string}`;
   readonly localMcpUrl: string;
   readonly controlPlaneBaseUrl: string;
   readonly healthListenAddress: string;
@@ -55,7 +53,7 @@ export interface TunnelProfileWriteReceipt {
   readonly profileDirectory: string;
   readonly sha256: string;
   readonly replaced: boolean;
-  readonly apiKeySource: `env:${typeof CONTROL_PLANE_API_KEY_ENV}`;
+  readonly apiKeySource: 'file';
 }
 
 export interface TunnelCommand {

@@ -69,12 +69,24 @@ export function buildDoctorCommand(
 export function buildRunCommand(
   binaryPath: string,
   profileName: string,
-  profileDirectory?: string,
+  profileDirectory: string,
 ): TunnelCommand {
-  const environmentOverrides = profileEnvironment(profileDirectory);
+  const validatedDirectory =
+    profileEnvironment(profileDirectory)?.TUNNEL_CLIENT_PROFILE_DIR;
+  if (validatedDirectory === undefined) {
+    throw new TunnelAdapterError(
+      'PROFILE_INVALID',
+      'Profile directory is required.',
+    );
+  }
   return {
     command: assertBinaryPath(binaryPath),
-    args: ['run', '--profile', validateProfileName(profileName)],
-    ...(environmentOverrides === undefined ? {} : { environmentOverrides }),
+    args: [
+      'run',
+      '--profile',
+      validateProfileName(profileName),
+      '--profile-dir',
+      validatedDirectory,
+    ],
   };
 }

@@ -7,7 +7,6 @@ import { createServer } from 'node:net';
 import { fileURLToPath } from 'node:url';
 import {
   FilesService,
-  MacOSKeychainSecretProvider,
   ProcessManager,
   WorkspaceRegistry,
   createStatePaths,
@@ -27,6 +26,7 @@ import {
 import {
   buildTunnelStatus,
   discoverTunnelClient,
+  tunnelAuthFilePath,
   TunnelProfileStore,
   type DoctorLayerResult,
   type TunnelBinaryStatus,
@@ -35,10 +35,13 @@ import {
 import {
   LocalServiceController,
   MacOSKeychainAdapter,
+  SystemSecurityExecutor,
   SystemTunnelChildLauncher,
   createInstallationContext,
   createTunnelServiceConfig,
   executeRecoveryOnce,
+  inspectTunnelAuthFile,
+  migrateLegacyKeychainTunnelAuth,
   readTunnelServiceConfig,
   runTunnelWrapper,
   writeServiceSnapshot,
@@ -51,7 +54,6 @@ import {
   type ServiceSnapshotInput,
   type TunnelServiceConfig,
 } from '@localink/service';
-import { createKeychainAvailabilityProbe } from './keychain-availability.js';
 
 function output(value: unknown): void {
   process.stdout.write(`${JSON.stringify(value, null, 2)}\n`);
@@ -160,16 +162,13 @@ async function probeLocalMcp(url = DEFAULT_MCP_URL): Promise<McpProbe> {
   }
 }
 
-function keychainProvider(): MacOSKeychainSecretProvider {
-  return new MacOSKeychainSecretProvider(new MacOSKeychainAdapter());
-}
-
 async function secretAvailable(
   config: TunnelServiceConfig | undefined,
 ): Promise<boolean> {
   if (config === undefined) return false;
   try {
-    return await createKeychainAvailabilityProbe().exists(config.secretRef);
+    return (await inspectTunnelAuthFile(stateRoot(), process.getuid?.()))
+      .available;
   } catch {
     return false;
   }
@@ -384,7 +383,7 @@ async function configureTunnel(tunnelId: string): Promise<void> {
   await profile.write({
     name: config.profileName,
     tunnelId: config.tunnelId,
-    apiKeySecretRef: config.secretRef,
+    apiKeyFilePath: tunnelAuthFilePath(stateRoot()),
     localMcpUrl: config.localMcpUrl,
     healthListenAddress: config.healthListenAddress,
   });
@@ -430,19 +429,45 @@ async function runTunnelService(): Promise<void> {
   });
   if (binary.binaryPath === undefined || binary.compatibility === 'unsupported')
     throw new Error('Supported tunnel-client is unavailable.');
+  const authFile = await inspectTunnelAuthFile(stateRoot(), process.getuid?.());
+  if (!authFile.available) throw new Error('Tunnel auth file is unavailable.');
   const result = await runTunnelWrapper(
     {
       binaryPath: binary.binaryPath,
       profileName: config.profileName,
       profileDirectory: new TunnelProfileStore(stateRoot()).profileDirectory,
       workingDirectory: installationContext().runtimePath,
-      secretRef: config.secretRef,
       baseEnvironment: { PATH: '/usr/bin:/bin', LANG: 'C', LC_ALL: 'C' },
     },
-    keychainProvider(),
     new SystemTunnelChildLauncher(),
   );
   process.exitCode = result.exitCode ?? 1;
+}
+
+async function migrateTunnelAuth(): Promise<void> {
+  const root = stateRoot();
+  const config = await readTunnelServiceConfig(root);
+  if (config === undefined)
+    throw new Error('Tunnel service is not configured.');
+  const migration = await migrateLegacyKeychainTunnelAuth(
+    root,
+    new MacOSKeychainAdapter(new SystemSecurityExecutor(60_000)),
+    process.getuid?.(),
+  );
+  await new TunnelProfileStore(root).write({
+    name: config.profileName,
+    tunnelId: config.tunnelId,
+    apiKeyFilePath: tunnelAuthFilePath(root),
+    localMcpUrl: config.localMcpUrl,
+    healthListenAddress: config.healthListenAddress,
+  });
+  await writeTunnelServiceConfig(root, config);
+  output({
+    migrated: migration.migrated,
+    authFileAvailable: migration.authFileAvailable,
+    profileUpdated: true,
+    configUpdated: true,
+  });
 }
 
 async function recoveryOnce(): Promise<void> {
@@ -491,6 +516,14 @@ async function handleM5(args: readonly string[]): Promise<boolean> {
     const inspection = await inspectLive();
     await writeCurrentSnapshot(inspection);
     output({ tunnel: snapshotFromInspection(inspection).tunnel });
+    return true;
+  }
+  if (
+    args.length === 2 &&
+    args[0] === 'tunnel' &&
+    args[1] === 'migrate-keychain-auth'
+  ) {
+    await migrateTunnelAuth();
     return true;
   }
   if (args[0] !== 'service') return false;
@@ -721,7 +754,7 @@ async function main(): Promise<void> {
     }
     throw new LocalinkError(
       'INVALID_ARGUMENT',
-      'Usage: localink doctor --json | localink service status|bootstrap|bootout --json | localink service restart <core|tunnel> --json | localink tunnel configure <tunnel-id> --json | localink tunnel status --json | localink core self-test --json | runtime health --json | workspace add <name> <absolute-root> --json | workspace list --json | workspace inspect <id> --json | workspace remove <id> --json | process policy --json | process enable --json | process disable --json | skill-source list --json | skill-source add <id> <absolute-root> --json | skill-source remove <id> --json | mcp-provider list --json | mcp-provider add-http <id> <loopback-url> --json | mcp-provider add-stdio <id> <absolute-command> [args...] --json | mcp-provider remove <id> --json',
+      'Usage: localink doctor --json | localink service status|bootstrap|bootout --json | localink service restart <core|tunnel> --json | localink tunnel configure <tunnel-id> --json | localink tunnel status --json | localink tunnel migrate-keychain-auth --json | localink core self-test --json | runtime health --json | workspace add <name> <absolute-root> --json | workspace list --json | workspace inspect <id> --json | workspace remove <id> --json | process policy --json | process enable --json | process disable --json | skill-source list --json | skill-source add <id> <absolute-root> --json | skill-source remove <id> --json | mcp-provider list --json | mcp-provider add-http <id> <loopback-url> --json | mcp-provider add-stdio <id> <absolute-command> [args...] --json | mcp-provider remove <id> --json',
     );
   } finally {
     await runtime.close();

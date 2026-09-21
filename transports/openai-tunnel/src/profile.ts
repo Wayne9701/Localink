@@ -13,13 +13,19 @@ import { createStatePaths } from '@localink/core';
 import { TunnelAdapterError } from './errors.js';
 import { validateProfileName } from './commands.js';
 import {
-  CONTROL_PLANE_API_KEY_ENV,
   DEFAULT_CONTROL_PLANE_BASE_URL,
   DEFAULT_HEALTH_LISTEN_ADDRESS,
   type TunnelProfileInput,
   type TunnelProfileWriteReceipt,
   type ValidatedTunnelProfile,
 } from './types.js';
+
+export const TUNNEL_AUTH_FILE_NAME = 'openai-tunnel-runtime.key' as const;
+
+export function tunnelAuthFilePath(stateRoot?: string): string {
+  const paths = createStatePaths(stateRoot);
+  return path.join(paths.root, 'secrets', TUNNEL_AUTH_FILE_NAME);
+}
 
 function invalid(message: string): never {
   throw new TunnelAdapterError('PROFILE_INVALID', message);
@@ -95,17 +101,17 @@ function assertHealthUrlFile(value: string): string {
   return path.normalize(value);
 }
 
+function assertApiKeyFilePath(value: string): string {
+  if (!path.isAbsolute(value) || value.includes('\0')) {
+    invalid('API key file path must be absolute.');
+  }
+  return path.normalize(value);
+}
+
 export function validateTunnelProfile(
   input: TunnelProfileInput,
 ): ValidatedTunnelProfile {
-  if (
-    typeof input.apiKeySecretRef !== 'object' ||
-    input.apiKeySecretRef === null ||
-    input.apiKeySecretRef.provider.trim() === '' ||
-    input.apiKeySecretRef.key.trim() === ''
-  ) {
-    invalid('A valid API key SecretRef is required.');
-  }
+  const apiKeyFilePath = assertApiKeyFilePath(input.apiKeyFilePath);
   const healthUrlFile =
     input.healthUrlFile === undefined
       ? undefined
@@ -113,8 +119,8 @@ export function validateTunnelProfile(
   return {
     name: validateProfileName(input.name),
     tunnelId: assertTunnelId(input.tunnelId),
-    apiKeySecretRef: structuredClone(input.apiKeySecretRef),
-    apiKeyEnvironmentReference: `env:${CONTROL_PLANE_API_KEY_ENV}`,
+    apiKeyFilePath,
+    apiKeyFileReference: `file:${apiKeyFilePath}`,
     localMcpUrl: assertLocalMcpUrl(input.localMcpUrl),
     controlPlaneBaseUrl: assertControlPlaneUrl(
       input.controlPlaneBaseUrl ?? DEFAULT_CONTROL_PLANE_BASE_URL,
@@ -136,7 +142,7 @@ export function renderTunnelProfile(profile: ValidatedTunnelProfile): string {
     'control_plane:',
     `  base_url: ${yamlString(profile.controlPlaneBaseUrl)}`,
     `  tunnel_id: ${yamlString(profile.tunnelId)}`,
-    `  api_key: ${yamlString(profile.apiKeyEnvironmentReference)}`,
+    `  api_key: ${yamlString(profile.apiKeyFileReference)}`,
     'health:',
     `  listen_addr: ${yamlString(profile.healthListenAddress)}`,
     ...(profile.healthUrlFile === undefined
@@ -183,6 +189,7 @@ async function currentFile(
 
 export class TunnelProfileStore {
   readonly profileDirectory: string;
+  readonly authFilePath: string;
 
   constructor(stateRoot?: string) {
     const paths = createStatePaths(stateRoot);
@@ -191,6 +198,7 @@ export class TunnelProfileStore {
       'openai-tunnel',
       'profiles',
     );
+    this.authFilePath = tunnelAuthFilePath(paths.root);
   }
 
   profilePath(name: string): string {
@@ -205,6 +213,12 @@ export class TunnelProfileStore {
     options: { readonly expectedSha256?: string } = {},
   ): Promise<TunnelProfileWriteReceipt> {
     const profile = validateTunnelProfile(input);
+    if (profile.apiKeyFilePath !== this.authFilePath) {
+      throw new TunnelAdapterError(
+        'PROFILE_INVALID',
+        'Production profile must use the canonical Tunnel auth file.',
+      );
+    }
     const profilePath = this.profilePath(profile.name);
     const existing = await currentFile(profilePath);
     if (
@@ -245,7 +259,7 @@ export class TunnelProfileStore {
       profileDirectory: this.profileDirectory,
       sha256: sha256(rendered),
       replaced: existing !== undefined,
-      apiKeySource: `env:${CONTROL_PLANE_API_KEY_ENV}`,
+      apiKeySource: 'file',
     };
   }
 }
