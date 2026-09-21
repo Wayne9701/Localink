@@ -28,7 +28,11 @@ function definition(
   return {
     serviceId,
     Label: SERVICE_LABELS[serviceId],
-    ProgramArguments: [context.localinkExecutablePath, ...args],
+    ProgramArguments: [
+      context.localinkExecutablePath,
+      ...context.localinkEntrypointArguments,
+      ...args,
+    ],
     WorkingDirectory: context.runtimePath,
     RunAtLoad: true,
     KeepAlive: false,

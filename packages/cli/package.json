@@ -8,7 +8,11 @@
   },
   "dependencies": {
     "@localink/core": "0.1.0",
+    "@localink/mcp-server": "0.1.0",
+    "@localink/openai-tunnel": "0.1.0",
     "@localink/runtime": "0.1.0",
-    "@localink/sdk": "0.1.0"
+    "@localink/sdk": "0.1.0",
+    "@localink/service": "0.1.0",
+    "@modelcontextprotocol/client": "2.0.0"
   }
 }

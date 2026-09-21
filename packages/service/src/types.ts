@@ -13,6 +13,7 @@ export type ServiceReadiness = 'ready' | 'failed' | 'unknown';
 export interface InstallationContextInput {
   readonly installPrefix: string;
   readonly localinkExecutablePath: string;
+  readonly localinkEntrypointArguments: readonly string[];
   readonly runtimePath: string;
   readonly stateRoot: string;
   readonly configRoot: string;
@@ -97,6 +98,8 @@ export interface TunnelLaunchReceipt {
   readonly args: readonly string[];
   readonly secretInjected: true;
   readonly injectedEnvironmentKeys: readonly ['CONTROL_PLANE_API_KEY'];
+  readonly exitCode: number | null;
+  readonly signal: NodeJS.Signals | null;
 }
 
 export interface RestartEvent {

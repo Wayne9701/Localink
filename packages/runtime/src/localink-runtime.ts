@@ -48,6 +48,11 @@ import {
   type SkillSourceLoadSummary,
   type SkillSourcesConfig,
 } from './skill-sources.js';
+import {
+  readServiceSnapshot,
+  unconfiguredServiceSnapshot,
+  type PublicServiceSnapshot,
+} from '@localink/service';
 
 export interface WorkspaceConfigStore {
   read(): Promise<WorkspaceConfig | undefined>;
@@ -101,6 +106,9 @@ export interface LocalinkRuntimeHealth {
     };
     readonly externalMcp: ReturnType<ExternalMcpManager['health']>;
   };
+  readonly service:
+    | PublicServiceSnapshot
+    | { readonly state: 'unconfigured'; readonly stale: true };
 }
 
 function resolveStateRoot(options: LocalinkRuntimeOptions): string | undefined {
@@ -240,6 +248,9 @@ export class LocalinkRuntime {
   }
 
   async health(): Promise<LocalinkRuntimeHealth> {
+    const service =
+      (await readServiceSnapshot(this.statePaths.root)) ??
+      unconfiguredServiceSnapshot();
     return {
       mode: 'runtime',
       version: LOCALINK_VERSION.version,
@@ -263,6 +274,7 @@ export class LocalinkRuntime {
         },
         externalMcp: this.#externalMcp.health(),
       },
+      service,
     };
   }
 

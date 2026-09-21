@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import { LocalinkError, type WorkspaceRecord } from '@localink/sdk';
+import { writeServiceSnapshot } from '@localink/service';
 import {
   WORKSPACE_SCHEMA_VERSION,
   createLocalinkRuntime,
@@ -54,6 +55,7 @@ test('fresh runtime persists stable canonical workspace identity across restart 
           providers: [],
         },
       },
+      service: { state: 'unconfigured', stale: true },
     });
     const added = await first.addWorkspace('primary', workspaceInput);
     assert.equal(added.root, await realpath(workspaceRoot));
@@ -86,6 +88,47 @@ test('separate state roots remain isolated', async () => {
     assert.equal(left.workspaces.list().length, 1);
     assert.equal(right.workspaces.list().length, 0);
     await Promise.all([left.close(), right.close()]);
+  });
+});
+
+test('runtime health reads the latest sanitized service snapshot and marks stale state', async () => {
+  await withTemp(async (root) => {
+    const checkedAt = '2026-09-20T00:00:00.000Z';
+    await writeServiceSnapshot(root, {
+      version: 1,
+      checkedAt,
+      core: {
+        installed: true,
+        processRunning: true,
+        readiness: 'ready',
+        reasonCodes: [],
+      },
+      localMcpReadiness: 'ready',
+      tunnel: {
+        configured: false,
+        secretAvailable: false,
+        installed: false,
+        processRunning: false,
+        binaryAvailable: true,
+        versionCompatibility: 'tested',
+        profileValid: 'unknown',
+        controlPlaneAuth: 'unknown',
+        connected: 'unknown',
+        ready: 'unknown',
+        reasonCodes: ['TUNNEL_NOT_CONFIGURED'],
+      },
+      recovery: { installed: true, lastAction: 'none' },
+      clientBinding: { state: 'not_observable' },
+    });
+    const runtime = await createLocalinkRuntime({ stateRoot: root });
+    const service = (await runtime.health()).service;
+    assert.equal(
+      'checkedAt' in service ? service.checkedAt : undefined,
+      checkedAt,
+    );
+    assert.equal(service.stale, true);
+    assert.equal(JSON.stringify(service).includes(root), false);
+    await runtime.close();
   });
 });
 

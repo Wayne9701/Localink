@@ -2,10 +2,16 @@ import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { mkdir, mkdtemp, realpath, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
+import { createServer } from 'node:net';
 import path from 'node:path';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
 import { createLocalinkRuntime } from '@localink/runtime';
+import { PROTOCOL_VERSION } from '@localink/mcp-server';
+import {
+  Client,
+  StreamableHTTPClientTransport,
+} from '@modelcontextprotocol/client';
 
 const cliEntry = fileURLToPath(new URL('../src/cli.js', import.meta.url));
 
@@ -196,3 +202,77 @@ test('CLI persists local-only Skill source and external MCP provider configurati
     await rm(root, { recursive: true, force: true });
   }
 });
+
+async function availablePort(): Promise<number> {
+  const server = createServer();
+  await new Promise<void>((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', resolve);
+  });
+  const address = server.address();
+  assert.ok(address !== null && typeof address !== 'string');
+  const port = address.port;
+  await new Promise<void>((resolve, reject) =>
+    server.close((error) => (error ? reject(error) : resolve())),
+  );
+  return port;
+}
+
+test(
+  'service core-run is a real foreground MCP server and closes gracefully on SIGTERM',
+  { timeout: 15_000 },
+  async () => {
+    const root = await mkdtemp(path.join(tmpdir(), 'localink-cli-core-run-'));
+    const port = await availablePort();
+    const child = spawn(process.execPath, [cliEntry, 'service', 'core-run'], {
+      env: {
+        ...process.env,
+        LOCALINK_STATE_ROOT: path.join(root, 'state'),
+        LOCALINK_MCP_PORT: String(port),
+      },
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    let stderr = '';
+    child.stderr.on('data', (chunk: Buffer) => {
+      stderr += chunk.toString();
+    });
+    let client: Client | undefined;
+    try {
+      const deadline = Date.now() + 8_000;
+      while (client === undefined && Date.now() < deadline) {
+        const transport = new StreamableHTTPClientTransport(
+          new URL(`http://127.0.0.1:${port}/mcp`),
+        );
+        const candidate = new Client(
+          { name: 'core-run-test', version: '1.0.0' },
+          { versionNegotiation: { mode: { pin: PROTOCOL_VERSION } } },
+        );
+        try {
+          await candidate.connect(transport);
+          client = candidate;
+        } catch {
+          await transport.close().catch(() => undefined);
+          await new Promise((resolve) => setTimeout(resolve, 50));
+        }
+      }
+      assert.ok(client !== undefined, stderr);
+      const tools = await client.listTools();
+      assert.equal(tools.tools.length, 26);
+      const health = await client.callTool({
+        name: 'localink.health_status',
+        arguments: {},
+      });
+      assert.notEqual(health.isError, true);
+      await client.close();
+      child.kill('SIGTERM');
+      const code = await new Promise<number | null>((resolve) =>
+        child.once('close', resolve),
+      );
+      assert.equal(code, 0, stderr);
+    } finally {
+      if (client !== undefined) await client.close().catch(() => undefined);
+      if (child.exitCode === null) child.kill('SIGKILL');
+      await rm(root, { recursive: true, force: true });
+    }
+  },
+);

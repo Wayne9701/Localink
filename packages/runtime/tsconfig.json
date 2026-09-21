@@ -6,5 +6,9 @@
     "tsBuildInfoFile": "dist/runtime.tsbuildinfo"
   },
   "include": ["src/**/*.ts", "test/**/*.ts"],
-  "references": [{ "path": "../sdk" }, { "path": "../core" }]
+  "references": [
+    { "path": "../sdk" },
+    { "path": "../core" },
+    { "path": "../service" }
+  ]
 }

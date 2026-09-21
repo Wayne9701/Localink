@@ -7,6 +7,7 @@
   "exports": "./dist/src/index.js",
   "types": "./dist/src/index.d.ts",
   "dependencies": {
+    "@localink/core": "0.1.0",
     "@localink/openai-tunnel": "0.1.0",
     "@localink/sdk": "0.1.0"
   }

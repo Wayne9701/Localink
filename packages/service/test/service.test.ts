@@ -1,6 +1,14 @@
 import assert from 'node:assert/strict';
 import { execFile } from 'node:child_process';
-import { mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
+import { EventEmitter } from 'node:events';
+import {
+  mkdir,
+  mkdtemp,
+  readFile,
+  rm,
+  stat,
+  writeFile,
+} from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
@@ -12,6 +20,9 @@ import type {
 } from '@localink/sdk';
 import {
   DEFAULT_RECOVERY_POLICY,
+  LaunchctlExecutor,
+  LocalServiceController,
+  MacOSKeychainAdapter,
   SERVICE_LABELS,
   ServiceFoundationError,
   buildBootoutCommand,
@@ -24,12 +35,21 @@ import {
   createLaunchAgentArtifacts,
   createServiceDefinitions,
   createServiceStatus,
+  createTunnelServiceConfig,
   createUninstallPlan,
   decideRecovery,
   dispatchServiceEntrypoint,
+  executeRecoveryOnce,
+  readServiceSnapshot,
+  readTunnelServiceConfig,
   renderLaunchAgentPlist,
   runTunnelWrapper,
+  serviceSnapshotPath,
+  writeServiceSnapshot,
+  writeTunnelServiceConfig,
+  type FixedCommandExecutor,
   type InstallationContext,
+  type RecoveryDecision,
   type RecoveryInput,
   type ServiceStatus,
   type TunnelChildLauncher,
@@ -93,6 +113,7 @@ function fixtureContext(root: string): InstallationContext {
   return createInstallationContext({
     installPrefix: path.join(root, 'install'),
     localinkExecutablePath: path.join(root, 'install', 'bin', 'localink'),
+    localinkEntrypointArguments: [],
     runtimePath: path.join(root, 'install', 'runtime'),
     stateRoot: path.join(root, 'state'),
     configRoot: path.join(root, 'state', 'config'),
@@ -156,6 +177,13 @@ function execFileResult(
 test('three deterministic LaunchAgent definitions use injected paths and isolated logs', async () => {
   await withTemporaryDirectory(async (root) => {
     const context = fixtureContext(root);
+    await mkdir(path.dirname(context.localinkExecutablePath), {
+      recursive: true,
+    });
+    await mkdir(context.runtimePath, { recursive: true });
+    await writeFile(context.localinkExecutablePath, '#!/bin/sh\n', {
+      mode: 0o700,
+    });
     const first = createServiceDefinitions(context);
     const second = createServiceDefinitions(context);
     assert.deepEqual(first, second);
@@ -321,7 +349,15 @@ test('tunnel wrapper reveals a synthetic secret only inside the injected launch 
     const launcher: TunnelChildLauncher = {
       async launch(command, args, options) {
         calls.push({ command, args, env: options.env, shell: options.shell });
-        return { pid: 404 };
+        return {
+          pid: 404,
+          async wait() {
+            return { exitCode: 0, signal: null };
+          },
+          signal() {
+            return true;
+          },
+        };
       },
     };
     const receipt = await runTunnelWrapper(
@@ -630,4 +666,348 @@ test('injected clock and policy make capped backoff deterministic', () => {
   });
   assert.equal(expiredWindow.action, 'start');
   assert.equal(expiredWindow.reasonCode, 'TUNNEL_PROCESS_STOPPED');
+});
+
+function snapshotFixture(checkedAt: string) {
+  return {
+    version: 1 as const,
+    checkedAt,
+    core: {
+      installed: true,
+      processRunning: true,
+      readiness: 'ready' as const,
+      reasonCodes: [],
+    },
+    localMcpReadiness: 'ready' as const,
+    tunnel: {
+      configured: false,
+      secretAvailable: false,
+      installed: false,
+      processRunning: false,
+      binaryAvailable: true,
+      versionCompatibility: 'tested' as const,
+      profileValid: 'unknown' as const,
+      controlPlaneAuth: 'unknown' as const,
+      connected: 'unknown' as const,
+      ready: 'unknown' as const,
+      reasonCodes: ['TUNNEL_NOT_CONFIGURED'],
+    },
+    recovery: {
+      installed: true,
+      lastAction: 'none' as const,
+    },
+    clientBinding: { state: 'not_observable' as const },
+  };
+}
+
+test('service snapshot is atomic, strict, freshness-aware, and public-safe', async () => {
+  await withTemporaryDirectory(async (root) => {
+    const checkedAt = '2026-09-21T00:00:00.000Z';
+    await writeServiceSnapshot(root, snapshotFixture(checkedAt));
+    assert.equal((await stat(serviceSnapshotPath(root))).mode & 0o777, 0o600);
+    const fresh = await readServiceSnapshot(root, {
+      now: Date.parse(checkedAt) + 1_000,
+      freshnessMs: 2_000,
+    });
+    assert.equal(fresh?.stale, false);
+    const stale = await readServiceSnapshot(root, {
+      now: Date.parse(checkedAt) + 3_000,
+      freshnessMs: 2_000,
+    });
+    assert.equal(stale?.stale, true);
+    const serialized = JSON.stringify(stale);
+    for (const privateValue of [
+      '/Users/fixture',
+      'tunnel_private_id',
+      'synthetic-secret',
+      'pid',
+    ]) {
+      assert.equal(serialized.includes(privateValue), false);
+    }
+    await writeFile(
+      serviceSnapshotPath(root),
+      JSON.stringify({ ...snapshotFixture(checkedAt), pid: 99 }),
+    );
+    assert.equal(await readServiceSnapshot(root), undefined);
+  });
+});
+
+test('tunnel service config is strict, non-secret, atomic, and fixed to Local MCP', async () => {
+  await withTemporaryDirectory(async (root) => {
+    const config = createTunnelServiceConfig('tunnel_abcdefgh', {
+      tunnelClientPath: '/opt/local/bin/tunnel-client',
+    });
+    await writeTunnelServiceConfig(root, config);
+    assert.deepEqual(await readTunnelServiceConfig(root), config);
+    const source = await readFile(
+      path.join(root, 'config', 'tunnel-service.json'),
+      'utf8',
+    );
+    assert.match(source, /http:\/\/127\.0\.0\.1:4318\/mcp/u);
+    assert.equal(source.includes('CONTROL_PLANE_API_KEY'), false);
+    assert.equal(source.includes('synthetic-secret'), false);
+    assert.throws(() =>
+      createTunnelServiceConfig('not-a-tunnel', {
+        tunnelClientPath: '/opt/local/bin/tunnel-client',
+      }),
+    );
+  });
+});
+
+test('real Keychain adapter boundary uses fixed security argv and redacts failures', async () => {
+  const calls: Array<{ command: string; args: readonly string[] }> = [];
+  const adapter = new MacOSKeychainAdapter({
+    async execute(command, args) {
+      calls.push({ command, args });
+      return { stdout: 'synthetic-secret\n' };
+    },
+  });
+  assert.equal(
+    await adapter.read('localink.openai-tunnel', 'runtime-api-key'),
+    'synthetic-secret',
+  );
+  assert.deepEqual(calls, [
+    {
+      command: '/usr/bin/security',
+      args: [
+        'find-generic-password',
+        '-s',
+        'localink.openai-tunnel',
+        '-a',
+        'runtime-api-key',
+        '-w',
+      ],
+    },
+  ]);
+  const failing = new MacOSKeychainAdapter({
+    async execute() {
+      throw new Error('synthetic-secret should be hidden');
+    },
+  });
+  await assert.rejects(
+    failing.read('localink.openai-tunnel', 'runtime-api-key'),
+    (error) =>
+      error instanceof Error && !error.message.includes('synthetic-secret'),
+  );
+  const missing = new MacOSKeychainAdapter({
+    async execute() {
+      throw Object.assign(new Error('not found'), { code: 44 });
+    },
+  });
+  assert.equal(
+    await missing.read('localink.openai-tunnel', 'runtime-api-key'),
+    undefined,
+  );
+});
+
+test('service controller writes only managed plists and executes fixed launchctl argv', async () => {
+  await withTemporaryDirectory(async (root) => {
+    const context = fixtureContext(root);
+    await mkdir(path.dirname(context.localinkExecutablePath), {
+      recursive: true,
+    });
+    await mkdir(context.runtimePath, { recursive: true });
+    await writeFile(context.localinkExecutablePath, '#!/bin/sh\n', {
+      mode: 0o700,
+    });
+    const calls: Array<{ command: string; args: readonly string[] }> = [];
+    const executor: FixedCommandExecutor = {
+      async execute(command, args) {
+        calls.push({ command, args });
+        if (
+          command === '/bin/launchctl' &&
+          args[0] === 'print' &&
+          args.length === 2 &&
+          args[1] !== context.launchdDomain
+        ) {
+          throw Object.assign(new Error('missing'), { code: 113 });
+        }
+        return { stdout: '{}', stderr: '' };
+      },
+    };
+    const controller = new LocalServiceController(
+      context,
+      new LaunchctlExecutor(executor),
+      executor,
+      () => 501,
+    );
+    const receipt = await controller.bootstrap(false);
+    assert.deepEqual(receipt.bootstrapped, [
+      'localink-core',
+      'localink-recovery',
+    ]);
+    assert.deepEqual(receipt.skipped, ['localink-tunnel']);
+    assert.equal(receipt.requiresRoot, false);
+    assert.equal(
+      calls.some(
+        ({ command, args }) =>
+          command === '/bin/launchctl' &&
+          args[0] === 'bootstrap' &&
+          args[1] === 'gui/501',
+      ),
+      true,
+    );
+    const corePlist = await readFile(
+      path.join(context.launchAgentsDirectory, 'com.localink.core.plist'),
+      'utf8',
+    );
+    assert.match(corePlist, /Managed by Localink/u);
+    assert.equal(corePlist.includes('CONTROL_PLANE_API_KEY'), false);
+
+    await writeFile(
+      path.join(context.launchAgentsDirectory, 'com.localink.unknown.plist'),
+      'unknown',
+    );
+    await assert.rejects(controller.preflight(), /Unknown com\.localink/u);
+    const rootController = new LocalServiceController(
+      context,
+      new LaunchctlExecutor(executor),
+      executor,
+      () => 0,
+    );
+    await assert.rejects(rootController.preflight(), /Root execution/u);
+  });
+});
+
+test('long-lived tunnel wrapper waits, forwards signals, and reports child exit without secret leakage', async () => {
+  await withTemporaryDirectory(async (root) => {
+    const emitter = new EventEmitter();
+    let finish:
+      | ((value: {
+          exitCode: number | null;
+          signal: NodeJS.Signals | null;
+        }) => void)
+      | undefined;
+    const signaled: NodeJS.Signals[] = [];
+    const launcher: TunnelChildLauncher = {
+      async launch() {
+        return {
+          pid: 404,
+          wait: () =>
+            new Promise((resolve) => {
+              finish = resolve;
+            }),
+          signal(value) {
+            signaled.push(value);
+            return true;
+          },
+        };
+      },
+    };
+    const running = runTunnelWrapper(
+      {
+        binaryPath: path.join(root, 'tunnel-client'),
+        profileName: 'localink',
+        profileDirectory: path.join(root, 'profiles'),
+        workingDirectory: root,
+        secretRef: { provider: 'fake', key: 'runtime-api-key' },
+      },
+      new FakeSecretProvider('fake', 'synthetic-secret'),
+      launcher,
+      { signalEmitter: emitter as unknown as NodeJS.Process, shutdownMs: 50 },
+    );
+    await new Promise((resolve) => setImmediate(resolve));
+    emitter.emit('SIGTERM');
+    assert.deepEqual(signaled, ['SIGTERM']);
+    finish?.({ exitCode: 7, signal: null });
+    const result = await running;
+    assert.equal(result.exitCode, 7);
+    assert.equal(JSON.stringify(result).includes('synthetic-secret'), false);
+    assert.equal(emitter.listenerCount('SIGTERM'), 0);
+  });
+});
+
+test('recovery executor performs at most one mutation and persists backoff/manual state', async () => {
+  await withTemporaryDirectory(async (root) => {
+    const mutations: string[] = [];
+    const snapshots: RecoveryDecision[] = [];
+    const stoppedCore = serviceStatus('localink-core', {
+      processRunning: false,
+      readiness: 'failed',
+    });
+    const dependencies = {
+      stateRoot: root,
+      now: () => new Date('2026-09-21T00:00:00.000Z'),
+      collect: async () => ({
+        core: stoppedCore,
+        localMcpReadiness: 'failed' as const,
+        tunnel: serviceStatus('localink-tunnel', { processRunning: false }),
+        tunnelConnected: 'unknown' as const,
+        tunnelReady: 'unknown' as const,
+        tunnelAuth: 'unknown' as const,
+        coreConfig: 'valid' as const,
+        tunnelConfig: 'unknown' as const,
+        tunnelSecret: 'missing' as const,
+      }),
+      mutate: async (serviceId: string, action: string) => {
+        mutations.push(`${serviceId}:${action}`);
+      },
+      writeSnapshot: async (decision: RecoveryDecision) => {
+        snapshots.push(decision);
+      },
+    };
+    const first = await executeRecoveryOnce(dependencies);
+    assert.equal(first.action, 'start');
+    assert.deepEqual(mutations, ['localink-core:start']);
+    assert.equal(snapshots.length, 1);
+    const second = await executeRecoveryOnce({
+      ...dependencies,
+      now: () => new Date('2026-09-21T00:00:01.000Z'),
+    });
+    assert.equal(second.action, 'wait_backoff');
+    assert.equal(mutations.length, 1);
+    assert.equal(snapshots.length, 2);
+  });
+});
+
+test('live recovery execution keeps tunnel prerequisites manual and restarts tunnel only after Core readiness', async () => {
+  await withTemporaryDirectory(async (root) => {
+    const readyCore = serviceStatus('localink-core');
+    const failedTunnel = serviceStatus('localink-tunnel', {
+      readiness: 'failed',
+    });
+    const mutations: string[] = [];
+    const common = {
+      core: readyCore,
+      localMcpReadiness: 'ready' as const,
+      tunnel: failedTunnel,
+      tunnelConnected: 'failed' as const,
+      tunnelReady: 'failed' as const,
+      coreConfig: 'valid' as const,
+    };
+    const manual = await executeRecoveryOnce({
+      stateRoot: path.join(root, 'manual'),
+      now: () => new Date('2026-09-21T00:00:00.000Z'),
+      collect: async () => ({
+        ...common,
+        tunnelAuth: 'unknown' as const,
+        tunnelConfig: 'unknown' as const,
+        tunnelSecret: 'missing' as const,
+      }),
+      mutate: async (serviceId, action) => {
+        mutations.push(`${serviceId}:${action}`);
+      },
+      writeSnapshot: async () => undefined,
+    });
+    assert.equal(manual.action, 'manual_intervention');
+    assert.equal(manual.reasonCode, 'TUNNEL_SECRET_MISSING');
+    assert.equal(mutations.length, 0);
+
+    const restarted = await executeRecoveryOnce({
+      stateRoot: path.join(root, 'restart'),
+      now: () => new Date('2026-09-21T00:00:00.000Z'),
+      collect: async () => ({
+        ...common,
+        tunnelAuth: 'ready' as const,
+        tunnelConfig: 'valid' as const,
+        tunnelSecret: 'available' as const,
+      }),
+      mutate: async (serviceId, action) => {
+        mutations.push(`${serviceId}:${action}`);
+      },
+      writeSnapshot: async () => undefined,
+    });
+    assert.equal(restarted.action, 'restart');
+    assert.deepEqual(mutations, ['localink-tunnel:restart']);
+  });
 });

@@ -9,6 +9,9 @@
   "references": [
     { "path": "../sdk" },
     { "path": "../core" },
-    { "path": "../runtime" }
+    { "path": "../runtime" },
+    { "path": "../service" },
+    { "path": "../mcp-server" },
+    { "path": "../../transports/openai-tunnel" }
   ]
 }
