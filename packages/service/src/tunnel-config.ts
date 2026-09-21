@@ -28,6 +28,17 @@ export function tunnelServiceConfigPath(stateRoot: string): string {
   return path.join(path.resolve(stateRoot), 'config', 'tunnel-service.json');
 }
 
+export function localinkTunnelClientPath(stateRoot: string): string {
+  return path.join(path.resolve(stateRoot), 'bin', 'tunnel-client');
+}
+
+export function isLocalinkOwnedTunnelClientPath(
+  stateRoot: string,
+  candidate: string,
+): boolean {
+  return path.resolve(candidate) === localinkTunnelClientPath(stateRoot);
+}
+
 export function validateTunnelServiceConfig(
   value: unknown,
 ): TunnelServiceConfig {

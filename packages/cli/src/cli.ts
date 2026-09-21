@@ -41,6 +41,7 @@ import {
   createTunnelServiceConfig,
   executeRecoveryOnce,
   inspectTunnelAuthFile,
+  localinkTunnelClientPath,
   migrateLegacyKeychainTunnelAuth,
   readTunnelServiceConfig,
   runTunnelWrapper,
@@ -368,7 +369,10 @@ async function assertHealthPortAvailable(address: string): Promise<void> {
 }
 
 async function configureTunnel(tunnelId: string): Promise<void> {
-  const binary = await discoverTunnelClient();
+  const root = stateRoot();
+  const binary = await discoverTunnelClient({
+    explicitPath: localinkTunnelClientPath(root),
+  });
   if (
     !binary.available ||
     binary.binaryPath === undefined ||
@@ -379,15 +383,15 @@ async function configureTunnel(tunnelId: string): Promise<void> {
     tunnelClientPath: binary.binaryPath,
   });
   await assertHealthPortAvailable(config.healthListenAddress);
-  const profile = new TunnelProfileStore(stateRoot());
+  const profile = new TunnelProfileStore(root);
   await profile.write({
     name: config.profileName,
     tunnelId: config.tunnelId,
-    apiKeyFilePath: tunnelAuthFilePath(stateRoot()),
+    apiKeyFilePath: tunnelAuthFilePath(root),
     localMcpUrl: config.localMcpUrl,
     healthListenAddress: config.healthListenAddress,
   });
-  await writeTunnelServiceConfig(stateRoot(), config);
+  await writeTunnelServiceConfig(root, config);
   output({
     configured: true,
     profileName: config.profileName,

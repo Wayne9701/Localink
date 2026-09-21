@@ -49,10 +49,14 @@ export function classifyTunnelVersion(
   version: ParsedTunnelVersion,
 ): Compatibility {
   if (version.raw === TESTED_LOCAL_TUNNEL_CLIENT_VERSION) return 'tested';
-  if (version.major === 0 && version.minor === 0 && version.patch === 11) {
-    return 'supported';
-  }
   return 'unsupported';
+}
+
+function unsupportedVersionReason(version: ParsedTunnelVersion): string {
+  if (version.major === 0 && version.minor === 0 && version.patch === 11) {
+    return 'TUNNEL_VERSION_MCP_PROTOCOL_INCOMPATIBLE';
+  }
+  return 'TUNNEL_VERSION_UNVALIDATED';
 }
 
 async function executable(candidate: string): Promise<boolean> {
@@ -142,15 +146,15 @@ export async function discoverTunnelClient(
     );
     const version = parseTunnelVersion(stdout);
     const compatibility = classifyTunnelVersion(version);
-    const supported = compatibility !== 'unsupported';
+    const supported = compatibility === 'tested';
     return {
       available: true,
       binaryPath,
       version: version.raw,
       compatibility,
-      reasonCodes: [
-        supported ? 'TUNNEL_BINARY_PRESENT' : 'TUNNEL_VERSION_UNSUPPORTED',
-      ],
+      reasonCodes: supported
+        ? ['TUNNEL_BINARY_PRESENT']
+        : ['TUNNEL_VERSION_UNSUPPORTED', unsupportedVersionReason(version)],
       installRequirement: {
         required: !supported,
         reasonCode: supported

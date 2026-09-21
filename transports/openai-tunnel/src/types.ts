@@ -1,5 +1,6 @@
 export const TESTED_LOCAL_TUNNEL_CLIENT_VERSION =
-  '0.0.11+8d55683eeef80bc5e360d95abf4692454fafc615' as const;
+  '0.0.14+0f870e50a973fa820d4c409000059e181e8d242b' as const;
+export const REQUIRED_LOCAL_MCP_PROTOCOL_VERSION = '2026-07-28' as const;
 export const CONTROL_PLANE_API_KEY_ENV = 'CONTROL_PLANE_API_KEY' as const;
 export const DEFAULT_CONTROL_PLANE_BASE_URL = 'https://api.openai.com' as const;
 export const DEFAULT_HEALTH_LISTEN_ADDRESS = '127.0.0.1:8080' as const;

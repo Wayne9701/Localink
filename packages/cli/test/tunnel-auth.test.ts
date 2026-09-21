@@ -2,6 +2,8 @@ import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
+import { REQUIRED_LOCAL_MCP_PROTOCOL_VERSION } from '@localink/openai-tunnel';
+import { PROTOCOL_VERSION } from '@localink/mcp-server';
 
 async function source(relativeUrl: string): Promise<string> {
   return readFile(fileURLToPath(new URL(relativeUrl, import.meta.url)), 'utf8');
@@ -37,4 +39,17 @@ test('Tunnel runtime uses fixed file-reference wrapper without secret env inject
   assert.match(wrapperSource, /secretInjected: false/u);
   assert.match(wrapperSource, /injectedEnvironmentKeys: \[\]/u);
   assert.doesNotMatch(cliSource, /secretRef: config\.secretRef/u);
+});
+
+test('Tunnel configuration is pinned to the Localink-owned client and current MCP protocol', async () => {
+  const cliSource = await source('../../src/cli.ts');
+  assert.equal(REQUIRED_LOCAL_MCP_PROTOCOL_VERSION, PROTOCOL_VERSION);
+  assert.match(
+    cliSource,
+    /discoverTunnelClient\(\{\s*explicitPath: localinkTunnelClientPath\(root\)/u,
+  );
+  assert.doesNotMatch(
+    cliSource,
+    /async function configureTunnel[\s\S]*?discoverTunnelClient\(\)/u,
+  );
 });

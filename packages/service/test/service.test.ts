@@ -33,6 +33,8 @@ import {
   createServiceDefinitions,
   createServiceStatus,
   createTunnelServiceConfig,
+  isLocalinkOwnedTunnelClientPath,
+  localinkTunnelClientPath,
   createUninstallPlan,
   decideRecovery,
   dispatchServiceEntrypoint,
@@ -693,8 +695,9 @@ test('service snapshot is atomic, strict, freshness-aware, and public-safe', asy
 
 test('tunnel service config is strict, non-secret, atomic, and fixed to Local MCP', async () => {
   await withTemporaryDirectory(async (root) => {
+    const ownedBinary = localinkTunnelClientPath(root);
     const config = createTunnelServiceConfig('tunnel_abcdefgh', {
-      tunnelClientPath: '/opt/local/bin/tunnel-client',
+      tunnelClientPath: ownedBinary,
     });
     await writeTunnelServiceConfig(root, config);
     assert.deepEqual(await readTunnelServiceConfig(root), config);
@@ -704,12 +707,21 @@ test('tunnel service config is strict, non-secret, atomic, and fixed to Local MC
     );
     assert.match(source, /http:\/\/127\.0\.0\.1:4318\/mcp/u);
     assert.match(source, /"version": 2/u);
+    assert.equal(config.tunnelClientPath, ownedBinary);
+    assert.equal(isLocalinkOwnedTunnelClientPath(root, ownedBinary), true);
+    assert.equal(
+      isLocalinkOwnedTunnelClientPath(
+        root,
+        path.resolve(root, '..', '.local', 'bin', 'tunnel-client'),
+      ),
+      false,
+    );
     assert.equal(source.includes('secretRef'), false);
     assert.equal(source.includes('CONTROL_PLANE_API_KEY'), false);
     assert.equal(source.includes('synthetic-secret'), false);
     assert.throws(() =>
       createTunnelServiceConfig('not-a-tunnel', {
-        tunnelClientPath: '/opt/local/bin/tunnel-client',
+        tunnelClientPath: ownedBinary,
       }),
     );
   });
@@ -738,10 +750,28 @@ test('legacy tunnel service config is accepted only for one-way version-two upgr
     assert.equal(upgraded?.version, 2);
     assert.equal(JSON.stringify(upgraded).includes('secretRef'), false);
     if (upgraded === undefined) throw new Error('Expected upgraded config.');
-    await writeTunnelServiceConfig(root, upgraded);
+    const sharedBinary = path.resolve(
+      root,
+      '..',
+      '.local',
+      'bin',
+      'tunnel-client',
+    );
+    await mkdir(path.dirname(sharedBinary), { recursive: true });
+    await writeFile(sharedBinary, 'shared-binary-sentinel', { mode: 0o755 });
+    const sharedBefore = await readFile(sharedBinary, 'utf8');
+    await writeTunnelServiceConfig(root, {
+      ...upgraded,
+      tunnelClientPath: localinkTunnelClientPath(root),
+    });
     assert.equal(
       (await readFile(destination, 'utf8')).includes('macos-keychain'),
       false,
+    );
+    assert.equal(await readFile(sharedBinary, 'utf8'), sharedBefore);
+    assert.match(
+      await readFile(destination, 'utf8'),
+      new RegExp(localinkTunnelClientPath(root).replaceAll('/', '\\/'), 'u'),
     );
   });
 });

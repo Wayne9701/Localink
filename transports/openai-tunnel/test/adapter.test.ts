@@ -14,6 +14,7 @@ import test from 'node:test';
 import { InMemorySecretProvider, SecretValue } from '@localink/core';
 import {
   TESTED_LOCAL_TUNNEL_CLIENT_VERSION,
+  REQUIRED_LOCAL_MCP_PROTOCOL_VERSION,
   TunnelAdapterError,
   TunnelProfileStore,
   buildDoctorCommand,
@@ -64,7 +65,7 @@ function profileInput(
   };
 }
 
-test('current tunnel-client discovery is live when installed and fail-visible otherwise', async () => {
+test('current tunnel-client discovery is live and compatibility is fail-visible', async () => {
   const discovered = await discoverTunnelClient();
   if (!discovered.available) {
     assert.deepEqual(discovered.reasonCodes, ['TUNNEL_BINARY_MISSING']);
@@ -73,7 +74,13 @@ test('current tunnel-client discovery is live when installed and fail-visible ot
   }
   assert.ok(path.isAbsolute(discovered.binaryPath ?? ''));
   assert.match(discovered.version ?? '', /^\d+\.\d+\.\d+/u);
-  assert.notEqual(discovered.compatibility, 'unsupported');
+  if (discovered.compatibility === 'tested') {
+    assert.equal(discovered.installRequirement.required, false);
+  } else {
+    assert.equal(discovered.compatibility, 'unsupported');
+    assert.equal(discovered.installRequirement.required, true);
+    assert.ok(discovered.reasonCodes.includes('TUNNEL_VERSION_UNSUPPORTED'));
+  }
   const help = await executeShortLivedCommand(
     buildQuickstartHelpCommand(discovered.binaryPath ?? ''),
   );
@@ -130,7 +137,7 @@ test('binary discovery reports missing and malformed versions without installing
   });
 });
 
-test('tested version is recorded as evidence rather than a permanent install pin', async () => {
+test('only the exact official MCP-compatible v0.0.14 build is tested', async () => {
   await withTemporaryDirectory(async (directory) => {
     const binaryPath = await fakeBinary(
       directory,
@@ -141,10 +148,38 @@ test('tested version is recorded as evidence rather than a permanent install pin
     assert.equal(result.compatibility, 'tested');
     assert.equal(result.installRequirement.required, false);
 
-    const futurePath = await fakeBinary(directory, '0.0.12+unvalidated\n');
-    const future = await discoverTunnelClient({ explicitPath: futurePath });
-    assert.equal(future.compatibility, 'unsupported');
-    assert.equal(future.installRequirement.required, true);
+    assert.equal(REQUIRED_LOCAL_MCP_PROTOCOL_VERSION, '2026-07-28');
+
+    for (const version of [
+      '0.0.12+unvalidated',
+      '0.0.13+unvalidated',
+      '0.0.14+unvalidated',
+      '0.0.15+future',
+    ]) {
+      const unvalidatedPath = await fakeBinary(directory, `${version}\n`);
+      const unvalidated = await discoverTunnelClient({
+        explicitPath: unvalidatedPath,
+      });
+      assert.equal(unvalidated.compatibility, 'unsupported');
+      assert.equal(unvalidated.installRequirement.required, true);
+      assert.ok(unvalidated.reasonCodes.includes('TUNNEL_VERSION_UNVALIDATED'));
+    }
+  });
+});
+
+test('v0.0.11 is blocked for MCP 2026-07-28 protocol incompatibility', async () => {
+  await withTemporaryDirectory(async (directory) => {
+    const legacyPath = await fakeBinary(
+      directory,
+      '0.0.11+8d55683eeef80bc5e360d95abf4692454fafc615\n',
+    );
+    const legacy = await discoverTunnelClient({ explicitPath: legacyPath });
+    assert.equal(legacy.compatibility, 'unsupported');
+    assert.equal(legacy.installRequirement.required, true);
+    assert.deepEqual(legacy.reasonCodes, [
+      'TUNNEL_VERSION_UNSUPPORTED',
+      'TUNNEL_VERSION_MCP_PROTOCOL_INCOMPATIBLE',
+    ]);
   });
 });
 
