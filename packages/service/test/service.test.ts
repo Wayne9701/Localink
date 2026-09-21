@@ -74,6 +74,7 @@ class SyntheticSecret implements SecretValueHandle {
 class FakeSecretProvider implements SecretProvider {
   readonly id: string;
   readonly #value: string | undefined;
+  getCount = 0;
 
   constructor(id: string, value?: string) {
     this.id = id;
@@ -81,6 +82,7 @@ class FakeSecretProvider implements SecretProvider {
   }
 
   async get(ref: SecretRef): Promise<SecretValueHandle | undefined> {
+    this.getCount += 1;
     return ref.provider === this.id && this.#value !== undefined
       ? new SyntheticSecret(this.#value)
       : undefined;
@@ -360,6 +362,7 @@ test('tunnel wrapper reveals a synthetic secret only inside the injected launch 
         };
       },
     };
+    const provider = new FakeSecretProvider('fake', syntheticSecret);
     const receipt = await runTunnelWrapper(
       {
         binaryPath: path.join(root, 'bin', 'tunnel-client'),
@@ -369,9 +372,10 @@ test('tunnel wrapper reveals a synthetic secret only inside the injected launch 
         secretRef: { provider: 'fake', key: 'runtime-api-key' },
         baseEnvironment: { LANG: 'C' },
       },
-      new FakeSecretProvider('fake', syntheticSecret),
+      provider,
       launcher,
     );
+    assert.equal(provider.getCount, 1);
     assert.equal(calls.length, 1);
     assert.equal(calls[0]?.env.CONTROL_PLANE_API_KEY, syntheticSecret);
     assert.equal(calls[0]?.shell, false);
@@ -556,6 +560,19 @@ test('Tunnel starts only when Core is ready and auth prerequisites are healthy',
   );
   assert.equal(missingSecret.action, 'manual_intervention');
   assert.equal(missingSecret.reasonCode, 'TUNNEL_SECRET_MISSING');
+
+  const notActivated = decideRecovery(
+    recoveryInput({
+      tunnel: serviceStatus('localink-tunnel', {
+        installed: false,
+        processRunning: false,
+        readiness: 'unknown',
+      }),
+    }),
+  );
+  assert.equal(notActivated.action, 'no_action');
+  assert.equal(notActivated.reasonCode, 'TUNNEL_NOT_ACTIVATED');
+  assert.equal(notActivated.serviceId, 'localink-tunnel');
 });
 
 test('transient crashes back off and repeated crashes enter cooldown/manual state', () => {
@@ -754,7 +771,7 @@ test('tunnel service config is strict, non-secret, atomic, and fixed to Local MC
   });
 });
 
-test('real Keychain adapter boundary uses fixed security argv and redacts failures', async () => {
+test('real Keychain adapter separates metadata existence from secret reads with fixed security argv', async () => {
   const calls: Array<{ command: string; args: readonly string[] }> = [];
   const adapter = new MacOSKeychainAdapter({
     async execute(command, args) {
@@ -779,6 +796,24 @@ test('real Keychain adapter boundary uses fixed security argv and redacts failur
       ],
     },
   ]);
+  calls.length = 0;
+  assert.equal(
+    await adapter.exists('localink.openai-tunnel', 'runtime-api-key'),
+    true,
+  );
+  assert.deepEqual(calls, [
+    {
+      command: '/usr/bin/security',
+      args: [
+        'find-generic-password',
+        '-s',
+        'localink.openai-tunnel',
+        '-a',
+        'runtime-api-key',
+      ],
+    },
+  ]);
+  assert.equal(calls[0]?.args.includes('-w'), false);
   const failing = new MacOSKeychainAdapter({
     async execute() {
       throw new Error('synthetic-secret should be hidden');
@@ -789,6 +824,13 @@ test('real Keychain adapter boundary uses fixed security argv and redacts failur
     (error) =>
       error instanceof Error && !error.message.includes('synthetic-secret'),
   );
+  await assert.rejects(
+    failing.exists('localink.openai-tunnel', 'runtime-api-key'),
+    (error) =>
+      error instanceof Error &&
+      error.message === 'Keychain availability check failed.' &&
+      !error.message.includes('synthetic-secret'),
+  );
   const missing = new MacOSKeychainAdapter({
     async execute() {
       throw Object.assign(new Error('not found'), { code: 44 });
@@ -797,6 +839,10 @@ test('real Keychain adapter boundary uses fixed security argv and redacts failur
   assert.equal(
     await missing.read('localink.openai-tunnel', 'runtime-api-key'),
     undefined,
+  );
+  assert.equal(
+    await missing.exists('localink.openai-tunnel', 'runtime-api-key'),
+    false,
   );
 });
 

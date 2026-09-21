@@ -213,6 +213,11 @@ export function decideRecovery(input: RecoveryInput): RecoveryDecision {
 
   const tunnelPrecondition = manualPrecondition(input, 'localink-tunnel');
   if (tunnelPrecondition !== undefined) return tunnelPrecondition;
+  if (!input.tunnel.installed) {
+    return decision(input, 'no_action', 'TUNNEL_NOT_ACTIVATED', {
+      serviceId: 'localink-tunnel',
+    });
+  }
   if (!input.tunnel.processRunning) {
     return boundedAction(
       input,

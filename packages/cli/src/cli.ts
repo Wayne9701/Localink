@@ -25,12 +25,8 @@ import {
   StreamableHTTPClientTransport,
 } from '@modelcontextprotocol/client';
 import {
-  buildDoctorCommand,
   buildTunnelStatus,
   discoverTunnelClient,
-  executeShortLivedCommand,
-  parseDoctorOutput,
-  resolveTunnelSecretEnvironment,
   TunnelProfileStore,
   type DoctorLayerResult,
   type TunnelBinaryStatus,
@@ -55,6 +51,7 @@ import {
   type ServiceSnapshotInput,
   type TunnelServiceConfig,
 } from '@localink/service';
+import { createKeychainAvailabilityProbe } from './keychain-availability.js';
 
 function output(value: unknown): void {
   process.stdout.write(`${JSON.stringify(value, null, 2)}\n`);
@@ -172,7 +169,7 @@ async function secretAvailable(
 ): Promise<boolean> {
   if (config === undefined) return false;
   try {
-    return (await keychainProvider().get(config.secretRef)) !== undefined;
+    return await createKeychainAvailabilityProbe().exists(config.secretRef);
   } catch {
     return false;
   }
@@ -233,51 +230,6 @@ async function inspectTunnel(localMcp: McpProbe): Promise<TunnelInspection> {
       tunnelReady: 'unknown',
       reasonCodes: ['TUNNEL_CONFIG_INVALID'],
     };
-  }
-  if (
-    config !== undefined &&
-    hasSecret &&
-    binary.available &&
-    binary.binaryPath !== undefined &&
-    binary.compatibility !== 'unsupported'
-  ) {
-    try {
-      const secretEnvironment = await resolveTunnelSecretEnvironment(
-        keychainProvider(),
-        config.secretRef,
-      );
-      const command = buildDoctorCommand(
-        binary.binaryPath,
-        config.profileName,
-        {
-          profileDirectory: new TunnelProfileStore(stateRoot())
-            .profileDirectory,
-          json: true,
-        },
-      );
-      const result = await executeShortLivedCommand({
-        ...command,
-        environmentOverrides: Object.fromEntries(
-          Object.entries(
-            secretEnvironment.forSpawn(command.environmentOverrides),
-          ).filter(
-            (entry): entry is [string, string] => entry[1] !== undefined,
-          ),
-        ),
-      });
-      doctor = parseDoctorOutput(result.stdout);
-    } catch {
-      doctor = {
-        profileValid: 'unknown' as const,
-        tunnelIdPresent: 'unknown' as const,
-        localMcpConfigured: 'unknown' as const,
-        localMcpReachable: localMcp.readiness,
-        controlPlaneAuth: 'failed' as const,
-        tunnelConnected: 'failed' as const,
-        tunnelReady: 'failed' as const,
-        reasonCodes: ['TUNNEL_DOCTOR_FAILED'],
-      };
-    }
   }
   return {
     configured: config !== undefined,

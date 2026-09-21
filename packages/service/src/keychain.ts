@@ -83,6 +83,28 @@ export class MacOSKeychainAdapter implements KeychainAdapterContract {
     }
   }
 
+  /**
+   * Checks that an item can be located without requesting its secret value.
+   * This is intentionally separate from `read()`: M5 status, doctor, and
+   * recovery must never provoke a Keychain authorization prompt.
+   */
+  async exists(service: string, account: string): Promise<boolean> {
+    const args = [
+      'find-generic-password',
+      '-s',
+      safeIdentifier(service, 'service'),
+      '-a',
+      safeIdentifier(account, 'account'),
+    ] as const;
+    try {
+      await this.#executor.execute(SECURITY_BINARY, args);
+      return true;
+    } catch (error) {
+      if (notFound(error)) return false;
+      throw new Error('Keychain availability check failed.');
+    }
+  }
+
   async write(): Promise<void> {
     throw new Error('Keychain mutation is not available in M5.');
   }
