@@ -134,3 +134,65 @@ test('CLI process policy is disabled by default and persists explicit enable/dis
     await rm(root, { recursive: true, force: true });
   }
 });
+
+test('CLI persists local-only Skill source and external MCP provider configuration', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'localink-cli-assets-'));
+  try {
+    const stateRoot = path.join(root, 'state');
+    const skillsRoot = path.join(root, 'skills');
+    await mkdir(skillsRoot);
+    assert.deepEqual(
+      await runCli(stateRoot, ['skill-source', 'list', '--json']),
+      {
+        sources: [],
+      },
+    );
+    const source = await runCli(stateRoot, [
+      'skill-source',
+      'add',
+      'shared',
+      skillsRoot,
+      '--json',
+    ]);
+    assert.deepEqual(source, {
+      id: 'shared',
+      root: skillsRoot,
+      enabled: true,
+    });
+    assert.deepEqual(
+      await runCli(stateRoot, ['skill-source', 'list', '--json']),
+      { sources: [source] },
+    );
+
+    const provider = await runCli(stateRoot, [
+      'mcp-provider',
+      'add-stdio',
+      'fixture',
+      process.execPath,
+      '-e',
+      'process.exit(0)',
+      '--json',
+    ]);
+    assert.deepEqual(provider, {
+      id: 'fixture',
+      transport: 'stdio',
+      command: process.execPath,
+      args: ['-e', 'process.exit(0)'],
+      enabled: true,
+    });
+    assert.deepEqual(
+      await runCli(stateRoot, ['mcp-provider', 'list', '--json']),
+      { providers: [provider] },
+    );
+    assert.deepEqual(
+      await runCli(stateRoot, ['mcp-provider', 'remove', 'fixture', '--json']),
+      provider,
+    );
+    assert.deepEqual(
+      await runCli(stateRoot, ['skill-source', 'remove', 'shared', '--json']),
+      source,
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});

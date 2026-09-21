@@ -44,6 +44,16 @@ test('fresh runtime persists stable canonical workspace identity across restart 
       skillCount: 0,
       state: { ready: true, schemaVersion: 1 },
       processPolicy: { enabled: false, shell: false, osSandbox: false },
+      sharedAssets: {
+        skillSources: { configured: 0, loadedSkills: 0, degraded: 0 },
+        externalMcp: {
+          providerCount: 0,
+          readyProviders: 0,
+          degradedProviders: 0,
+          registeredReadCapabilities: 0,
+          providers: [],
+        },
+      },
     });
     const added = await first.addWorkspace('primary', workspaceInput);
     assert.equal(added.root, await realpath(workspaceRoot));

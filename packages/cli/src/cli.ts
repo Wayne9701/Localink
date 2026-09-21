@@ -110,6 +110,62 @@ async function main(): Promise<void> {
       output({ policy: await runtime.setProcessEnabled(false) });
       return;
     }
+    if (args.length === 2 && args[0] === 'skill-source' && args[1] === 'list') {
+      output({ sources: await runtime.skillSources() });
+      return;
+    }
+    if (
+      args.length === 4 &&
+      args[0] === 'skill-source' &&
+      args[1] === 'add' &&
+      args[2] !== undefined &&
+      args[3] !== undefined
+    ) {
+      output(await runtime.addSkillSource(args[2], args[3]));
+      return;
+    }
+    if (
+      args.length === 3 &&
+      args[0] === 'skill-source' &&
+      args[1] === 'remove' &&
+      args[2] !== undefined
+    ) {
+      output(await runtime.removeSkillSource(args[2]));
+      return;
+    }
+    if (args.length === 2 && args[0] === 'mcp-provider' && args[1] === 'list') {
+      output({ providers: await runtime.externalMcpProviders() });
+      return;
+    }
+    if (
+      args.length === 4 &&
+      args[0] === 'mcp-provider' &&
+      args[1] === 'add-http' &&
+      args[2] !== undefined &&
+      args[3] !== undefined
+    ) {
+      output(await runtime.addHttpProvider(args[2], args[3]));
+      return;
+    }
+    if (
+      args.length >= 4 &&
+      args[0] === 'mcp-provider' &&
+      args[1] === 'add-stdio' &&
+      args[2] !== undefined &&
+      args[3] !== undefined
+    ) {
+      output(await runtime.addStdioProvider(args[2], args[3], args.slice(4)));
+      return;
+    }
+    if (
+      args.length === 3 &&
+      args[0] === 'mcp-provider' &&
+      args[1] === 'remove' &&
+      args[2] !== undefined
+    ) {
+      output(await runtime.removeExternalMcpProvider(args[2]));
+      return;
+    }
     if (
       args.length === 3 &&
       args[0] === 'workspace' &&
@@ -130,7 +186,7 @@ async function main(): Promise<void> {
     }
     throw new LocalinkError(
       'INVALID_ARGUMENT',
-      'Usage: localink core self-test --json | runtime health --json | workspace add <name> <absolute-root> --json | workspace list --json | workspace inspect <id> --json | workspace remove <id> --json | process policy --json | process enable --json | process disable --json',
+      'Usage: localink core self-test --json | runtime health --json | workspace add <name> <absolute-root> --json | workspace list --json | workspace inspect <id> --json | workspace remove <id> --json | process policy --json | process enable --json | process disable --json | skill-source list --json | skill-source add <id> <absolute-root> --json | skill-source remove <id> --json | mcp-provider list --json | mcp-provider add-http <id> <loopback-url> --json | mcp-provider add-stdio <id> <absolute-command> [args...] --json | mcp-provider remove <id> --json',
     );
   } finally {
     await runtime.close();

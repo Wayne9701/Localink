@@ -27,7 +27,8 @@
     "test:cli": "node --test packages/cli/dist/test/*.test.js",
     "test:mcp": "node --test packages/mcp-server/dist/test/*.test.js",
     "test:tunnel": "node --test transports/openai-tunnel/dist/test/*.test.js",
-    "test:service": "node --test packages/service/dist/test/*.test.js"
+    "test:service": "node --test packages/service/dist/test/*.test.js",
+    "e2e:m4:lark": "npm run build && node tests/e2e/m4-lark.mjs"
   },
   "devDependencies": {
     "@eslint/js": "9.39.5",

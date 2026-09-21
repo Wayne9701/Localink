@@ -9,6 +9,7 @@ import {
   createStatePaths,
 } from '@localink/core';
 import {
+  CONTRACT_VERSION_V1,
   LOCALINK_VERSION,
   LocalinkError,
   type StatePaths,
@@ -25,6 +26,28 @@ import {
   validateProcessPolicy,
 } from './process-policy.js';
 import { NativeToolFacade } from './native-tools.js';
+import {
+  EXTERNAL_MCP_MODULE_ID,
+  EXTERNAL_MCP_SCHEMA_VERSION,
+  ExternalMcpManager,
+  addExternalMcpProvider,
+  removeExternalMcpProvider,
+  validateExternalMcpConfig,
+  validExternalMcpProviders,
+  type ExternalMcpConfig,
+  type ExternalMcpProvider,
+} from './external-mcp.js';
+import {
+  SKILL_SOURCE_SCHEMA_VERSION,
+  addSkillSource,
+  loadSkillSources,
+  removeSkillSource,
+  validateSkillSourcesConfig,
+  validSkillSources,
+  type SkillSource,
+  type SkillSourceLoadSummary,
+  type SkillSourcesConfig,
+} from './skill-sources.js';
 
 export interface WorkspaceConfigStore {
   read(): Promise<WorkspaceConfig | undefined>;
@@ -36,11 +59,23 @@ export interface ProcessPolicyStore {
   write(value: ProcessPolicy): Promise<ProcessPolicy>;
 }
 
+export interface SkillSourceStore {
+  read(): Promise<SkillSourcesConfig | undefined>;
+  write(value: SkillSourcesConfig): Promise<SkillSourcesConfig>;
+}
+
+export interface ExternalMcpStore {
+  read(): Promise<ExternalMcpConfig | undefined>;
+  write(value: ExternalMcpConfig): Promise<ExternalMcpConfig>;
+}
+
 export interface LocalinkRuntimeOptions {
   readonly stateRoot?: string;
   readonly environment?: NodeJS.ProcessEnv;
   readonly workspaceStore?: WorkspaceConfigStore;
   readonly processPolicyStore?: ProcessPolicyStore;
+  readonly skillSourceStore?: SkillSourceStore;
+  readonly externalMcpStore?: ExternalMcpStore;
 }
 
 export interface LocalinkRuntimeHealth {
@@ -57,6 +92,14 @@ export interface LocalinkRuntimeHealth {
     readonly enabled: boolean;
     readonly shell: false;
     readonly osSandbox: false;
+  };
+  readonly sharedAssets: {
+    readonly skillSources: {
+      readonly configured: number;
+      readonly loadedSkills: number;
+      readonly degraded: number;
+    };
+    readonly externalMcp: ReturnType<ExternalMcpManager['health']>;
   };
 }
 
@@ -85,7 +128,16 @@ export class LocalinkRuntime {
   readonly native: NativeToolFacade;
   readonly #workspaceStore: WorkspaceConfigStore;
   readonly #processPolicyStore: ProcessPolicyStore;
+  readonly #skillSourceStore: SkillSourceStore;
+  readonly #externalMcpStore: ExternalMcpStore;
+  readonly #externalMcp: ExternalMcpManager;
   #processPolicy: ProcessPolicy;
+  #skillSourceSummary: SkillSourceLoadSummary = {
+    configuredSources: 0,
+    loadedSkills: 0,
+    degradedSources: 0,
+    sources: [],
+  };
   #mutationTail: Promise<void> = Promise.resolve();
   #closed = false;
 
@@ -95,6 +147,8 @@ export class LocalinkRuntime {
     workspaceStore: WorkspaceConfigStore,
     processPolicyStore: ProcessPolicyStore,
     processPolicy: ProcessPolicy,
+    skillSourceStore: SkillSourceStore,
+    externalMcpStore: ExternalMcpStore,
     environment: NodeJS.ProcessEnv,
   ) {
     this.statePaths = statePaths;
@@ -108,6 +162,8 @@ export class LocalinkRuntime {
     this.skills = new SkillRegistry();
     this.#workspaceStore = workspaceStore;
     this.#processPolicyStore = processPolicyStore;
+    this.#skillSourceStore = skillSourceStore;
+    this.#externalMcpStore = externalMcpStore;
     this.#processPolicy = processPolicy;
     this.native = new NativeToolFacade(
       this.workspaces,
@@ -116,6 +172,7 @@ export class LocalinkRuntime {
       () => this.processPolicy(),
       environment,
     );
+    this.#externalMcp = new ExternalMcpManager(this.capabilities, environment);
   }
 
   static async create(
@@ -128,6 +185,12 @@ export class LocalinkRuntime {
     const processPolicyStore =
       options.processPolicyStore ??
       new ConfigStore(statePaths, 'process-policy', validateProcessPolicy);
+    const skillSourceStore =
+      options.skillSourceStore ??
+      new ConfigStore(statePaths, 'skill-sources', validateSkillSourcesConfig);
+    const externalMcpStore =
+      options.externalMcpStore ??
+      new ConfigStore(statePaths, 'external-mcp', validateExternalMcpConfig);
     const workspaces = new WorkspaceRegistry();
     const config = await workspaceStore.read();
     for (const record of config?.workspaces ?? []) {
@@ -137,14 +200,18 @@ export class LocalinkRuntime {
       version: PROCESS_POLICY_SCHEMA_VERSION,
       enabled: false,
     };
-    return new LocalinkRuntime(
+    const runtime = new LocalinkRuntime(
       statePaths,
       workspaces,
       workspaceStore,
       processPolicyStore,
       processPolicy,
+      skillSourceStore,
+      externalMcpStore,
       options.environment ?? process.env,
     );
+    await runtime.#initializeSharedAssets();
+    return runtime;
   }
 
   async addWorkspace(name: string, root: string): Promise<WorkspaceRecord> {
@@ -188,7 +255,64 @@ export class LocalinkRuntime {
         shell: false,
         osSandbox: false,
       },
+      sharedAssets: {
+        skillSources: {
+          configured: this.#skillSourceSummary.configuredSources,
+          loadedSkills: this.#skillSourceSummary.loadedSkills,
+          degraded: this.#skillSourceSummary.degradedSources,
+        },
+        externalMcp: this.#externalMcp.health(),
+      },
     };
+  }
+
+  async skillSources(): Promise<SkillSource[]> {
+    return validSkillSources(await this.#skillSourceStore.read());
+  }
+
+  async addSkillSource(id: string, root: string): Promise<SkillSource> {
+    return this.#mutate(() => addSkillSource(this.#skillSourceStore, id, root));
+  }
+
+  async removeSkillSource(id: string): Promise<SkillSource> {
+    return this.#mutate(() => removeSkillSource(this.#skillSourceStore, id));
+  }
+
+  async externalMcpProviders(): Promise<ExternalMcpProvider[]> {
+    return validExternalMcpProviders(await this.#externalMcpStore.read());
+  }
+
+  async addHttpProvider(id: string, url: string): Promise<ExternalMcpProvider> {
+    return this.#mutate(() =>
+      addExternalMcpProvider(this.#externalMcpStore, {
+        id,
+        transport: 'loopback-http',
+        url,
+        enabled: true,
+      }),
+    );
+  }
+
+  async addStdioProvider(
+    id: string,
+    command: string,
+    args: readonly string[],
+  ): Promise<ExternalMcpProvider> {
+    return this.#mutate(() =>
+      addExternalMcpProvider(this.#externalMcpStore, {
+        id,
+        transport: 'stdio',
+        command,
+        args,
+        enabled: true,
+      }),
+    );
+  }
+
+  async removeExternalMcpProvider(id: string): Promise<ExternalMcpProvider> {
+    return this.#mutate(() =>
+      removeExternalMcpProvider(this.#externalMcpStore, id),
+    );
   }
 
   processPolicy(): ProcessPolicy {
@@ -212,8 +336,40 @@ export class LocalinkRuntime {
 
   async close(): Promise<void> {
     await this.#mutationTail;
+    if (this.#closed) return;
     this.#closed = true;
-    await this.processes.close();
+    await Promise.all([this.#externalMcp.close(), this.processes.close()]);
+  }
+
+  async #initializeSharedAssets(): Promise<void> {
+    let skillConfig: SkillSourcesConfig | undefined;
+    try {
+      skillConfig = await this.#skillSourceStore.read();
+    } catch {
+      skillConfig = { version: SKILL_SOURCE_SCHEMA_VERSION, sources: [null] };
+    }
+    this.#skillSourceSummary = await loadSkillSources(skillConfig, this.skills);
+
+    this.modules.register({
+      manifest: {
+        contractVersion: CONTRACT_VERSION_V1,
+        id: EXTERNAL_MCP_MODULE_ID,
+        version: '1.0.0',
+        title: 'External MCP Read Bridge',
+        runtime: { apiVersion: CONTRACT_VERSION_V1 },
+      },
+    });
+    await this.modules.enable(EXTERNAL_MCP_MODULE_ID);
+    let providerConfig: ExternalMcpConfig | undefined;
+    try {
+      providerConfig = await this.#externalMcpStore.read();
+    } catch {
+      providerConfig = {
+        version: EXTERNAL_MCP_SCHEMA_VERSION,
+        providers: [null],
+      };
+    }
+    await this.#externalMcp.load(providerConfig);
   }
 
   async #persist(workspaces: WorkspaceRecord[]): Promise<void> {

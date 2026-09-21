@@ -3,6 +3,7 @@ import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
+import { fileURLToPath } from 'node:url';
 import { createLocalinkRuntime } from '@localink/runtime';
 import { PublicAdapter } from '../src/public-adapter.js';
 import { createPublicServer } from '../src/server.js';
@@ -23,6 +24,12 @@ import {
 } from './helpers.js';
 
 const SYNTHETIC_SECRET = 'synthetic-not-a-real-secret';
+const externalStdioFixture = fileURLToPath(
+  new URL(
+    '../../../runtime/dist/test/external-mcp-stdio-fixture.js',
+    import.meta.url,
+  ),
+);
 
 async function withNative(
   worker: (fixture: {
@@ -342,10 +349,21 @@ test('official SDK stdio and HTTP expose and call the same exact 26 product tool
   const root = await mkdtemp(path.join(tmpdir(), 'localink-product-native-'));
   const stateRoot = path.join(root, 'state');
   const workspaceRoot = path.join(root, 'workspace');
+  const skillsRoot = path.join(root, 'skills');
   await mkdir(workspaceRoot);
+  await mkdir(path.join(skillsRoot, 'transport-skill'), { recursive: true });
   await writeFile(path.join(workspaceRoot, 'transport.txt'), 'transport-ok');
+  await writeFile(
+    path.join(skillsRoot, 'transport-skill', 'SKILL.md'),
+    '---\nname: Transport Skill\ndescription: Real configured test skill.\n---\n# Transport\n',
+  );
   const setup = await createLocalinkRuntime({ stateRoot });
   const workspace = await setup.addWorkspace('transport', workspaceRoot);
+  await setup.addSkillSource('shared', skillsRoot);
+  await setup.addStdioProvider('fixture', process.execPath, [
+    externalStdioFixture,
+    path.join(root, 'provider.pid'),
+  ]);
   await setup.close();
 
   const stdio = await stdioClientForStateRoot(stateRoot, true);
@@ -368,6 +386,66 @@ test('official SDK stdio and HTTP expose and call the same exact 26 product tool
     unknown
   >[];
   assert.equal(at(stdioItems[0], 'value', 'text'), 'transport-ok');
+  const skillSearch = await call(stdio.client, 'skill_search', {
+    query: 'Transport Skill',
+  });
+  assert.equal((at(skillSearch, 'data', 'items') as unknown[]).length, 1);
+  const skillRead = await call(stdio.client, 'skill_read', {
+    skillId: 'skill.shared.transport-skill',
+  });
+  assert.equal(at(skillRead, 'data', 'trust'), 'untrusted-asset');
+  assert.equal(JSON.stringify(skillRead).includes(skillsRoot), false);
+  const capabilitySearch = await call(stdio.client, 'capability_search', {
+    query: 'fixture_read',
+  });
+  const capabilityItems = at(capabilitySearch, 'data', 'items') as Record<
+    string,
+    unknown
+  >[];
+  assert.equal(capabilityItems.length, 1);
+  const capabilityId = String(capabilityItems[0]?.id);
+  const capabilityDescription = await call(
+    stdio.client,
+    'capability_describe',
+    { capabilityId },
+  );
+  assert.equal(at(capabilityDescription, 'data', 'riskTier'), 0);
+  assert.equal(at(capabilityDescription, 'data', 'operationClass'), 'read');
+  const capabilityInvoke = await call(stdio.client, 'capability_invoke', {
+    capabilityId,
+    input: { value: 'public-bridge-ok' },
+  });
+  assert.equal(at(capabilityInvoke, 'data', 'status'), 'executed');
+  const boundedProviderResult = await call(stdio.client, 'capability_invoke', {
+    capabilityId,
+    input: { value: 'large' },
+  });
+  assert.equal(at(boundedProviderResult, 'truncation', 'truncated'), true);
+  const assetHealth = await call(stdio.client, 'health_status');
+  assert.equal(
+    at(
+      assetHealth,
+      'data',
+      'sharedAssets',
+      'externalMcp',
+      'registeredReadCapabilities',
+    ),
+    1,
+  );
+  assert.equal(
+    JSON.stringify(assetHealth).includes(externalStdioFixture),
+    false,
+  );
+  assert.equal(JSON.stringify(assetHealth).includes(skillsRoot), false);
+  const safeProviderFailure = await call(stdio.client, 'capability_invoke', {
+    capabilityId,
+    input: { value: 'fail' },
+  });
+  assert.equal(
+    at(safeProviderFailure, 'data', 'error', 'code'),
+    'CAPABILITY_UNAVAILABLE',
+  );
+  assert.equal(JSON.stringify(safeProviderFailure).includes(root), false);
   await stdio.client.close();
 
   const runtime = await createLocalinkRuntime({ stateRoot });
