@@ -30,6 +30,7 @@ const LOCAL_WORKSPACES = [
   'packages/service',
   'packages/runtime',
   'packages/mcp-server',
+  'packages/release',
   'packages/cli',
   'transports/openai-tunnel',
 ] as const;

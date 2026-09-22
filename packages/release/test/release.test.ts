@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { execFile } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import {
   chmod,
@@ -135,6 +136,41 @@ test('builder creates a complete production payload without compiler or dev depe
       (await validateReleaseArtifact(artifact)).releaseId,
       'm6-test-a',
     );
+    const entrypoint = path.join(
+      artifact,
+      'payload',
+      'node_modules',
+      '@localink',
+      'cli',
+      'dist',
+      'src',
+      'cli.js',
+    );
+    const packaged = await new Promise<{ stdout: string; stderr: string }>(
+      (resolve, reject) => {
+        execFile(
+          process.execPath,
+          [entrypoint, 'core', 'self-test', '--json'],
+          {
+            cwd: path.join(artifact, 'payload'),
+            env: {
+              PATH: '/usr/bin:/bin',
+              LANG: 'C',
+              LC_ALL: 'C',
+              LOCALINK_STATE_ROOT: path.join(root, 'packaged-state'),
+              LOCALINK_INSTALL_ROOT: artifact,
+            },
+            timeout: 15_000,
+          },
+          (error, stdout, stderr) => {
+            if (error === null) resolve({ stdout, stderr });
+            else reject(error);
+          },
+        );
+      },
+    );
+    assert.equal((JSON.parse(packaged.stdout) as { ok: boolean }).ok, true);
+    assert.equal(packaged.stderr, '');
   });
 });
 
