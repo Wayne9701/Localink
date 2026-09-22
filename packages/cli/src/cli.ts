@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 
+import { execFile } from 'node:child_process';
 import { access, mkdtemp, rm } from 'node:fs/promises';
 import { homedir, tmpdir } from 'node:os';
 import path from 'node:path';
@@ -13,6 +14,12 @@ import {
 } from '@localink/core';
 import { createLocalinkRuntime } from '@localink/runtime';
 import { LocalinkError, LOCALINK_VERSION } from '@localink/sdk';
+import {
+  ReleaseManager,
+  buildReleaseArtifact,
+  type ReleaseManifest,
+  type ReleaseReceipt,
+} from '@localink/release';
 import {
   httpOptionsFromEnv,
   PROTOCOL_VERSION,
@@ -73,11 +80,44 @@ function installationContext(): InstallationContext {
   const repoRoot = path.resolve(path.dirname(executable), '../../../..');
   const root = stateRoot();
   const userHome = homedir();
+  const installedRoot = process.env.LOCALINK_INSTALL_ROOT;
+  if (installedRoot !== undefined) {
+    const normalized = path.resolve(installedRoot);
+    return createInstallationContext({
+      installPrefix: normalized,
+      localinkExecutablePath: path.join(root, 'bin', 'localink'),
+      localinkEntrypointArguments: [],
+      runtimePath: path.join(normalized, 'payload'),
+      stateRoot: root,
+      configRoot: process.env.LOCALINK_CONFIG_ROOT ?? path.join(root, 'config'),
+      logRoot: process.env.LOCALINK_LOG_ROOT ?? path.join(root, 'logs'),
+      userHome,
+      launchAgentsDirectory: path.join(userHome, 'Library', 'LaunchAgents'),
+      uid: process.getuid?.() ?? 0,
+    });
+  }
   return createInstallationContext({
     installPrefix: repoRoot,
     localinkExecutablePath: process.execPath,
     localinkEntrypointArguments: [executable],
     runtimePath: repoRoot,
+    stateRoot: root,
+    configRoot: process.env.LOCALINK_CONFIG_ROOT ?? path.join(root, 'config'),
+    logRoot: process.env.LOCALINK_LOG_ROOT ?? path.join(root, 'logs'),
+    userHome,
+    launchAgentsDirectory: path.join(userHome, 'Library', 'LaunchAgents'),
+    uid: process.getuid?.() ?? 0,
+  });
+}
+
+function stableInstallationContext(): InstallationContext {
+  const root = stateRoot();
+  const userHome = homedir();
+  return createInstallationContext({
+    installPrefix: path.join(root, 'app', 'current'),
+    localinkExecutablePath: path.join(root, 'bin', 'localink'),
+    localinkEntrypointArguments: [],
+    runtimePath: path.join(root, 'app', 'current', 'payload'),
     stateRoot: root,
     configRoot: process.env.LOCALINK_CONFIG_ROOT ?? path.join(root, 'config'),
     logRoot: process.env.LOCALINK_LOG_ROOT ?? path.join(root, 'logs'),
@@ -507,6 +547,214 @@ async function recoveryOnce(): Promise<void> {
   output({ decision });
 }
 
+function executeBounded(
+  command: string,
+  args: readonly string[],
+  options: { readonly env: NodeJS.ProcessEnv; readonly timeoutMs?: number },
+): Promise<{ readonly stdout: string; readonly stderr: string }> {
+  return new Promise((resolve, reject) => {
+    execFile(
+      command,
+      [...args],
+      {
+        env: options.env,
+        timeout: options.timeoutMs ?? 15_000,
+        maxBuffer: 1024 * 1024,
+        windowsHide: true,
+      },
+      (error, stdout, stderr) => {
+        if (error === null) resolve({ stdout, stderr });
+        else reject(new Error('Bounded release validation command failed.'));
+      },
+    );
+  });
+}
+
+async function tunnelCanRun(): Promise<boolean> {
+  const config = await readTunnelServiceConfig(stateRoot()).catch(
+    () => undefined,
+  );
+  if (config === undefined || !(await secretAvailable(config))) return false;
+  const binary = await discoverTunnelClient({
+    ...(config.tunnelClientPath === undefined
+      ? {}
+      : { explicitPath: config.tunnelClientPath }),
+  });
+  return binary.available && binary.compatibility === 'tested';
+}
+
+async function verifyPackagedRuntime(
+  releasePath: string,
+  manifest: ReleaseManifest,
+): Promise<void> {
+  const fixture = await mkdtemp(path.join(tmpdir(), 'localink-release-check-'));
+  try {
+    const entrypoint = path.join(
+      releasePath,
+      ...manifest.entrypoint.split('/'),
+    );
+    const result = await executeBounded(
+      process.execPath,
+      [entrypoint, 'core', 'self-test', '--json'],
+      {
+        env: {
+          PATH: '/usr/bin:/bin',
+          LANG: 'C',
+          LC_ALL: 'C',
+          LOCALINK_STATE_ROOT: path.join(fixture, 'state'),
+          LOCALINK_INSTALL_ROOT: releasePath,
+        },
+      },
+    );
+    const parsed = JSON.parse(result.stdout) as { readonly ok?: unknown };
+    if (parsed.ok !== true || result.stderr !== '') {
+      throw new Error('Packaged Localink self-test failed.');
+    }
+  } finally {
+    await rm(fixture, { recursive: true, force: true });
+  }
+}
+
+async function requireTunnelControlPlanePoll(): Promise<void> {
+  const root = stateRoot();
+  const config = await readTunnelServiceConfig(root);
+  if (config === undefined)
+    throw new Error('Tunnel service is not configured.');
+  const binary = await discoverTunnelClient({
+    ...(config.tunnelClientPath === undefined
+      ? {}
+      : { explicitPath: config.tunnelClientPath }),
+  });
+  if (binary.binaryPath === undefined || binary.compatibility !== 'tested') {
+    throw new Error('Tested Localink tunnel client is unavailable.');
+  }
+  await executeBounded(
+    binary.binaryPath,
+    [
+      'health',
+      '--url',
+      `http://${config.healthListenAddress}`,
+      '--require-control-plane-poll',
+      '--json',
+    ],
+    {
+      env: { PATH: '/usr/bin:/bin', LANG: 'C', LC_ALL: 'C' },
+      timeoutMs: 20_000,
+    },
+  );
+}
+
+async function waitForManagedReadiness(
+  context: InstallationContext,
+  requireTunnel: boolean,
+): Promise<void> {
+  const controller = new LocalServiceController(context);
+  const deadline = Date.now() + 20_000;
+  let lastFailure: unknown;
+  while (Date.now() < deadline) {
+    try {
+      const [mcp, core, tunnel, recovery] = await Promise.all([
+        probeLocalMcp(),
+        controller.status('localink-core'),
+        controller.status('localink-tunnel'),
+        controller.status('localink-recovery'),
+      ]);
+      if (
+        mcp.readiness === 'ready' &&
+        mcp.toolCount === TOOL_NAMES.length &&
+        core.installed &&
+        core.processRunning &&
+        recovery.installed &&
+        (!requireTunnel || (tunnel.installed && tunnel.processRunning))
+      ) {
+        if (requireTunnel) await requireTunnelControlPlanePoll();
+        return;
+      }
+      lastFailure = new Error('Managed Localink readiness is incomplete.');
+    } catch (error) {
+      lastFailure = error;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 250));
+  }
+  throw lastFailure ?? new Error('Managed Localink readiness timed out.');
+}
+
+async function activateManagedContext(
+  context: InstallationContext,
+): Promise<void> {
+  const requireTunnel = await tunnelCanRun();
+  if (!requireTunnel) {
+    throw new Error(
+      'Live release activation requires the existing tested Tunnel configuration.',
+    );
+  }
+  const controller = new LocalServiceController(context);
+  await controller.rebootstrap(true);
+  await waitForManagedReadiness(context, true);
+}
+
+function receiptSucceeded(receipt: ReleaseReceipt): boolean {
+  return receipt.status === 'activated' || receipt.status === 'rolled_back';
+}
+
+async function handleRelease(args: readonly string[]): Promise<boolean> {
+  if (args[0] !== 'release') return false;
+  if (
+    args.length === 5 &&
+    args[1] === 'build' &&
+    args[2] !== undefined &&
+    args[3] !== undefined &&
+    args[4] !== undefined
+  ) {
+    const executable = fileURLToPath(import.meta.url);
+    const sourceRoot = path.resolve(path.dirname(executable), '../../../..');
+    output({
+      manifest: await buildReleaseArtifact({
+        sourceRoot,
+        artifactRoot: path.resolve(args[2]),
+        releaseId: args[3],
+        sourceCommit: args[4],
+        version: LOCALINK_VERSION.version,
+      }),
+    });
+    return true;
+  }
+  const priorContext = installationContext();
+  const stableContext = stableInstallationContext();
+  const stableController = new LocalServiceController(stableContext);
+  const manager = new ReleaseManager({
+    root: stateRoot(),
+    hooks: {
+      beforeSwitch: verifyPackagedRuntime,
+      activate: async () => activateManagedContext(stableContext),
+      restorePrior: async () => activateManagedContext(priorContext),
+      safeStop: async () => {
+        await stableController.bootout();
+      },
+    },
+  });
+  if (args.length === 2 && (args[1] === 'status' || args[1] === 'list')) {
+    output(await manager.status());
+    return true;
+  }
+  if (args.length === 3 && args[1] === 'install' && args[2] !== undefined) {
+    const result = await manager.install(path.resolve(args[2]));
+    output(result);
+    if (!receiptSucceeded(result)) process.exitCode = 1;
+    return true;
+  }
+  if (args.length === 2 && args[1] === 'rollback') {
+    const result = await manager.rollback();
+    output(result);
+    if (!receiptSucceeded(result)) process.exitCode = 1;
+    return true;
+  }
+  throw new LocalinkError(
+    'INVALID_ARGUMENT',
+    'Usage: localink release build <artifact-dir> <release-id> <source-commit> --json | localink release status|list --json | localink release install <artifact-dir> --json | localink release rollback --json',
+  );
+}
+
 async function handleM5(args: readonly string[]): Promise<boolean> {
   if (args.length === 1 && args[0] === 'doctor') {
     await doctor();
@@ -638,6 +886,7 @@ async function main(): Promise<void> {
     await selfTest();
     return;
   }
+  if (await handleRelease(args)) return;
   if (await handleM5(args)) return;
 
   const runtime = await createLocalinkRuntime();
@@ -758,7 +1007,7 @@ async function main(): Promise<void> {
     }
     throw new LocalinkError(
       'INVALID_ARGUMENT',
-      'Usage: localink doctor --json | localink service status|bootstrap|bootout --json | localink service restart <core|tunnel> --json | localink tunnel configure <tunnel-id> --json | localink tunnel status --json | localink tunnel migrate-keychain-auth --json | localink core self-test --json | runtime health --json | workspace add <name> <absolute-root> --json | workspace list --json | workspace inspect <id> --json | workspace remove <id> --json | process policy --json | process enable --json | process disable --json | skill-source list --json | skill-source add <id> <absolute-root> --json | skill-source remove <id> --json | mcp-provider list --json | mcp-provider add-http <id> <loopback-url> --json | mcp-provider add-stdio <id> <absolute-command> [args...] --json | mcp-provider remove <id> --json',
+      'Usage: localink release build|status|list|install|rollback --json | localink doctor --json | localink service status|bootstrap|bootout --json | localink service restart <core|tunnel> --json | localink tunnel configure <tunnel-id> --json | localink tunnel status --json | localink tunnel migrate-keychain-auth --json | localink core self-test --json | runtime health --json | workspace add <name> <absolute-root> --json | workspace list --json | workspace inspect <id> --json | workspace remove <id> --json | process policy --json | process enable --json | process disable --json | skill-source list --json | skill-source add <id> <absolute-root> --json | skill-source remove <id> --json | mcp-provider list --json | mcp-provider add-http <id> <loopback-url> --json | mcp-provider add-stdio <id> <absolute-command> [args...] --json | mcp-provider remove <id> --json',
     );
   } finally {
     await runtime.close();

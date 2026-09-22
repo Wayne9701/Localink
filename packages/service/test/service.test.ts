@@ -992,6 +992,102 @@ test('service controller writes only managed plists and executes fixed launchctl
   });
 });
 
+test('stable-prefix rebootstrap replaces all Localink services in bounded dependency order', async () => {
+  await withTemporaryDirectory(async (root) => {
+    const userHome = path.join(root, 'home');
+    const localinkRoot = path.join(userHome, '.localink');
+    const context = createInstallationContext({
+      installPrefix: path.join(localinkRoot, 'app', 'current'),
+      localinkExecutablePath: path.join(localinkRoot, 'bin', 'localink'),
+      localinkEntrypointArguments: [],
+      runtimePath: path.join(localinkRoot, 'app', 'current', 'payload'),
+      stateRoot: localinkRoot,
+      configRoot: path.join(localinkRoot, 'config'),
+      logRoot: path.join(localinkRoot, 'logs'),
+      userHome,
+      launchAgentsDirectory: path.join(userHome, 'Library', 'LaunchAgents'),
+      uid: 501,
+    });
+    await mkdir(path.dirname(context.localinkExecutablePath), {
+      recursive: true,
+    });
+    await mkdir(context.runtimePath, { recursive: true });
+    await writeFile(context.localinkExecutablePath, '#!/bin/sh\n', {
+      mode: 0o700,
+    });
+    const loaded = new Set<string>();
+    const calls: Array<{ command: string; args: readonly string[] }> = [];
+    const executor: FixedCommandExecutor = {
+      async execute(command, args) {
+        calls.push({ command, args });
+        if (command === '/usr/bin/plutil')
+          return { stdout: 'OK\n', stderr: '' };
+        if (args[0] === 'print' && args[1] === context.launchdDomain) {
+          return { stdout: [...loaded].join('\n'), stderr: '' };
+        }
+        if (args[0] === 'print') {
+          const label = String(args[1]).split('/').at(-1)!;
+          if (!loaded.has(label)) throw new Error('missing');
+          return { stdout: 'state = running\npid = 123\n', stderr: '' };
+        }
+        if (args[0] === 'bootstrap') {
+          loaded.add(path.basename(String(args[2]), '.plist'));
+          return { stdout: '', stderr: '' };
+        }
+        if (args[0] === 'bootout') {
+          loaded.delete(String(args[1]).split('/').at(-1)!);
+          return { stdout: '', stderr: '' };
+        }
+        throw new Error('unexpected command');
+      },
+    };
+    const controller = new LocalServiceController(
+      context,
+      new LaunchctlExecutor(executor),
+      executor,
+      () => 501,
+    );
+    await controller.bootstrap(true);
+    calls.length = 0;
+    const receipt = await controller.rebootstrap(true);
+    assert.deepEqual(receipt.bootstrapped, [
+      'localink-core',
+      'localink-tunnel',
+      'localink-recovery',
+    ]);
+    assert.deepEqual(receipt.skipped, []);
+    const transitions = calls
+      .filter(
+        ({ command, args }) =>
+          command === '/bin/launchctl' &&
+          (args[0] === 'bootout' || args[0] === 'bootstrap'),
+      )
+      .map(({ args }) => args[0]);
+    assert.deepEqual(transitions, [
+      'bootout',
+      'bootout',
+      'bootout',
+      'bootstrap',
+      'bootstrap',
+      'bootstrap',
+    ]);
+    for (const definition of createServiceDefinitions(context)) {
+      assert.equal(
+        definition.ProgramArguments[0],
+        path.join(localinkRoot, 'bin', 'localink'),
+      );
+      assert.equal(
+        definition.WorkingDirectory,
+        path.join(localinkRoot, 'app', 'current', 'payload'),
+      );
+      assert.equal(
+        definition.ProgramArguments.join(' ').includes('/repo/'),
+        false,
+      );
+    }
+  });
+});
+
 test('long-lived tunnel wrapper waits, forwards signals, and reports child exit without secret leakage', async () => {
   await withTemporaryDirectory(async (root) => {
     const emitter = new EventEmitter();

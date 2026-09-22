@@ -21,6 +21,9 @@
     },
     {
       "path": "./packages/service"
+    },
+    {
+      "path": "./packages/release"
     }
   ]
 }

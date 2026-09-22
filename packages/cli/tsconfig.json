@@ -9,6 +9,7 @@
   "references": [
     { "path": "../sdk" },
     { "path": "../core" },
+    { "path": "../release" },
     { "path": "../runtime" },
     { "path": "../service" },
     { "path": "../mcp-server" },

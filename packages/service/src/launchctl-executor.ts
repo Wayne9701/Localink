@@ -310,6 +310,57 @@ export class LocalServiceController {
     return { bootstrapped, skipped, requiresRoot: false };
   }
 
+  async rebootstrap(tunnelReady: boolean): Promise<ServiceBootstrapReceipt> {
+    await this.preflight();
+    await Promise.all([
+      mkdir(this.#context.stateRoot, { recursive: true, mode: 0o700 }),
+      mkdir(this.#context.configRoot, { recursive: true, mode: 0o700 }),
+      mkdir(this.#context.logRoot, { recursive: true, mode: 0o700 }),
+    ]);
+    const selected = new Set<ServiceId>([
+      'localink-core',
+      'localink-recovery',
+      ...(tunnelReady ? (['localink-tunnel'] as const) : []),
+    ]);
+    const artifacts = createLaunchAgentArtifacts(this.#context);
+    for (const artifact of artifacts) {
+      if (!selected.has(artifact.serviceId)) continue;
+      await atomicManagedWrite(artifact.destinationPath, artifact.contents);
+      await this.#executor.execute('/usr/bin/plutil', [
+        '-lint',
+        artifact.destinationPath,
+      ]);
+    }
+    for (const serviceId of [
+      'localink-recovery',
+      'localink-tunnel',
+      'localink-core',
+    ] as const) {
+      const label = SERVICE_LABELS[serviceId];
+      const status = await this.#launchctl.print(
+        buildPrintCommand(this.#context, label),
+      );
+      if (status.installed) {
+        await this.#launchctl.execute(
+          buildBootoutCommand(this.#context, label),
+        );
+      }
+    }
+    const bootstrapped: ServiceId[] = [];
+    const skipped: ServiceId[] = [];
+    for (const artifact of artifacts) {
+      if (!selected.has(artifact.serviceId)) {
+        skipped.push(artifact.serviceId);
+        continue;
+      }
+      await this.#launchctl.execute(
+        buildBootstrapCommand(this.#context, artifact),
+      );
+      bootstrapped.push(artifact.serviceId);
+    }
+    return { bootstrapped, skipped, requiresRoot: false };
+  }
+
   async bootout(): Promise<{ readonly bootedOut: readonly ServiceId[] }> {
     const bootedOut: ServiceId[] = [];
     for (const serviceId of [
