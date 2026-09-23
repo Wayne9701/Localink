@@ -981,14 +981,24 @@ test('service controller writes only managed plists and executes fixed launchctl
       path.join(context.launchAgentsDirectory, 'com.localink.unknown.plist'),
       'unknown',
     );
-    await assert.rejects(controller.preflight(), /Unknown com\.localink/u);
+    await assert.rejects(
+      controller.preflight(),
+      (error) =>
+        error instanceof ServiceFoundationError &&
+        error.code === 'SERVICE_PREFLIGHT_FAILED',
+    );
     const rootController = new LocalServiceController(
       context,
       new LaunchctlExecutor(executor),
       executor,
       () => 0,
     );
-    await assert.rejects(rootController.preflight(), /Root execution/u);
+    await assert.rejects(
+      rootController.preflight(),
+      (error) =>
+        error instanceof ServiceFoundationError &&
+        error.code === 'SERVICE_PREFLIGHT_FAILED',
+    );
   });
 });
 
@@ -1027,7 +1037,8 @@ test('stable-prefix rebootstrap replaces all Localink services in bounded depend
         }
         if (args[0] === 'print') {
           const label = String(args[1]).split('/').at(-1)!;
-          if (!loaded.has(label)) throw new Error('missing');
+          if (!loaded.has(label))
+            throw Object.assign(new Error('missing'), { code: 113 });
           return { stdout: 'state = running\npid = 123\n', stderr: '' };
         }
         if (args[0] === 'bootstrap') {
@@ -1086,6 +1097,215 @@ test('stable-prefix rebootstrap replaces all Localink services in bounded depend
       );
     }
   });
+});
+
+interface TransitionFixture {
+  readonly controller: LocalServiceController;
+  readonly events: string[];
+  readonly elapsed: () => number;
+}
+
+async function withTransitionFixture(
+  options: {
+    readonly unloadAfter?: number;
+    readonly registerAfter?: number;
+    readonly registeredRunning?: boolean;
+    readonly fail?: 'bootout' | 'bootstrap';
+  },
+  worker: (fixture: TransitionFixture) => Promise<void>,
+): Promise<void> {
+  await withTemporaryDirectory(async (root) => {
+    const context = fixtureContext(root);
+    await mkdir(path.dirname(context.localinkExecutablePath), {
+      recursive: true,
+    });
+    await mkdir(context.runtimePath, { recursive: true });
+    await mkdir(context.launchAgentsDirectory, { recursive: true });
+    await writeFile(context.localinkExecutablePath, '#!/bin/sh\n', {
+      mode: 0o700,
+    });
+    const artifacts = createLaunchAgentArtifacts(context);
+    for (const artifact of artifacts)
+      await writeFile(artifact.destinationPath, artifact.contents);
+    const loaded = new Set(artifacts.map((artifact) => artifact.label));
+    const unloading = new Map<string, number>();
+    const registering = new Map<string, number>();
+    const events: string[] = [];
+    let current = 0;
+    const executor: FixedCommandExecutor = {
+      async execute(command, args) {
+        if (command === '/usr/bin/plutil')
+          return { stdout: 'OK\n', stderr: '' };
+        const operation = args[0];
+        if (operation === 'print' && args[1] === context.launchdDomain)
+          return { stdout: [...loaded].join('\n'), stderr: '' };
+        const label =
+          operation === 'bootstrap'
+            ? path.basename(String(args[2]), '.plist')
+            : String(args.at(-1)).split('/').at(-1)!;
+        if (operation === 'print') {
+          if (unloading.has(label)) {
+            const remaining = unloading.get(label)! - 1;
+            if (remaining <= 0) {
+              unloading.delete(label);
+              loaded.delete(label);
+            } else unloading.set(label, remaining);
+          }
+          if (registering.has(label)) {
+            const remaining = registering.get(label)! - 1;
+            if (remaining <= 0) {
+              registering.delete(label);
+              loaded.add(label);
+            } else registering.set(label, remaining);
+          }
+          events.push(
+            `print:${label}:${loaded.has(label) ? 'present' : 'absent'}`,
+          );
+          if (!loaded.has(label))
+            throw Object.assign(new Error('not registered'), { code: 113 });
+          return {
+            stdout:
+              options.registeredRunning === false
+                ? 'state = waiting\n'
+                : 'state = running\npid = 123\n',
+            stderr: '',
+          };
+        }
+        if (operation === 'bootout') {
+          events.push(`bootout:${label}`);
+          if (options.fail === 'bootout')
+            throw new Error('synthetic raw launchctl secret');
+          unloading.set(label, options.unloadAfter ?? 1);
+          return { stdout: '', stderr: '' };
+        }
+        if (operation === 'bootstrap') {
+          events.push(`bootstrap:${label}`);
+          if (options.fail === 'bootstrap')
+            throw new Error('synthetic raw launchctl secret');
+          registering.set(label, options.registerAfter ?? 1);
+          return { stdout: '', stderr: '' };
+        }
+        throw new Error('unexpected command');
+      },
+    };
+    const controller = new LocalServiceController(
+      context,
+      new LaunchctlExecutor(executor),
+      executor,
+      () => 501,
+      {
+        now: () => current,
+        sleep: async (ms) => {
+          current += ms;
+        },
+      },
+    );
+    await worker({ controller, events, elapsed: () => current });
+  });
+}
+
+test('rebootstrap confirms immediate unload and registration in service order', async () => {
+  await withTransitionFixture({}, async ({ controller, events, elapsed }) => {
+    const receipt = await controller.rebootstrap(true);
+    assert.deepEqual(receipt.bootstrapped, [
+      'localink-core',
+      'localink-tunnel',
+      'localink-recovery',
+    ]);
+    assert.equal(elapsed(), 0);
+    const firstBootstrap = events.findIndex((event) =>
+      event.startsWith('bootstrap:'),
+    );
+    assert.ok(firstBootstrap > 0);
+    for (const label of Object.values(SERVICE_LABELS))
+      assert.ok(events.indexOf(`print:${label}:absent`) < firstBootstrap);
+  });
+});
+
+test('rebootstrap waits for the third unload probe before any bootstrap', async () => {
+  await withTransitionFixture(
+    { unloadAfter: 3 },
+    async ({ controller, events, elapsed }) => {
+      await controller.rebootstrap(true);
+      const firstBootstrap = events.findIndex((event) =>
+        event.startsWith('bootstrap:'),
+      );
+      assert.ok(firstBootstrap > 0);
+      for (const label of Object.values(SERVICE_LABELS)) {
+        assert.ok(events.indexOf(`print:${label}:absent`) < firstBootstrap);
+        assert.equal(
+          events.filter((event) => event === `print:${label}:present`).length >=
+            3,
+          true,
+        );
+      }
+      assert.equal(elapsed(), 450);
+    },
+  );
+});
+
+test('rebootstrap stops before bootstrap when unload never completes', async () => {
+  await withTransitionFixture(
+    { unloadAfter: Infinity },
+    async ({ controller, events, elapsed }) => {
+      await assert.rejects(
+        controller.rebootstrap(true),
+        (error) =>
+          error instanceof ServiceFoundationError &&
+          error.code === 'LAUNCHCTL_UNLOAD_TIMEOUT',
+      );
+      assert.equal(
+        events.some((event) => event.startsWith('bootstrap:')),
+        false,
+      );
+      assert.equal(elapsed(), 5_000);
+    },
+  );
+});
+
+test('rebootstrap preserves typed bootout and bootstrap command failures without raw output', async () => {
+  for (const [fail, code] of [
+    ['bootout', 'LAUNCHCTL_BOOTOUT_FAILED'],
+    ['bootstrap', 'LAUNCHCTL_BOOTSTRAP_FAILED'],
+  ] as const) {
+    await withTransitionFixture({ fail }, async ({ controller }) => {
+      await assert.rejects(
+        controller.rebootstrap(true),
+        (error) =>
+          error instanceof ServiceFoundationError &&
+          error.code === code &&
+          !error.message.includes('synthetic raw launchctl secret'),
+      );
+    });
+  }
+});
+
+test('rebootstrap waits for delayed registration without requiring process readiness', async () => {
+  await withTransitionFixture(
+    { registerAfter: 3, registeredRunning: false },
+    async ({ controller, events, elapsed }) => {
+      await controller.rebootstrap(true);
+      for (const label of Object.values(SERVICE_LABELS))
+        assert.ok(events.includes(`print:${label}:absent`));
+      assert.equal(elapsed(), 450);
+    },
+  );
+});
+
+test('rebootstrap reports registration timeout after successful bootstrap', async () => {
+  await withTransitionFixture(
+    { registerAfter: Infinity },
+    async ({ controller, events, elapsed }) => {
+      await assert.rejects(
+        controller.rebootstrap(true),
+        (error) =>
+          error instanceof ServiceFoundationError &&
+          error.code === 'LAUNCHCTL_REGISTRATION_TIMEOUT',
+      );
+      assert.ok(events.some((event) => event.startsWith('bootstrap:')));
+      assert.equal(elapsed(), 5_000);
+    },
+  );
 });
 
 test('long-lived tunnel wrapper waits, forwards signals, and reports child exit without secret leakage', async () => {

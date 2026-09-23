@@ -19,6 +19,7 @@ import {
   buildPrintCommand,
 } from './launchctl.js';
 import { createLaunchAgentArtifacts, SERVICE_LABELS } from './definitions.js';
+import { ServiceFoundationError } from './errors.js';
 import type {
   InstallationContext,
   LaunchctlCommand,
@@ -35,6 +36,7 @@ export interface FixedCommandExecutor {
   execute(
     command: string,
     args: readonly string[],
+    timeoutMs?: number,
   ): Promise<{ readonly stdout: string; readonly stderr: string }>;
 }
 
@@ -42,13 +44,14 @@ export class SystemFixedCommandExecutor implements FixedCommandExecutor {
   execute(
     command: string,
     args: readonly string[],
+    timeoutMs = 10_000,
   ): Promise<{ readonly stdout: string; readonly stderr: string }> {
     return new Promise((resolve, reject) => {
       execFile(
         command,
         [...args],
         {
-          timeout: 10_000,
+          timeout: Math.min(10_000, Math.max(1, timeoutMs)),
           maxBuffer: OUTPUT_LIMIT,
           windowsHide: true,
           env: { PATH: '/usr/bin:/bin', LANG: 'C', LC_ALL: 'C' },
@@ -92,35 +95,71 @@ export class LaunchctlExecutor {
   }
 
   async execute(command: LaunchctlCommand): Promise<void> {
-    if (command.command !== '/bin/launchctl')
-      throw new Error('Unsafe launchctl command.');
+    const operation = command.args[0];
+    if (
+      command.command !== '/bin/launchctl' ||
+      !['bootout', 'bootstrap', 'kickstart'].includes(operation ?? '')
+    ) {
+      throw new ServiceFoundationError(
+        'LAUNCHCTL_TARGET_INVALID',
+        'Unsafe launchctl command.',
+      );
+    }
     try {
       await this.#executor.execute(command.command, command.args);
     } catch {
-      throw new Error('launchctl operation failed.');
+      const code =
+        operation === 'bootout'
+          ? 'LAUNCHCTL_BOOTOUT_FAILED'
+          : operation === 'bootstrap'
+            ? 'LAUNCHCTL_BOOTSTRAP_FAILED'
+            : 'LAUNCHCTL_KICKSTART_FAILED';
+      throw new ServiceFoundationError(code, `launchctl ${operation} failed.`);
     }
   }
 
-  async print(command: LaunchctlCommand): Promise<LaunchctlPrintStatus> {
+  async print(
+    command: LaunchctlCommand,
+    timeoutMs = 10_000,
+  ): Promise<LaunchctlPrintStatus> {
     if (command.command !== '/bin/launchctl' || command.args[0] !== 'print')
-      throw new Error('Unsafe launchctl status command.');
+      throw new ServiceFoundationError(
+        'LAUNCHCTL_TARGET_INVALID',
+        'Unsafe launchctl status command.',
+      );
     try {
       const result = await this.#executor.execute(
         command.command,
         command.args,
+        timeoutMs,
       );
       return parsePrintOutput(result.stdout);
-    } catch {
-      return {
-        installed: false,
-        processRunning: false,
-        reasonCodes: ['SERVICE_NOT_INSTALLED'],
-      };
+    } catch (error) {
+      if (
+        typeof error === 'object' &&
+        error !== null &&
+        'code' in error &&
+        error.code === 113
+      ) {
+        return {
+          installed: false,
+          processRunning: false,
+          reasonCodes: ['SERVICE_NOT_INSTALLED'],
+        };
+      }
+      throw new ServiceFoundationError(
+        'LAUNCHCTL_STATUS_FAILED',
+        'Unable to inspect launchd service status.',
+      );
     }
   }
 
   async domainLabels(domain: string): Promise<readonly string[]> {
-    if (!/^gui\/\d+$/u.test(domain)) throw new Error('Unsafe launchd domain.');
+    if (!/^gui\/\d+$/u.test(domain))
+      throw new ServiceFoundationError(
+        'SERVICE_PREFLIGHT_FAILED',
+        'Unsafe launchd domain.',
+      );
     try {
       const result = await this.#executor.execute('/bin/launchctl', [
         'print',
@@ -130,7 +169,10 @@ export class LaunchctlExecutor {
         ...new Set(result.stdout.match(/com\.localink\.[a-z0-9.-]+/gu) ?? []),
       ];
     } catch {
-      throw new Error('Unable to inspect launchd domain.');
+      throw new ServiceFoundationError(
+        'SERVICE_PREFLIGHT_FAILED',
+        'Unable to inspect launchd domain.',
+      );
     }
   }
 }
@@ -184,85 +226,148 @@ export interface ServiceBootstrapReceipt {
   readonly requiresRoot: false;
 }
 
+export interface TransitionTiming {
+  readonly now: () => number;
+  readonly sleep: (ms: number) => Promise<void>;
+}
+
+const DEFAULT_TRANSITION_TIMING: TransitionTiming = {
+  now: Date.now,
+  sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+};
+
 export class LocalServiceController {
   readonly #context: InstallationContext;
   readonly #launchctl: LaunchctlExecutor;
   readonly #executor: FixedCommandExecutor;
   readonly #currentUid: () => number;
+  readonly #timing: TransitionTiming;
 
   constructor(
     context: InstallationContext,
     launchctl = new LaunchctlExecutor(),
     executor: FixedCommandExecutor = new SystemFixedCommandExecutor(),
     currentUid: () => number = () => process.getuid?.() ?? 0,
+    timing: TransitionTiming = DEFAULT_TRANSITION_TIMING,
   ) {
     this.#context = context;
     this.#launchctl = launchctl;
     this.#executor = executor;
     this.#currentUid = currentUid;
+    this.#timing = timing;
   }
 
   async preflight(): Promise<void> {
-    if (this.#currentUid() === 0 || this.#currentUid() !== this.#context.uid)
-      throw new Error('Root execution is forbidden.');
-    await Promise.all([
-      access(this.#context.localinkExecutablePath, constants.X_OK),
-      access(this.#context.runtimePath, constants.R_OK),
-    ]).catch(() => {
-      throw new Error('Current checkout service entrypoint is unavailable.');
-    });
-    const known = new Set(Object.values(SERVICE_LABELS));
-    const loaded = await this.#launchctl.domainLabels(
-      this.#context.launchdDomain,
-    );
-    if (loaded.some((label) => !known.has(label)))
-      throw new Error('Unknown com.localink service is already registered.');
-    let files: string[] = [];
     try {
-      files = await readdir(this.#context.launchAgentsDirectory);
-    } catch (error) {
-      if (!(
-        typeof error === 'object' &&
-        error !== null &&
-        'code' in error &&
-        error.code === 'ENOENT'
-      ))
-        throw error;
-    }
-    const unknown = files.filter(
-      (name) =>
-        /^com\.localink\..+\.plist$/u.test(name) &&
-        !known.has(name.slice(0, -'.plist'.length)),
-    );
-    if (unknown.length > 0)
-      throw new Error('Unknown com.localink LaunchAgent artifact exists.');
-    for (const label of known) {
-      const destination = path.join(
-        this.#context.launchAgentsDirectory,
-        `${label}.plist`,
+      if (this.#currentUid() === 0 || this.#currentUid() !== this.#context.uid)
+        throw new Error('Root execution is forbidden.');
+      await Promise.all([
+        access(this.#context.localinkExecutablePath, constants.X_OK),
+        access(this.#context.runtimePath, constants.R_OK),
+      ]).catch(() => {
+        throw new Error('Current checkout service entrypoint is unavailable.');
+      });
+      const known = new Set(Object.values(SERVICE_LABELS));
+      const loaded = await this.#launchctl.domainLabels(
+        this.#context.launchdDomain,
       );
+      if (loaded.some((label) => !known.has(label)))
+        throw new Error('Unknown com.localink service is already registered.');
+      let files: string[] = [];
       try {
-        const source = await readFile(destination, 'utf8');
-        if (!source.includes(MANAGED_MARKER))
-          throw new Error('Existing Localink label is not a managed artifact.');
+        files = await readdir(this.#context.launchAgentsDirectory);
       } catch (error) {
-        if (
+        if (!(
           typeof error === 'object' &&
           error !== null &&
           'code' in error &&
           error.code === 'ENOENT'
-        ) {
-          const status = await this.#launchctl.print(
-            buildPrintCommand(this.#context, label),
-          );
-          if (status.installed)
+        ))
+          throw error;
+      }
+      const unknown = files.filter(
+        (name) =>
+          /^com\.localink\..+\.plist$/u.test(name) &&
+          !known.has(name.slice(0, -'.plist'.length)),
+      );
+      if (unknown.length > 0)
+        throw new Error('Unknown com.localink LaunchAgent artifact exists.');
+      for (const label of known) {
+        const destination = path.join(
+          this.#context.launchAgentsDirectory,
+          `${label}.plist`,
+        );
+        try {
+          const source = await readFile(destination, 'utf8');
+          if (!source.includes(MANAGED_MARKER))
             throw new Error(
-              'Existing Localink service has no managed artifact.',
+              'Existing Localink label is not a managed artifact.',
             );
-          continue;
+        } catch (error) {
+          if (
+            typeof error === 'object' &&
+            error !== null &&
+            'code' in error &&
+            error.code === 'ENOENT'
+          ) {
+            const status = await this.#launchctl.print(
+              buildPrintCommand(this.#context, label),
+            );
+            if (status.installed)
+              throw new Error(
+                'Existing Localink service has no managed artifact.',
+              );
+            continue;
+          }
+          throw error;
+        }
+      }
+    } catch (error) {
+      if (error instanceof ServiceFoundationError) throw error;
+      throw new ServiceFoundationError(
+        'SERVICE_PREFLIGHT_FAILED',
+        'Localink service preflight failed.',
+      );
+    }
+  }
+
+  async #waitForRegistration(label: string, installed: boolean): Promise<void> {
+    const deadline = this.#timing.now() + 5_000;
+    const timeoutCode = installed
+      ? 'LAUNCHCTL_REGISTRATION_TIMEOUT'
+      : 'LAUNCHCTL_UNLOAD_TIMEOUT';
+    while (true) {
+      const remaining = Math.max(1, deadline - this.#timing.now());
+      let status: LaunchctlPrintStatus;
+      try {
+        status = await this.#launchctl.print(
+          buildPrintCommand(this.#context, label),
+          remaining,
+        );
+      } catch (error) {
+        if (
+          this.#timing.now() >= deadline &&
+          error instanceof ServiceFoundationError &&
+          error.code === 'LAUNCHCTL_STATUS_FAILED'
+        ) {
+          throw new ServiceFoundationError(
+            timeoutCode,
+            'LaunchAgent transition observation timed out.',
+          );
         }
         throw error;
       }
+      if (this.#timing.now() <= deadline && status.installed === installed)
+        return;
+      if (this.#timing.now() >= deadline) {
+        throw new ServiceFoundationError(
+          timeoutCode,
+          installed
+            ? 'LaunchAgent registration did not complete in time.'
+            : 'LaunchAgent unload did not complete in time.',
+        );
+      }
+      await this.#timing.sleep(Math.min(75, deadline - this.#timing.now()));
     }
   }
 
@@ -312,24 +417,34 @@ export class LocalServiceController {
 
   async rebootstrap(tunnelReady: boolean): Promise<ServiceBootstrapReceipt> {
     await this.preflight();
-    await Promise.all([
-      mkdir(this.#context.stateRoot, { recursive: true, mode: 0o700 }),
-      mkdir(this.#context.configRoot, { recursive: true, mode: 0o700 }),
-      mkdir(this.#context.logRoot, { recursive: true, mode: 0o700 }),
-    ]);
-    const selected = new Set<ServiceId>([
-      'localink-core',
-      'localink-recovery',
-      ...(tunnelReady ? (['localink-tunnel'] as const) : []),
-    ]);
-    const artifacts = createLaunchAgentArtifacts(this.#context);
-    for (const artifact of artifacts) {
-      if (!selected.has(artifact.serviceId)) continue;
-      await atomicManagedWrite(artifact.destinationPath, artifact.contents);
-      await this.#executor.execute('/usr/bin/plutil', [
-        '-lint',
-        artifact.destinationPath,
+    let artifacts: ReturnType<typeof createLaunchAgentArtifacts>;
+    let selected: Set<ServiceId>;
+    try {
+      await Promise.all([
+        mkdir(this.#context.stateRoot, { recursive: true, mode: 0o700 }),
+        mkdir(this.#context.configRoot, { recursive: true, mode: 0o700 }),
+        mkdir(this.#context.logRoot, { recursive: true, mode: 0o700 }),
       ]);
+      selected = new Set<ServiceId>([
+        'localink-core',
+        'localink-recovery',
+        ...(tunnelReady ? (['localink-tunnel'] as const) : []),
+      ]);
+      artifacts = createLaunchAgentArtifacts(this.#context);
+      for (const artifact of artifacts) {
+        if (!selected.has(artifact.serviceId)) continue;
+        await atomicManagedWrite(artifact.destinationPath, artifact.contents);
+        await this.#executor.execute('/usr/bin/plutil', [
+          '-lint',
+          artifact.destinationPath,
+        ]);
+      }
+    } catch (error) {
+      if (error instanceof ServiceFoundationError) throw error;
+      throw new ServiceFoundationError(
+        'SERVICE_PREFLIGHT_FAILED',
+        'Localink service preparation failed.',
+      );
     }
     for (const serviceId of [
       'localink-recovery',
@@ -345,6 +460,7 @@ export class LocalServiceController {
           buildBootoutCommand(this.#context, label),
         );
       }
+      await this.#waitForRegistration(label, false);
     }
     const bootstrapped: ServiceId[] = [];
     const skipped: ServiceId[] = [];
@@ -356,6 +472,7 @@ export class LocalServiceController {
       await this.#launchctl.execute(
         buildBootstrapCommand(this.#context, artifact),
       );
+      await this.#waitForRegistration(artifact.label, true);
       bootstrapped.push(artifact.serviceId);
     }
     return { bootstrapped, skipped, requiresRoot: false };

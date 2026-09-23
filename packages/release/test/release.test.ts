@@ -376,6 +376,67 @@ test('failed first activation restores the prior live arrangement without a brok
   });
 });
 
+test('release receipts preserve launchd transition codes on activation and automatic restore failure', async () => {
+  await withFixture(async (root) => {
+    const artifact = await fixtureArtifact(root, 'release-a', 'A');
+    const launchdCodes = [
+      'SERVICE_PREFLIGHT_FAILED',
+      'LAUNCHCTL_BOOTOUT_FAILED',
+      'LAUNCHCTL_UNLOAD_TIMEOUT',
+      'LAUNCHCTL_BOOTSTRAP_FAILED',
+      'LAUNCHCTL_REGISTRATION_TIMEOUT',
+    ] as const;
+    for (const code of launchdCodes) {
+      const manager = new ReleaseManager({
+        root: path.join(root, code, '.localink'),
+        allowFixtureRoot: true,
+        hooks: {
+          activate: async () => {
+            throw Object.assign(
+              new Error('synthetic private launchctl output'),
+              {
+                code,
+              },
+            );
+          },
+          restorePrior: async () => undefined,
+        },
+      });
+      const result = await manager.install(artifact);
+      assert.equal(result.status, 'failed_rolled_back');
+      assert.equal(result.failureDetailCode, code);
+      assert.equal(JSON.stringify(result).includes('synthetic private'), false);
+    }
+
+    let safeStops = 0;
+    const failingRestore = new ReleaseManager({
+      root: path.join(root, 'failed-restore', '.localink'),
+      allowFixtureRoot: true,
+      hooks: {
+        activate: async () => {
+          throw Object.assign(new Error('synthetic private activation'), {
+            code: 'LAUNCHCTL_BOOTSTRAP_FAILED',
+          });
+        },
+        restorePrior: async () => {
+          throw Object.assign(new Error('synthetic private restore'), {
+            code: 'LAUNCHCTL_UNLOAD_TIMEOUT',
+          });
+        },
+        safeStop: async () => {
+          safeStops += 1;
+        },
+      },
+    });
+    const result = await failingRestore.install(artifact);
+    assert.equal(result.status, 'failed_safe_stop');
+    assert.equal(result.failureDetailCode, 'LAUNCHCTL_BOOTSTRAP_FAILED');
+    assert.equal(result.rollbackFailureDetailCode, 'LAUNCHCTL_UNLOAD_TIMEOUT');
+    assert.equal(safeStops, 1);
+    assert.equal(JSON.stringify(result).includes('synthetic private'), false);
+  });
+});
+
 test('rollback failure restores pointers, attempts current recovery once, and safe-stops', async () => {
   await withFixture(async (root) => {
     const artifactA = await fixtureArtifact(root, 'release-a', 'A');
