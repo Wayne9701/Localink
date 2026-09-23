@@ -194,6 +194,62 @@ test('configured Skill sources persist, load real SKILL.md safely, and isolate b
   });
 });
 
+test('running runtime atomically refreshes external skill source add/remove', async () => {
+  await withTemp(async (root) => {
+    const stateRoot = path.join(root, 'state');
+    const sourceRoot = path.join(root, 'skills');
+    await mkdir(path.join(sourceRoot, 'example'), { recursive: true });
+    await writeFile(
+      path.join(sourceRoot, 'example', 'SKILL.md'),
+      '# Dynamic Shared Skill\nSynthetic read only.\n',
+    );
+    const running = await createLocalinkRuntime({ stateRoot });
+    const cli = await createLocalinkRuntime({ stateRoot });
+    try {
+      assert.deepEqual(running.skills.list(), []);
+      await cli.addSkillSource('shared', sourceRoot);
+      await running.refreshSkillSources();
+      assert.equal(running.skills.search('Dynamic Shared Skill').length, 1);
+      assert.equal(
+        running.skills.read('skill.shared.example', 128).location,
+        'source:shared/example/SKILL.md',
+      );
+      assert.equal(
+        (await running.health()).sharedAssets.skillSources.loadedSkills,
+        1,
+      );
+      const previous = running.skills;
+      await writeFile(
+        path.join(stateRoot, 'config', 'skill-sources.json'),
+        '{bad json',
+      );
+      await assert.rejects(
+        running.refreshSkillSources(),
+        (error) =>
+          error instanceof LocalinkError && error.code === 'CONFIG_INVALID',
+      );
+      assert.equal(running.skills, previous);
+      assert.equal(running.skills.list().length, 1);
+      await writeFile(
+        path.join(stateRoot, 'config', 'skill-sources.json'),
+        JSON.stringify({
+          version: 1,
+          sources: [{ id: 'shared', root: sourceRoot, enabled: true }],
+        }),
+      );
+      await cli.removeSkillSource('shared');
+      await running.refreshSkillSources();
+      assert.deepEqual(running.skills.list(), []);
+      assert.equal(
+        (await running.health()).sharedAssets.skillSources.configured,
+        0,
+      );
+    } finally {
+      await Promise.all([running.close(), cli.close()]);
+    }
+  });
+});
+
 test('provider config accepts only bounded credential-free loopback HTTP or absolute stdio', () => {
   assert.equal(
     parseExternalMcpProvider({
@@ -363,6 +419,94 @@ test('stdio bridge projects read-only tools, isolates environment, and reaps chi
       }
     }
     assert.fail('stdio provider child remained alive after runtime close');
+  });
+});
+
+test('running runtime refreshes external provider capabilities and closes removed connection', async () => {
+  await withTemp(async (root) => {
+    const stateRoot = path.join(root, 'state');
+    const pidFile = path.join(root, 'dynamic-provider.pid');
+    const running = await createLocalinkRuntime({ stateRoot });
+    const cli = await createLocalinkRuntime({ stateRoot });
+    try {
+      assert.deepEqual(running.capabilities.list(), []);
+      await cli.addStdioProvider('dynamic', process.execPath, [
+        stdioFixture,
+        pidFile,
+      ]);
+      await running.refreshExternalMcp();
+      const capability = running.capabilities.search('fixture_read')[0];
+      assert.ok(capability);
+      assert.equal(
+        (
+          await running.capabilities.invoke(
+            capability.id,
+            { value: 'dynamic-ok' },
+            { policyProfile: 'balanced' },
+          )
+        ).status,
+        'executed',
+      );
+      assert.equal(
+        (await running.health()).sharedAssets.externalMcp
+          .registeredReadCapabilities,
+        1,
+      );
+      const previous = running.capabilities;
+      await writeFile(
+        path.join(stateRoot, 'config', 'external-mcp.json'),
+        '{bad json',
+      );
+      await assert.rejects(
+        running.refreshExternalMcp(),
+        (error) =>
+          error instanceof LocalinkError && error.code === 'CONFIG_INVALID',
+      );
+      assert.equal(running.capabilities, previous);
+      assert.equal(running.capabilities.list().length, 1);
+      await writeFile(
+        path.join(stateRoot, 'config', 'external-mcp.json'),
+        JSON.stringify({
+          version: 1,
+          providers: [
+            {
+              id: 'dynamic',
+              transport: 'stdio',
+              command: process.execPath,
+              args: [stdioFixture, pidFile],
+              enabled: true,
+            },
+          ],
+        }),
+      );
+      const pid = Number(await readFile(pidFile, 'utf8'));
+      await cli.removeExternalMcpProvider('dynamic');
+      await running.refreshExternalMcp();
+      assert.deepEqual(running.capabilities.list(), []);
+      assert.equal(
+        (await running.health()).sharedAssets.externalMcp.providerCount,
+        0,
+      );
+      let exited = false;
+      for (let attempt = 0; attempt < 40; attempt++) {
+        try {
+          process.kill(pid, 0);
+          await new Promise((resolve) => setTimeout(resolve, 25));
+        } catch {
+          exited = true;
+          break;
+        }
+      }
+      assert.equal(exited, true);
+      await cli.addHttpProvider('offline', 'http://127.0.0.1:1/mcp');
+      await running.refreshExternalMcp();
+      const health = await running.health();
+      assert.equal(health.state.ready, true);
+      assert.equal(health.sharedAssets.externalMcp.degradedProviders, 1);
+      assert.deepEqual(running.capabilities.list(), []);
+    } finally {
+      await Promise.all([running.close(), cli.close()]);
+    }
   });
 });
 

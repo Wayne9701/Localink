@@ -6,6 +6,9 @@ export interface PublicRuntime {
   readonly skills: SkillRegistry;
   readonly native?: NativeToolFacade;
   refreshWorkspaces?(): Promise<void>;
+  refreshProcessPolicy?(): Promise<void>;
+  refreshSkillSources?(): Promise<void>;
+  refreshExternalMcp?(): Promise<void>;
   health(): Promise<unknown>;
   validateInput(capabilityId: string, input: unknown): void;
 }

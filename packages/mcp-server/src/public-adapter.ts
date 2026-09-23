@@ -113,6 +113,12 @@ export class PublicAdapter {
     }
     try {
       if (usesWorkspace(name)) await this.runtime.refreshWorkspaces?.();
+      if (name.startsWith('localink.process_'))
+        await this.runtime.refreshProcessPolicy?.();
+      if (name === 'localink.skill_search' || name === 'localink.skill_read')
+        await this.runtime.refreshSkillSources?.();
+      if (name.startsWith('localink.capability_'))
+        await this.runtime.refreshExternalMcp?.();
       const inputLimit =
         name === 'localink.git_apply_patch'
           ? PUBLIC_GIT_LIMITS.patchBytes + 4096

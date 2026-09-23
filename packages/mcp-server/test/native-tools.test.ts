@@ -177,6 +177,117 @@ test('running public workspace, Files, Git, and Process tools refresh external w
   }
 });
 
+test('running public tools refresh external process, skill, and provider config without restart', async () => {
+  await withNative(async ({ root, stateRoot, workspaceId, adapter }) => {
+    const cli = await createLocalinkRuntime({ stateRoot });
+    try {
+      const denied = await invoke(adapter, 'process_exec', {
+        workspaceId,
+        command: process.execPath,
+        args: ['-e', "process.stdout.write('denied')"],
+      });
+      assert.equal(at(denied, 'data', 'error', 'code'), 'POLICY_DENIED');
+      await cli.setProcessEnabled(true);
+      const executed = await invoke(adapter, 'process_exec', {
+        workspaceId,
+        command: process.execPath,
+        args: ['-e', "process.stdout.write('dynamic-process')"],
+      });
+      assert.equal(at(executed, 'data', 'stdout', 'text'), 'dynamic-process');
+      await cli.setProcessEnabled(false);
+      assert.equal(
+        at(
+          await invoke(adapter, 'health_status', {}),
+          'data',
+          'processPolicy',
+          'enabled',
+        ),
+        false,
+      );
+
+      const skillsRoot = path.join(root, 'skills');
+      await mkdir(path.join(skillsRoot, 'dynamic-skill'), { recursive: true });
+      await writeFile(
+        path.join(skillsRoot, 'dynamic-skill', 'SKILL.md'),
+        '# Dynamic Skill\nRead-only fixture.\n',
+      );
+      await cli.addSkillSource('dynamic', skillsRoot);
+      assert.equal(
+        (
+          at(
+            await invoke(adapter, 'skill_search', { query: 'Dynamic Skill' }),
+            'data',
+            'items',
+          ) as unknown[]
+        ).length,
+        1,
+      );
+      const skill = await invoke(adapter, 'skill_read', {
+        skillId: 'skill.dynamic.dynamic-skill',
+      });
+      assert.equal(at(skill, 'data', 'trust'), 'untrusted-asset');
+      assert.equal(JSON.stringify(skill).includes(skillsRoot), false);
+      await cli.removeSkillSource('dynamic');
+      assert.equal(
+        (
+          at(
+            await invoke(adapter, 'skill_search', { query: 'Dynamic Skill' }),
+            'data',
+            'items',
+          ) as unknown[]
+        ).length,
+        0,
+      );
+
+      await cli.addStdioProvider('dynamic', process.execPath, [
+        externalStdioFixture,
+        path.join(root, 'dynamic-provider.pid'),
+      ]);
+      const found = await invoke(adapter, 'capability_search', {
+        query: 'fixture_read',
+      });
+      const items = at(found, 'data', 'items') as Record<string, unknown>[];
+      assert.equal(items.length, 1);
+      const capabilityId = String(items[0]?.id);
+      assert.equal(
+        at(
+          await invoke(adapter, 'capability_invoke', {
+            capabilityId,
+            input: { value: 'dynamic-invoke' },
+          }),
+          'data',
+          'status',
+        ),
+        'executed',
+      );
+      await cli.removeExternalMcpProvider('dynamic');
+      assert.equal(
+        (
+          at(
+            await invoke(adapter, 'capability_search', {
+              query: 'fixture_read',
+            }),
+            'data',
+            'items',
+          ) as unknown[]
+        ).length,
+        0,
+      );
+      assert.equal(
+        at(
+          await invoke(adapter, 'capability_describe', { capabilityId }),
+          'data',
+          'error',
+          'code',
+        ),
+        'CAPABILITY_NOT_FOUND',
+      );
+    } finally {
+      await cli.close();
+    }
+  });
+});
+
 test('workspace and file tools are public-safe, bounded, partial-failure tolerant and verifiable', async () => {
   await withNative(async ({ adapter, root, workspaceId, workspaceRoot }) => {
     await writeFile(path.join(workspaceRoot, 'alpha.txt'), 'needle alpha\n');

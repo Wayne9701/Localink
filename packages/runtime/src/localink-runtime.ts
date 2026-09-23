@@ -131,15 +131,19 @@ export class LocalinkRuntime {
   readonly files: FilesService;
   readonly processes: ProcessManager;
   readonly modules: ModuleRegistry;
-  readonly capabilities: CapabilityRegistry;
-  readonly skills: SkillRegistry;
   readonly native: NativeToolFacade;
   readonly #workspaceStore: WorkspaceConfigStore;
   readonly #processPolicyStore: ProcessPolicyStore;
   readonly #skillSourceStore: SkillSourceStore;
   readonly #externalMcpStore: ExternalMcpStore;
-  readonly #externalMcp: ExternalMcpManager;
+  readonly #environment: NodeJS.ProcessEnv;
+  #capabilities: CapabilityRegistry;
+  #skills: SkillRegistry;
+  #externalMcp: ExternalMcpManager;
   #processPolicy: ProcessPolicy;
+  #processPolicySnapshotKey: string;
+  #skillSourceSnapshotKey = '';
+  #externalMcpSnapshotKey = '';
   #skillSourceSummary: SkillSourceLoadSummary = {
     configuredSources: 0,
     loadedSkills: 0,
@@ -149,6 +153,14 @@ export class LocalinkRuntime {
   #mutationTail: Promise<void> = Promise.resolve();
   #workspaceSnapshotKey: string;
   #closed = false;
+
+  get capabilities(): CapabilityRegistry {
+    return this.#capabilities;
+  }
+
+  get skills(): SkillRegistry {
+    return this.#skills;
+  }
 
   private constructor(
     statePaths: StatePaths,
@@ -166,16 +178,16 @@ export class LocalinkRuntime {
     this.files = new FilesService(workspaces, statePaths);
     this.processes = new ProcessManager(workspaces);
     this.modules = new ModuleRegistry();
-    this.capabilities = new CapabilityRegistry({
-      isModuleEnabled: (moduleId) => this.modules.isEnabled(moduleId),
-    });
-    this.skills = new SkillRegistry();
+    this.#capabilities = this.#newCapabilityRegistry();
+    this.#skills = new SkillRegistry();
     this.#workspaceStore = workspaceStore;
     this.#workspaceSnapshotKey = workspaceSnapshotKey;
     this.#processPolicyStore = processPolicyStore;
     this.#skillSourceStore = skillSourceStore;
     this.#externalMcpStore = externalMcpStore;
     this.#processPolicy = processPolicy;
+    this.#processPolicySnapshotKey = JSON.stringify(processPolicy);
+    this.#environment = environment;
     this.native = new NativeToolFacade(
       this.workspaces,
       this.files,
@@ -183,7 +195,7 @@ export class LocalinkRuntime {
       () => this.processPolicy(),
       environment,
     );
-    this.#externalMcp = new ExternalMcpManager(this.capabilities, environment);
+    this.#externalMcp = new ExternalMcpManager(this.#capabilities, environment);
   }
 
   static async create(
@@ -252,7 +264,12 @@ export class LocalinkRuntime {
   }
 
   async health(): Promise<LocalinkRuntimeHealth> {
-    if (!this.#closed) await this.refreshWorkspaces();
+    if (!this.#closed) {
+      await this.refreshWorkspaces();
+      await this.refreshProcessPolicy();
+      await this.refreshSkillSources();
+      await this.refreshExternalMcp();
+    }
     const service =
       (await readServiceSnapshot(this.statePaths.root)) ??
       unconfiguredServiceSnapshot();
@@ -285,6 +302,18 @@ export class LocalinkRuntime {
 
   async refreshWorkspaces(): Promise<void> {
     await this.#mutate(() => this.#refreshWorkspacesIfChanged());
+  }
+
+  async refreshProcessPolicy(): Promise<void> {
+    await this.#mutate(() => this.#refreshProcessPolicyIfChanged());
+  }
+
+  async refreshSkillSources(): Promise<void> {
+    await this.#mutate(() => this.#refreshSkillSourcesIfChanged());
+  }
+
+  async refreshExternalMcp(): Promise<void> {
+    await this.#mutate(() => this.#refreshExternalMcpIfChanged());
   }
 
   async skillSources(): Promise<SkillSource[]> {
@@ -347,6 +376,7 @@ export class LocalinkRuntime {
         enabled,
       });
       this.#processPolicy = policy;
+      this.#processPolicySnapshotKey = JSON.stringify(policy);
       return { ...policy };
     });
   }
@@ -370,6 +400,7 @@ export class LocalinkRuntime {
       skillConfig = { version: SKILL_SOURCE_SCHEMA_VERSION, sources: [null] };
     }
     this.#skillSourceSummary = await loadSkillSources(skillConfig, this.skills);
+    this.#skillSourceSnapshotKey = JSON.stringify(skillConfig?.sources ?? []);
 
     this.modules.register({
       manifest: {
@@ -391,6 +422,56 @@ export class LocalinkRuntime {
       };
     }
     await this.#externalMcp.load(providerConfig);
+    this.#externalMcpSnapshotKey = JSON.stringify(
+      providerConfig?.providers ?? [],
+    );
+  }
+
+  #newCapabilityRegistry(): CapabilityRegistry {
+    return new CapabilityRegistry({
+      isModuleEnabled: (moduleId) => this.modules.isEnabled(moduleId),
+    });
+  }
+
+  async #refreshProcessPolicyIfChanged(): Promise<void> {
+    const policy = (await this.#processPolicyStore.read()) ?? {
+      version: PROCESS_POLICY_SCHEMA_VERSION,
+      enabled: false,
+    };
+    const key = JSON.stringify(policy);
+    if (key === this.#processPolicySnapshotKey) return;
+    this.#processPolicy = policy;
+    this.#processPolicySnapshotKey = key;
+  }
+
+  async #refreshSkillSourcesIfChanged(): Promise<void> {
+    const config = await this.#skillSourceStore.read();
+    const key = JSON.stringify(config?.sources ?? []);
+    if (key === this.#skillSourceSnapshotKey) return;
+    const skills = new SkillRegistry();
+    const summary = await loadSkillSources(config, skills);
+    this.#skills = skills;
+    this.#skillSourceSummary = summary;
+    this.#skillSourceSnapshotKey = key;
+  }
+
+  async #refreshExternalMcpIfChanged(): Promise<void> {
+    const config = await this.#externalMcpStore.read();
+    const key = JSON.stringify(config?.providers ?? []);
+    if (key === this.#externalMcpSnapshotKey) return;
+    const capabilities = this.#newCapabilityRegistry();
+    const manager = new ExternalMcpManager(capabilities, this.#environment);
+    try {
+      await manager.load(config);
+    } catch (error) {
+      await manager.close();
+      throw error;
+    }
+    const previous = this.#externalMcp;
+    this.#capabilities = capabilities;
+    this.#externalMcp = manager;
+    this.#externalMcpSnapshotKey = key;
+    await previous.close();
   }
 
   async #persist(workspaces: WorkspaceRecord[]): Promise<void> {

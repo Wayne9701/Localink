@@ -179,6 +179,34 @@ test('running runtime refreshes external workspace add/remove and preserves late
   });
 });
 
+test('running runtime refreshes external process policy and retains last valid policy on malformed config', async () => {
+  await withTemp(async (root) => {
+    const stateRoot = path.join(root, 'state');
+    const running = await createLocalinkRuntime({ stateRoot });
+    const cli = await createLocalinkRuntime({ stateRoot });
+    try {
+      assert.equal(running.processPolicy().enabled, false);
+      await cli.setProcessEnabled(true);
+      await running.refreshProcessPolicy();
+      assert.equal(running.native.processPolicy().enabled, true);
+      assert.equal((await running.health()).processPolicy.enabled, true);
+      await cli.setProcessEnabled(false);
+      assert.equal((await running.health()).processPolicy.enabled, false);
+      await writeFile(
+        path.join(stateRoot, 'config', 'process-policy.json'),
+        '{bad json',
+      );
+      await assert.rejects(
+        running.refreshProcessPolicy(),
+        hasCode('CONFIG_INVALID'),
+      );
+      assert.equal(running.processPolicy().enabled, false);
+    } finally {
+      await Promise.all([running.close(), cli.close()]);
+    }
+  });
+});
+
 test('runtime health reads the latest sanitized service snapshot and marks stale state', async () => {
   await withTemp(async (root) => {
     const checkedAt = '2026-09-20T00:00:00.000Z';

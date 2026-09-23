@@ -22,7 +22,7 @@ const messages = {
   MODULE_DISABLED: 'Module is disabled.',
   SIZE_LIMIT_EXCEEDED: 'Input exceeds the allowed size.',
   CONTRACT_INVALID: 'The runtime contract is invalid.',
-  CONFIG_INVALID: 'Workspace configuration is invalid.',
+  CONFIG_INVALID: 'Localink configuration is invalid.',
   IO_ERROR: 'Localink could not complete the I/O operation.',
 } as const;
 
