@@ -47,7 +47,7 @@ server/adapter over one process-scoped runtime. Runtime state persists across
 requests; caller context does not. There is no persistent MCP session and no
 `Mcp-Session-Id` dependency.
 
-## Public tools: exactly 21
+## Public tools: exactly 26
 
 | Tool                                                       | Input / purpose                                                                           |
 | ---------------------------------------------------------- | ----------------------------------------------------------------------------------------- |
@@ -67,12 +67,13 @@ requests; caller context does not. There is no persistent MCP session and no
 | `localink.files_move` / `files_archive`                    | No-overwrite move and redacted recoverable archive receipt                                |
 | `localink.process_exec` / `process_start`                  | Local-policy-gated host execution; `shell: false`; no public env input                    |
 | `localink.process_poll` / `process_input` / `process_stop` | Managed process lifecycle                                                                 |
+| `localink.git_inspect`                                     | Bounded repository inspection within an authorized workspace                              |
+| `localink.git_status` / `git_diff` / `git_log`             | Structured, bounded Git reads                                                             |
+| `localink.git_apply_patch`                                 | Preconditions and bounded patch application with rollback on failure                      |
 
-M2 real runtime capability and Skill registries are intentionally empty. The
-fixture runtime and synthetic invocation context exist only behind explicit
-test entrypoints. They remain available for policy, identity, verification,
-error, bounding and Skill-contract regression tests and are never selected by a
-product entrypoint.
+Real runtime capability and Skill registries load explicitly configured Shared
+MCP and Shared Skill sources. The fixture runtime and synthetic invocation
+context remain explicit test-only entrypoints, never product defaults.
 
 ## Bounds and errors
 
@@ -97,8 +98,8 @@ npm run test:mcp
 Tests require permission to bind localhost. No public network endpoint is
 needed.
 
-M2 includes **no Git tools, Secure MCP Tunnel dogfood, live macOS Service,
-External MCP Bridge, Shared Skill filesystem adapter, Installer, Codex Agent,
-Browser, PTY, delete tool, blind replace tool, or batch mutation**. Workspace
-and process-policy configuration persists for new runtime processes; long-lived
-service hot reload and restart orchestration are deferred to M5.
+The MVP includes bounded Git, the Secure MCP Tunnel, live macOS services,
+Shared Asset bridges, and stable-prefix release installation. It does not
+include the Optional Codex Agent, browser automation, PTY, delete tool, blind
+replace, or batch mutation. The long-running runtime refreshes Workspace,
+Process policy, Shared Skill, and External MCP configuration on demand.

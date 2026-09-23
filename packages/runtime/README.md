@@ -15,9 +15,9 @@ revalidating and canonicalizing each root.
 
 Workspace mutations are serialized. Add rolls its in-memory registration back
 if persistence fails; remove persists the next configuration before removing
-the in-memory registration. A process loads configuration once. Changes made by
-another CLI process become visible to a newly created runtime; live reload of a
-long-running service is deferred to M5.
+the in-memory registration. The long-running runtime refreshes Workspace,
+Process policy, Shared Skill sources, and External MCP providers on demand
+after another CLI process changes their validated configuration.
 
 Process policy is stored atomically in
 `<state-root>/config/process-policy.json` and defaults to disabled. Only the
@@ -26,4 +26,5 @@ input, and starts children with a small non-sensitive environment allowlist.
 Runtime close gracefully stops managed children and force-kills after a bounded
 grace period when necessary.
 
-M2 capability and Skill registries remain empty pending later adapters.
+Capability and Skill registries load only explicitly configured Shared MCP and
+Shared Skill sources. They are empty on a clean machine until configured.

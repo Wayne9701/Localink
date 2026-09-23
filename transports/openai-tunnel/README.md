@@ -1,14 +1,13 @@
 # Localink OpenAI Tunnel adapter
 
-This Phase 1B-2A package defines the deterministic boundary between Localink
-and the official `tunnel-client` CLI. It discovers and probes a user-installed
-binary, writes a validated loopback-only YAML profile, builds argv vectors,
-resolves a frozen `SecretRef` into a redacted child-environment handle, and
-parses doctor results without starting a daemon.
+This package defines the deterministic boundary between Localink and the
+official `tunnel-client` CLI. It discovers and probes a separately installed
+binary, writes a validated loopback-only YAML profile with a machine-local
+`file:` credential reference, builds argv vectors, and parses doctor results.
 
-The package does not install the official binary, create a Platform tunnel,
-read process API-key variables, contact OpenAI, launch a long-lived process, or
-manage a system service. Those operations belong to later phases.
+The package does not install the official binary, create a Platform tunnel, or
+provision a runtime credential. Localink's service package owns the long-lived
+process and managed user LaunchAgents.
 
 The profile writer stores profiles below an injected Localink state root at
 `config/openai-tunnel/profiles/<name>.yaml`. Command builders pass that profile
@@ -19,6 +18,6 @@ tunnel-client doctor --profile <name> --explain
 tunnel-client run --profile <name>
 ```
 
-The written YAML contains `env:CONTROL_PLANE_API_KEY`; it never contains the
-resolved API key. Both the MCP target and health listener are restricted to
-loopback addresses.
+The current written YAML contains a `file:` reference under the Localink state
+root, never the credential value. Both the MCP target and health listener are
+restricted to loopback addresses.
