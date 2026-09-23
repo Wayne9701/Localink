@@ -31,6 +31,17 @@ function nativeRuntime(runtime: PublicRuntime) {
   return runtime.native;
 }
 
+function usesWorkspace(name: string): boolean {
+  return (
+    name === 'localink.workspace_list' ||
+    name === 'localink.workspace_inspect' ||
+    name.startsWith('localink.files_') ||
+    name.startsWith('localink.git_') ||
+    name === 'localink.process_exec' ||
+    name === 'localink.process_start'
+  );
+}
+
 async function itemResult<T>(
   path: string,
   operation: () => Promise<T>,
@@ -101,6 +112,7 @@ export class PublicAdapter {
       );
     }
     try {
+      if (usesWorkspace(name)) await this.runtime.refreshWorkspaces?.();
       const inputLimit =
         name === 'localink.git_apply_patch'
           ? PUBLIC_GIT_LIMITS.patchBytes + 4096

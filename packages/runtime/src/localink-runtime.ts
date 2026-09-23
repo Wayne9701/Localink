@@ -147,12 +147,14 @@ export class LocalinkRuntime {
     sources: [],
   };
   #mutationTail: Promise<void> = Promise.resolve();
+  #workspaceSnapshotKey: string;
   #closed = false;
 
   private constructor(
     statePaths: StatePaths,
     workspaces: WorkspaceRegistry,
     workspaceStore: WorkspaceConfigStore,
+    workspaceSnapshotKey: string,
     processPolicyStore: ProcessPolicyStore,
     processPolicy: ProcessPolicy,
     skillSourceStore: SkillSourceStore,
@@ -169,6 +171,7 @@ export class LocalinkRuntime {
     });
     this.skills = new SkillRegistry();
     this.#workspaceStore = workspaceStore;
+    this.#workspaceSnapshotKey = workspaceSnapshotKey;
     this.#processPolicyStore = processPolicyStore;
     this.#skillSourceStore = skillSourceStore;
     this.#externalMcpStore = externalMcpStore;
@@ -201,9 +204,7 @@ export class LocalinkRuntime {
       new ConfigStore(statePaths, 'external-mcp', validateExternalMcpConfig);
     const workspaces = new WorkspaceRegistry();
     const config = await workspaceStore.read();
-    for (const record of config?.workspaces ?? []) {
-      await workspaces.restore(record);
-    }
+    await workspaces.replaceAllValidated(config?.workspaces ?? []);
     const processPolicy = (await processPolicyStore.read()) ?? {
       version: PROCESS_POLICY_SCHEMA_VERSION,
       enabled: false,
@@ -212,6 +213,7 @@ export class LocalinkRuntime {
       statePaths,
       workspaces,
       workspaceStore,
+      JSON.stringify(config?.workspaces ?? []),
       processPolicyStore,
       processPolicy,
       skillSourceStore,
@@ -224,6 +226,7 @@ export class LocalinkRuntime {
 
   async addWorkspace(name: string, root: string): Promise<WorkspaceRecord> {
     return this.#mutate(async () => {
+      await this.#refreshWorkspacesIfChanged();
       const record = await this.workspaces.register(name, root);
       try {
         await this.#persist(this.workspaces.list());
@@ -237,6 +240,7 @@ export class LocalinkRuntime {
 
   async removeWorkspace(workspaceId: string): Promise<WorkspaceRecord> {
     return this.#mutate(async () => {
+      await this.#refreshWorkspacesIfChanged();
       const record = this.workspaces.inspect(workspaceId);
       const remaining = this.workspaces
         .list()
@@ -248,6 +252,7 @@ export class LocalinkRuntime {
   }
 
   async health(): Promise<LocalinkRuntimeHealth> {
+    if (!this.#closed) await this.refreshWorkspaces();
     const service =
       (await readServiceSnapshot(this.statePaths.root)) ??
       unconfiguredServiceSnapshot();
@@ -276,6 +281,10 @@ export class LocalinkRuntime {
       },
       service,
     };
+  }
+
+  async refreshWorkspaces(): Promise<void> {
+    await this.#mutate(() => this.#refreshWorkspacesIfChanged());
   }
 
   async skillSources(): Promise<SkillSource[]> {
@@ -389,6 +398,16 @@ export class LocalinkRuntime {
       version: WORKSPACE_SCHEMA_VERSION,
       workspaces,
     });
+    this.#workspaceSnapshotKey = JSON.stringify(workspaces);
+  }
+
+  async #refreshWorkspacesIfChanged(): Promise<void> {
+    const config = await this.#workspaceStore.read();
+    const records = config?.workspaces ?? [];
+    const nextKey = JSON.stringify(records);
+    if (nextKey === this.#workspaceSnapshotKey) return;
+    await this.workspaces.replaceAllValidated(records);
+    this.#workspaceSnapshotKey = nextKey;
   }
 
   #mutate<T>(operation: () => Promise<T>): Promise<T> {

@@ -1,8 +1,10 @@
 import assert from 'node:assert/strict';
+import { execFile } from 'node:child_process';
 import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
+import { promisify } from 'node:util';
 import { fileURLToPath } from 'node:url';
 import { createLocalinkRuntime } from '@localink/runtime';
 import { PublicAdapter } from '../src/public-adapter.js';
@@ -24,6 +26,7 @@ import {
 } from './helpers.js';
 
 const SYNTHETIC_SECRET = 'synthetic-not-a-real-secret';
+const run = promisify(execFile);
 const externalStdioFixture = fileURLToPath(
   new URL(
     '../../../runtime/dist/test/external-mcp-stdio-fixture.js',
@@ -93,6 +96,85 @@ test('tool registry is exact 26 with centralized conservative annotations and no
     false,
   );
   assert.equal(createPublicServer.length >= 1, true);
+});
+
+test('running public workspace, Files, Git, and Process tools refresh external workspace config', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'localink-cross-process-'));
+  const stateRoot = path.join(root, 'state');
+  const workspaceRoot = path.join(root, 'workspace');
+  await mkdir(workspaceRoot);
+  await writeFile(path.join(workspaceRoot, 'sample.txt'), 'fresh-needle\n');
+  await run('git', ['init', '-q'], { cwd: workspaceRoot });
+  const running = await createLocalinkRuntime({ stateRoot });
+  const cli = await createLocalinkRuntime({ stateRoot });
+  const adapter = new PublicAdapter(running);
+  try {
+    assert.equal(
+      (
+        at(
+          await invoke(adapter, 'workspace_list', {}),
+          'data',
+          'workspaces',
+        ) as unknown[]
+      ).length,
+      0,
+    );
+    const workspace = await cli.addWorkspace('cross-process', workspaceRoot);
+    const listed = await invoke(adapter, 'workspace_list', {});
+    assert.equal((at(listed, 'data', 'workspaces') as unknown[]).length, 1);
+    assert.equal(JSON.stringify(listed).includes(root), false);
+    assert.equal(
+      at(
+        await invoke(adapter, 'workspace_inspect', {
+          workspaceId: workspace.id,
+        }),
+        'data',
+        'name',
+      ),
+      'cross-process',
+    );
+    const read = await invoke(adapter, 'files_read_many', {
+      workspaceId: workspace.id,
+      paths: ['sample.txt'],
+    });
+    const items = at(read, 'data', 'items') as Record<string, unknown>[];
+    assert.equal(at(items[0], 'value', 'text'), 'fresh-needle\n');
+    const git = await invoke(adapter, 'git_status', {
+      workspaceId: workspace.id,
+    });
+    assert.equal(
+      (at(git, 'data', 'entries') as Record<string, unknown>[]).some(
+        (entry) => entry.path === 'sample.txt',
+      ),
+      true,
+    );
+    await running.setProcessEnabled(true);
+    const processResult = await invoke(adapter, 'process_exec', {
+      workspaceId: workspace.id,
+      command: process.execPath,
+      args: ['-e', "process.stdout.write('fresh-process')"],
+    });
+    assert.equal(at(processResult, 'data', 'stdout', 'text'), 'fresh-process');
+    await cli.removeWorkspace(workspace.id);
+    assert.equal(
+      (
+        at(
+          await invoke(adapter, 'workspace_list', {}),
+          'data',
+          'workspaces',
+        ) as unknown[]
+      ).length,
+      0,
+    );
+    const configPath = path.join(stateRoot, 'config', 'workspaces.json');
+    await writeFile(configPath, '{bad json');
+    const invalid = await invoke(adapter, 'workspace_list', {});
+    assert.equal(at(invalid, 'data', 'error', 'code'), 'CONFIG_INVALID');
+    assert.equal(JSON.stringify(invalid).includes(root), false);
+  } finally {
+    await Promise.all([running.close(), cli.close()]);
+    await rm(root, { recursive: true, force: true });
+  }
 });
 
 test('workspace and file tools are public-safe, bounded, partial-failure tolerant and verifiable', async () => {

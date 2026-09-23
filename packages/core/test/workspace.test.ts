@@ -1,5 +1,11 @@
 import assert from 'node:assert/strict';
-import { mkdir, readFile, symlink, writeFile } from 'node:fs/promises';
+import {
+  mkdir,
+  readFile,
+  realpath,
+  symlink,
+  writeFile,
+} from 'node:fs/promises';
 import path from 'node:path';
 import test from 'node:test';
 import { LocalinkError } from '@localink/sdk';
@@ -114,5 +120,42 @@ test('workspace registry restores persisted identity and rejects duplicate ID or
       restoredRegistry.restore({ ...source, id: 'different-id' }),
       hasCode('ALREADY_EXISTS'),
     );
+  });
+});
+
+test('workspace registry replaces only a fully valid snapshot', async () => {
+  await withFixture(async (fixture) => {
+    const original = fixture.workspaces.inspect(fixture.workspaceId);
+    const secondRoot = path.join(fixture.root, 'second');
+    await mkdir(secondRoot);
+    const second = {
+      ...original,
+      id: 'second-workspace',
+      root: secondRoot,
+    };
+    await assert.rejects(
+      fixture.workspaces.replaceAllValidated([
+        second,
+        {
+          ...original,
+          id: 'missing',
+          root: path.join(fixture.root, 'missing'),
+        },
+      ]),
+      hasCode('NOT_FOUND'),
+    );
+    assert.deepEqual(fixture.workspaces.list(), [original]);
+    await assert.rejects(
+      fixture.workspaces.replaceAllValidated([
+        second,
+        { ...original, id: 'duplicate-root', root: secondRoot },
+      ]),
+      hasCode('ALREADY_EXISTS'),
+    );
+    assert.deepEqual(fixture.workspaces.list(), [original]);
+    await fixture.workspaces.replaceAllValidated([second]);
+    assert.deepEqual(fixture.workspaces.list(), [
+      { ...second, root: await realpath(secondRoot) },
+    ]);
   });
 });

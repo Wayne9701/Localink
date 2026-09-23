@@ -91,6 +91,94 @@ test('separate state roots remain isolated', async () => {
   });
 });
 
+test('running runtime refreshes external workspace add/remove and preserves latest records on mutation', async () => {
+  await withTemp(async (root) => {
+    const stateRoot = path.join(root, 'state');
+    const firstRoot = path.join(root, 'first');
+    const secondRoot = path.join(root, 'second');
+    const thirdRoot = path.join(root, 'third');
+    await Promise.all(
+      [firstRoot, secondRoot, thirdRoot].map((directory) => mkdir(directory)),
+    );
+    await writeFile(path.join(firstRoot, 'sample.txt'), 'external workspace\n');
+    const running = await createLocalinkRuntime({ stateRoot });
+    const cli = await createLocalinkRuntime({ stateRoot });
+    try {
+      assert.equal((await running.health()).workspaceCount, 0);
+      const first = await cli.addWorkspace('first', firstRoot);
+      await running.refreshWorkspaces();
+      assert.equal(running.native.workspaceInspect(first.id).name, 'first');
+      assert.equal(running.native.workspaceList().length, 1);
+      assert.equal(
+        (await running.files.readText(first.id, 'sample.txt', 1024)).text,
+        'external workspace\n',
+      );
+      assert.equal((await running.health()).workspaceCount, 1);
+
+      const second = await running.addWorkspace('second', secondRoot);
+      assert.deepEqual(
+        cli.workspaces.list().map((item) => item.id),
+        [first.id],
+      );
+      await cli.refreshWorkspaces();
+      assert.deepEqual(
+        cli.workspaces
+          .list()
+          .map((item) => item.id)
+          .sort(),
+        [first.id, second.id].sort(),
+      );
+      await cli.removeWorkspace(first.id);
+      await running.refreshWorkspaces();
+      assert.deepEqual(
+        running.workspaces.list().map((item) => item.id),
+        [second.id],
+      );
+      assert.throws(
+        () => running.native.workspaceInspect(first.id),
+        hasCode('NOT_FOUND'),
+      );
+
+      const third = await cli.addWorkspace('third', thirdRoot);
+      await running.removeWorkspace(second.id);
+      await cli.refreshWorkspaces();
+      assert.deepEqual(
+        cli.workspaces.list().map((item) => item.id),
+        [third.id],
+      );
+      assert.equal((await running.health()).workspaceCount, 1);
+
+      const configPath = path.join(stateRoot, 'config', 'workspaces.json');
+      await writeFile(configPath, '{bad json');
+      await assert.rejects(
+        running.refreshWorkspaces(),
+        hasCode('CONFIG_INVALID'),
+      );
+      assert.deepEqual(
+        running.workspaces.list().map((item) => item.id),
+        [third.id],
+      );
+      await writeFile(
+        configPath,
+        JSON.stringify({
+          version: 1,
+          workspaces: [
+            third,
+            { ...third, id: 'missing-root', root: path.join(root, 'missing') },
+          ],
+        }),
+      );
+      await assert.rejects(running.refreshWorkspaces(), hasCode('NOT_FOUND'));
+      assert.deepEqual(
+        running.workspaces.list().map((item) => item.id),
+        [third.id],
+      );
+    } finally {
+      await Promise.all([running.close(), cli.close()]);
+    }
+  });
+});
+
 test('runtime health reads the latest sanitized service snapshot and marks stale state', async () => {
   await withTemp(async (root) => {
     const checkedAt = '2026-09-20T00:00:00.000Z';

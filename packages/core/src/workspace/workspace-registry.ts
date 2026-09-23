@@ -67,6 +67,16 @@ async function nearestCanonicalPath(candidate: string): Promise<{
 export class WorkspaceRegistry {
   readonly #records = new Map<string, WorkspaceRecord>();
 
+  async replaceAllValidated(
+    records: readonly WorkspaceRecord[],
+  ): Promise<void> {
+    const staged = new WorkspaceRegistry();
+    for (const record of records) await staged.restore(record);
+    // No await after validation: readers see either the old or new snapshot.
+    this.#records.clear();
+    for (const [id, record] of staged.#records) this.#records.set(id, record);
+  }
+
   async register(name: string, root: string): Promise<WorkspaceRecord> {
     if (name.trim().length === 0 || name.includes('\0')) {
       throw new LocalinkError(
