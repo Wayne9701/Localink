@@ -34,6 +34,18 @@ interface PointerSnapshot {
   };
 }
 
+function errorCode(error: unknown): string | undefined {
+  if (
+    typeof error === 'object' &&
+    error !== null &&
+    'code' in error &&
+    typeof error.code === 'string'
+  ) {
+    return error.code;
+  }
+  return undefined;
+}
+
 function receipt(
   operation: ReleaseReceipt['operation'],
   status: ReleaseReceipt['status'],
@@ -43,6 +55,8 @@ function receipt(
     readonly pointerSwitched: boolean;
     readonly servicesVerified: boolean;
     readonly reasonCode?: string;
+    readonly failureDetailCode?: string | undefined;
+    readonly rollbackFailureDetailCode?: string | undefined;
   },
 ): ReleaseReceipt {
   return {
@@ -61,6 +75,12 @@ function receipt(
     ...(options.reasonCode === undefined
       ? {}
       : { reasonCode: options.reasonCode }),
+    ...(options.failureDetailCode === undefined
+      ? {}
+      : { failureDetailCode: options.failureDetailCode }),
+    ...(options.rollbackFailureDetailCode === undefined
+      ? {}
+      : { rollbackFailureDetailCode: options.rollbackFailureDetailCode }),
   };
 }
 
@@ -313,7 +333,7 @@ export class ReleaseManager {
         pointerSwitched: true,
         servicesVerified: true,
       });
-    } catch {
+    } catch (activationError) {
       try {
         await this.#restorePointers(layout, snapshot);
         if (snapshot.current !== undefined)
@@ -324,14 +344,17 @@ export class ReleaseManager {
           pointerSwitched: true,
           servicesVerified: true,
           reasonCode: 'ACTIVATION_FAILED_ROLLBACK_SUCCEEDED',
+          failureDetailCode: errorCode(activationError),
         });
-      } catch {
+      } catch (rollbackError) {
         await this.#hooks.safeStop?.().catch(() => undefined);
         return receipt('install', 'failed_safe_stop', releaseId, {
           previousReleaseId: snapshot.current,
           pointerSwitched: true,
           servicesVerified: false,
           reasonCode: 'ACTIVATION_AND_ROLLBACK_FAILED',
+          failureDetailCode: errorCode(activationError),
+          rollbackFailureDetailCode: errorCode(rollbackError),
         });
       }
     }
@@ -367,7 +390,7 @@ export class ReleaseManager {
         pointerSwitched: true,
         servicesVerified: true,
       });
-    } catch {
+    } catch (activationError) {
       try {
         await this.#restorePointers(layout, snapshot);
         await this.#activate(layout, snapshot.current);
@@ -376,14 +399,17 @@ export class ReleaseManager {
           pointerSwitched: true,
           servicesVerified: true,
           reasonCode: 'ROLLBACK_TARGET_FAILED_CURRENT_RESTORED',
+          failureDetailCode: errorCode(activationError),
         });
-      } catch {
+      } catch (restoreError) {
         await this.#hooks.safeStop?.().catch(() => undefined);
         return receipt('rollback', 'failed_safe_stop', snapshot.previous, {
           previousReleaseId: snapshot.current,
           pointerSwitched: true,
           servicesVerified: false,
           reasonCode: 'ROLLBACK_AND_RESTORE_FAILED',
+          failureDetailCode: errorCode(activationError),
+          rollbackFailureDetailCode: errorCode(restoreError),
         });
       }
     }

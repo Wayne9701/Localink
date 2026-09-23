@@ -334,12 +334,17 @@ test('failures before and after switch are bounded and restore the prior release
       hooks: {
         activate: async (_releasePath, manifest) => {
           activations.push(manifest.releaseId);
-          if (manifest.releaseId === 'release-b') throw new Error('synthetic');
+          if (manifest.releaseId === 'release-b') {
+            throw Object.assign(new Error('synthetic'), {
+              code: 'CONTROL_PLANE_POLL_TIMEOUT',
+            });
+          }
         },
       },
     });
     const after = await afterFailure.install(artifactB);
     assert.equal(after.status, 'failed_rolled_back');
+    assert.equal(after.failureDetailCode, 'CONTROL_PLANE_POLL_TIMEOUT');
     assert.deepEqual(activations, ['release-b', 'release-a']);
     assert.equal((await afterFailure.status()).current, 'release-a');
   });

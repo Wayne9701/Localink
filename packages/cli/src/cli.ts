@@ -21,6 +21,11 @@ import {
   type ReleaseReceipt,
 } from '@localink/release';
 import {
+  ReleaseReadinessError,
+  waitForControlPlaneReadiness,
+  waitForLocalStartup,
+} from './release-readiness.js';
+import {
   httpOptionsFromEnv,
   PROTOCOL_VERSION,
   startHttpServer,
@@ -615,68 +620,124 @@ async function verifyPackagedRuntime(
   }
 }
 
-async function requireTunnelControlPlanePoll(): Promise<void> {
+async function tunnelControlPlaneProbe(): Promise<boolean> {
   const root = stateRoot();
-  const config = await readTunnelServiceConfig(root);
-  if (config === undefined)
-    throw new Error('Tunnel service is not configured.');
+  const config = await readTunnelServiceConfig(root).catch(() => {
+    throw new ReleaseReadinessError(
+      'CONTROL_PLANE_HEALTH_FAILED',
+      'Tunnel service configuration is unavailable.',
+    );
+  });
+  if (config === undefined) {
+    throw new ReleaseReadinessError(
+      'CONTROL_PLANE_HEALTH_FAILED',
+      'Tunnel service is not configured.',
+    );
+  }
   const binary = await discoverTunnelClient({
     ...(config.tunnelClientPath === undefined
       ? {}
       : { explicitPath: config.tunnelClientPath }),
+  }).catch(() => {
+    throw new ReleaseReadinessError(
+      'CONTROL_PLANE_HEALTH_FAILED',
+      'Tunnel client inspection is unavailable.',
+    );
   });
   if (binary.binaryPath === undefined || binary.compatibility !== 'tested') {
-    throw new Error('Tested Localink tunnel client is unavailable.');
+    throw new ReleaseReadinessError(
+      'CONTROL_PLANE_HEALTH_FAILED',
+      'Tested Localink tunnel client is unavailable.',
+    );
   }
-  await executeBounded(
-    binary.binaryPath,
-    [
-      'health',
-      '--url',
-      `http://${config.healthListenAddress}`,
-      '--require-control-plane-poll',
-      '--json',
-    ],
-    {
-      env: { PATH: '/usr/bin:/bin', LANG: 'C', LC_ALL: 'C' },
-      timeoutMs: 20_000,
-    },
-  );
+  try {
+    await executeBounded(
+      binary.binaryPath,
+      [
+        'health',
+        '--url',
+        `http://${config.healthListenAddress}`,
+        '--require-control-plane-poll',
+        '--json',
+      ],
+      {
+        env: { PATH: '/usr/bin:/bin', LANG: 'C', LC_ALL: 'C' },
+        timeoutMs: 5_000,
+      },
+    );
+    return true;
+  } catch {
+    return false;
+  }
 }
 
-async function waitForManagedReadiness(
+async function waitForManagedLocalStartup(
   context: InstallationContext,
-  requireTunnel: boolean,
 ): Promise<void> {
   const controller = new LocalServiceController(context);
-  const deadline = Date.now() + 20_000;
-  let lastFailure: unknown;
-  while (Date.now() < deadline) {
-    try {
+  await waitForLocalStartup(
+    async () => {
       const [mcp, core, tunnel, recovery] = await Promise.all([
         probeLocalMcp(),
         controller.status('localink-core'),
         controller.status('localink-tunnel'),
         controller.status('localink-recovery'),
       ]);
-      if (
-        mcp.readiness === 'ready' &&
-        mcp.toolCount === TOOL_NAMES.length &&
-        core.installed &&
-        core.processRunning &&
-        recovery.installed &&
-        (!requireTunnel || (tunnel.installed && tunnel.processRunning))
-      ) {
-        if (requireTunnel) await requireTunnelControlPlanePoll();
-        return;
+      return {
+        mcpReady: mcp.readiness === 'ready',
+        ...(mcp.toolCount === undefined ? {} : { toolCount: mcp.toolCount }),
+        coreInstalled: core.installed,
+        coreRunning: core.processRunning,
+        tunnelInstalled: tunnel.installed,
+        tunnelRunning: tunnel.processRunning,
+        recoveryInstalled: recovery.installed,
+      };
+    },
+    {
+      expectedToolCount: TOOL_NAMES.length,
+      timeoutMs: 20_000,
+      intervalMs: 250,
+    },
+  );
+}
+
+async function waitForManagedControlPlane(
+  context: InstallationContext,
+): Promise<void> {
+  const controller = new LocalServiceController(context);
+  await waitForControlPlaneReadiness(
+    async () => {
+      const [mcp, tunnel] = await Promise.all([
+        probeLocalMcp(),
+        controller.status('localink-tunnel'),
+      ]);
+      const coreMcpReady =
+        mcp.readiness === 'ready' && mcp.toolCount === TOOL_NAMES.length;
+      if (!coreMcpReady || !tunnel.processRunning) {
+        return {
+          coreMcpReady,
+          tunnelRunning: tunnel.processRunning,
+          pollReady: false,
+        };
       }
-      lastFailure = new Error('Managed Localink readiness is incomplete.');
-    } catch (error) {
-      lastFailure = error;
-    }
-    await new Promise((resolve) => setTimeout(resolve, 250));
-  }
-  throw lastFailure ?? new Error('Managed Localink readiness timed out.');
+      return {
+        coreMcpReady: true,
+        tunnelRunning: true,
+        pollReady: await tunnelControlPlaneProbe(),
+      };
+    },
+    {
+      timeoutMs: 60_000,
+      intervalMs: 1_000,
+    },
+  );
+}
+
+async function waitForManagedReadiness(
+  context: InstallationContext,
+): Promise<void> {
+  await waitForManagedLocalStartup(context);
+  await waitForManagedControlPlane(context);
 }
 
 async function activateManagedContext(
@@ -690,7 +751,7 @@ async function activateManagedContext(
   }
   const controller = new LocalServiceController(context);
   await controller.rebootstrap(true);
-  await waitForManagedReadiness(context, true);
+  await waitForManagedReadiness(context);
 }
 
 function receiptSucceeded(receipt: ReleaseReceipt): boolean {
@@ -727,7 +788,16 @@ async function handleRelease(args: readonly string[]): Promise<boolean> {
     hooks: {
       beforeSwitch: verifyPackagedRuntime,
       activate: async () => activateManagedContext(stableContext),
-      restorePrior: async () => activateManagedContext(priorContext),
+      restorePrior: async () => {
+        try {
+          await activateManagedContext(priorContext);
+        } catch {
+          throw new ReleaseReadinessError(
+            'ROLLBACK_READINESS_FAILED',
+            'Prior Localink arrangement did not recover within the bounded readiness window.',
+          );
+        }
+      },
       safeStop: async () => {
         await stableController.bootout();
       },

@@ -67,6 +67,8 @@ export interface ReleaseReceipt {
   readonly secretsPreserved: true;
   readonly networkRequiredForRollback: false;
   readonly reasonCode?: string;
+  readonly failureDetailCode?: string;
+  readonly rollbackFailureDetailCode?: string;
 }
 
 export interface ReleaseActivationHooks {
