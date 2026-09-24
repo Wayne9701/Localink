@@ -2,6 +2,7 @@
   "name": "localink",
   "version": "0.1.0",
   "private": true,
+  "license": "Apache-2.0",
   "description": "Local-first AI tool runtime for ChatGPT local execution and custom tools",
   "type": "module",
   "packageManager": "npm@10.9.8",

@@ -1,6 +1,6 @@
 # Security and credential boundary
 
-Report a suspected vulnerability privately to the repository owner or maintainers through an agreed channel. Do not include credentials, credential files, or sensitive logs in an issue or pull request. No public disclosure address is configured in this repository.
+Report a suspected vulnerability privately to the repository owner or maintainers through an agreed channel. If GitHub offers private vulnerability reporting for this repository, you may use it. Do not include credentials, credential files, sensitive logs, or vulnerability details in a public issue or pull request. No public disclosure address is configured in this repository.
 
 This repository is source and test material. It must not contain a real Tunnel runtime credential, private key, tenant configuration, personal workspace state, or another machine's `~/.localink/` data. Test strings such as `synthetic-service-secret` and `example.invalid` are fixtures. The Tunnel credential and profile are provisioned per Mac outside the checkout; the credential file must satisfy the ownership and mode checks in [the macOS install guide](docs/INSTALL_MACOS.md).
 

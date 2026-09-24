@@ -5,7 +5,7 @@ This guide uses the release commands in the repository. There is no one-click in
 ## Prerequisites
 
 - macOS with a user GUI session, Node.js 22 or newer, npm 10 or newer, and Git.
-- Access to the intended private GitHub repository and a network connection for clone and `npm ci`.
+- A network connection for the public repository clone and `npm ci`.
 - A machine-specific OpenAI Secure MCP Tunnel ID and runtime credential, plus a Localink-owned `tunnel-client` binary at `~/.localink/bin/tunnel-client` matching the version accepted by the checked-out code. Check `TESTED_LOCAL_TUNNEL_CLIENT_VERSION` in `transports/openai-tunnel/src/types.ts`. Localink does not download the client, create the Tunnel, or issue its credential.
 - A free local MCP endpoint (`127.0.0.1:4318`) and Tunnel health listener (`127.0.0.1:8080`), and permission to use the current user's `~/Library/LaunchAgents`.
 
@@ -14,7 +14,7 @@ Provision the Tunnel and credential separately on **each Mac**. The current runt
 ## Clone and verify
 
 ```sh
-git clone <private-repository-url> localink
+git clone https://github.com/Wayne9701/Localink.git localink
 cd localink
 npm ci
 npm run check

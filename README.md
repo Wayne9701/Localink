@@ -1,6 +1,6 @@
 # Localink
 
-Localink is a local runtime that gives **ChatGPT Web** controlled access to local tools through a Secure MCP Tunnel. Codex and Cursor use their own local tools and Shared Assets directly; they do not need to run through Localink.
+Localink is a general-purpose, local-first AI tool runtime that gives **ChatGPT Web** controlled access to local tools through a Secure MCP Tunnel. Codex and Cursor use their own local tools and Shared Assets directly; they do not need to run through Localink.
 
 ## Current status
 
@@ -15,11 +15,13 @@ Shared Skills and Shared MCP providers are independently owned assets. Localink 
 Requires Node.js 22 or newer and npm 10 or newer.
 
 ```sh
+git clone https://github.com/Wayne9701/Localink.git
+cd Localink
 npm ci
 npm run check
 ```
 
-For a new Mac, follow [the installation and acceptance guide](docs/INSTALL_MACOS.md). It covers the existing release CLI and the machine-specific Tunnel setup required before activation. Security and credential boundaries are in [SECURITY.md](SECURITY.md).
+For a new Mac, follow [the installation and acceptance guide](docs/INSTALL_MACOS.md). It covers the existing release CLI and the machine-specific Tunnel setup required before activation. Security and credential boundaries are in [SECURITY.md](SECURITY.md). Localink is licensed under [Apache-2.0](LICENSE).
 
 ## Local administration
 
