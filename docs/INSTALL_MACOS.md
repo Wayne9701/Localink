@@ -55,7 +55,7 @@ node packages/cli/dist/src/cli.js release install "$ARTIFACT_DIR" --json
 ~/.localink/bin/localink workspace list --json
 ```
 
-Confirm `release status` points to the new release, Doctor reports local MCP ready with **26** tools and a ready Tunnel, and Process policy is `enabled: false`. Use an intentional workspace root containing harmless test files. In ChatGPT Web, connect to this Mac's Localink Connector in a fresh session, verify tool discovery, then call `workspace_list`, `workspace_inspect`, a bounded file read, and `health_status` against that workspace. The CLI and ChatGPT Web should see the same workspace without restarting Core. Keep Process disabled unless a local administrator explicitly authorizes a bounded process test, then disable it again.
+Confirm `release status` points to the new release, Doctor reports local MCP ready with **27** tools and a ready Tunnel, and Process policy is `enabled: false`. Use an intentional workspace root containing harmless test files. In ChatGPT Web, connect to this Mac's Localink Connector in a fresh session, verify tool discovery, then call `workspace_list`, `workspace_inspect`, a bounded file read, and `health_status` against that workspace. The CLI and ChatGPT Web should see the same workspace without restarting Core. Keep Process disabled unless a local administrator explicitly authorizes a bounded process test, then disable it again.
 
 Shared Skill sources and Shared MCP providers must be installed and configured independently with `skill-source add` and `mcp-provider add-http|add-stdio` if needed. An empty shared-asset registry is expected on a clean Mac until configured. ChatGPT Web Connector visibility and calls are separate acceptance evidence; Doctor alone cannot prove that session binding.
 

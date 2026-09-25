@@ -194,6 +194,18 @@ export class PublicAdapter {
         this.runtime.validateInput(capabilityId, input);
         return this.runtime.capabilities.invoke(capabilityId, input, context);
       }
+      case 'localink.capability_confirm': {
+        const result = toolSchemas[name].safeParse(args);
+        if (!result.success) invalidInput();
+        const { ticket, capabilityId, input } = result.data;
+        this.runtime.validateInput(capabilityId, input);
+        return this.runtime.capabilities.invokeConfirmed(
+          ticket,
+          capabilityId,
+          input,
+          { policyProfile: 'balanced' },
+        );
+      }
       case 'localink.skill_read': {
         const result = toolSchemas[name].safeParse(args);
         if (!result.success) invalidInput();

@@ -21,7 +21,7 @@ test('local startup waits for MCP and managed services without requiring control
   await waitForLocalStartup(
     async () => ({
       mcpReady: clock.now() >= 2_000,
-      ...(clock.now() >= 2_000 ? { toolCount: 26 } : {}),
+      ...(clock.now() >= 2_000 ? { toolCount: 27 } : {}),
       coreInstalled: true,
       coreRunning: clock.now() >= 500,
       tunnelInstalled: true,
@@ -30,7 +30,7 @@ test('local startup waits for MCP and managed services without requiring control
     }),
     {
       ...clock,
-      expectedToolCount: 26,
+      expectedToolCount: 27,
       timeoutMs: 20_000,
       intervalMs: 500,
     },

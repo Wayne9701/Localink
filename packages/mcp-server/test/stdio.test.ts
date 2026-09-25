@@ -21,7 +21,7 @@ import {
 } from './helpers.js';
 
 test(
-  'stdio: official client initialize, exact 26 tools, all policy/registry/error/bounding paths, clean exit',
+  'stdio: official client initialize, exact 27 tools, all policy/registry/error/bounding paths, clean exit',
   { timeout: 20_000 },
   async (t) => {
     const connection = await fixtureStdioClient();
@@ -61,9 +61,28 @@ test(
       at(await invoke(client, 'fixture.read'), 'data', 'output', 'value'),
       'updated',
     );
+    const confirmation = await invoke(client, 'fixture.external-send');
+    assert.equal(at(confirmation, 'data', 'status'), 'confirmation_required');
+    const ticket = at(confirmation, 'data', 'confirmation', 'ticket') as string;
+    assert.equal(typeof ticket, 'string');
+    const confirmed = await call(client, 'capability_confirm', {
+      ticket,
+      capabilityId: 'fixture.external-send',
+      input: {},
+    });
+    assert.equal(at(confirmed, 'data', 'status'), 'executed');
     assert.equal(
-      at(await invoke(client, 'fixture.external-send'), 'data', 'status'),
-      'confirmation_required',
+      at(
+        await call(client, 'capability_confirm', {
+          ticket,
+          capabilityId: 'fixture.external-send',
+          input: {},
+        }),
+        'data',
+        'error',
+        'code',
+      ),
+      'INVALID_ARGUMENT',
     );
     assert.equal(
       at(
@@ -79,7 +98,7 @@ test(
       'denied',
     );
     const health = await call(client, 'health_status');
-    assert.equal(at(health, 'data', 'state', 'externalSendExecutions'), 0);
+    assert.equal(at(health, 'data', 'state', 'externalSendExecutions'), 1);
     assert.equal(at(health, 'data', 'state', 'protectedExecutions'), 0);
     assert.equal(
       at(
@@ -221,7 +240,7 @@ test(
 );
 
 test(
-  'stdio product entrypoint exposes exact 26 tools with real runtime health',
+  'stdio product entrypoint exposes exact 27 tools with real runtime health',
   { timeout: 15_000 },
   async (t) => {
     const connection = await stdioClient(true);

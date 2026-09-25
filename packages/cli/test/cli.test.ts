@@ -190,6 +190,40 @@ test('CLI persists local-only Skill source and external MCP provider configurati
       await runCli(stateRoot, ['mcp-provider', 'list', '--json']),
       { providers: [provider] },
     );
+    const overridden = await runCli(stateRoot, [
+      'mcp-provider',
+      'risk',
+      'set',
+      'fixture',
+      'fixture_unknown',
+      '0',
+      '--json',
+    ]);
+    assert.deepEqual(overridden, {
+      ...provider,
+      toolRiskOverrides: { fixture_unknown: 0 },
+    });
+    assert.deepEqual(
+      await runCli(stateRoot, [
+        'mcp-provider',
+        'risk',
+        'list',
+        'fixture',
+        '--json',
+      ]),
+      { providerId: 'fixture', overrides: { fixture_unknown: 0 } },
+    );
+    assert.deepEqual(
+      await runCli(stateRoot, [
+        'mcp-provider',
+        'risk',
+        'remove',
+        'fixture',
+        'fixture_unknown',
+        '--json',
+      ]),
+      provider,
+    );
     assert.deepEqual(
       await runCli(stateRoot, ['mcp-provider', 'remove', 'fixture', '--json']),
       provider,
@@ -257,7 +291,7 @@ test(
       }
       assert.ok(client !== undefined, stderr);
       const tools = await client.listTools();
-      assert.equal(tools.tools.length, 26);
+      assert.equal(tools.tools.length, 27);
       const health = await client.callTool({
         name: 'localink.health_status',
         arguments: {},

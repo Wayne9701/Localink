@@ -46,12 +46,17 @@ async function withTemp(
   }
 }
 
-function fixtureServer(): McpServer {
+function fixtureServer(calls: Map<string, number>): McpServer {
   const server = new McpServer({ name: 'm4-http-fixture', version: '1.0.0' });
   const register = (
     name: string,
     annotations:
-      { readOnlyHint: boolean; destructiveHint: boolean } | undefined,
+      | {
+          readOnlyHint: boolean;
+          destructiveHint: boolean;
+          openWorldHint?: boolean;
+        }
+      | undefined,
   ) =>
     server.registerTool(
       name,
@@ -61,20 +66,31 @@ function fixtureServer(): McpServer {
         inputSchema: z.strictObject({ value: z.string().optional() }),
         ...(annotations === undefined ? {} : { annotations }),
       },
-      (input) => ({
-        content: [{ type: 'text', text: JSON.stringify({ name, input }) }],
-        structuredContent: { name, input },
-      }),
+      (input) => {
+        calls.set(name, (calls.get(name) ?? 0) + 1);
+        return {
+          content: [{ type: 'text', text: JSON.stringify({ name, input }) }],
+          structuredContent: { name, input },
+        };
+      },
     );
   register('fixture_read', { readOnlyHint: true, destructiveHint: false });
   register('fixture_write', { readOnlyHint: false, destructiveHint: false });
   register('fixture_destroy', { readOnlyHint: true, destructiveHint: true });
+  register('fixture_open_world', {
+    readOnlyHint: false,
+    destructiveHint: false,
+    openWorldHint: true,
+  });
   register('fixture_unknown', undefined);
   return server;
 }
 
 async function startHttpFixture() {
-  const handler = createMcpHandler(() => fixtureServer(), { legacy: 'reject' });
+  const calls = new Map<string, number>();
+  const handler = createMcpHandler(() => fixtureServer(calls), {
+    legacy: 'reject',
+  });
   const nodeHandler = toNodeHandler(handler);
   const validateHost = localhostHostValidation();
   const validateOrigin = localhostOriginValidation();
@@ -93,6 +109,7 @@ async function startHttpFixture() {
   assert.ok(address !== null && typeof address !== 'string');
   return {
     url: `http://127.0.0.1:${address.port}/mcp`,
+    calls,
     async close() {
       await handler.close();
       server.closeAllConnections();
@@ -251,14 +268,19 @@ test('running runtime atomically refreshes external skill source add/remove', as
 });
 
 test('provider config accepts only bounded credential-free loopback HTTP or absolute stdio', () => {
-  assert.equal(
+  assert.deepEqual(
     parseExternalMcpProvider({
       id: 'local',
       transport: 'loopback-http',
       url: 'http://127.0.0.1:33332/mcp',
       enabled: true,
-    }).transport,
-    'loopback-http',
+    }),
+    {
+      id: 'local',
+      transport: 'loopback-http',
+      url: 'http://127.0.0.1:33332/mcp',
+      enabled: true,
+    },
   );
   for (const value of [
     {
@@ -302,6 +324,20 @@ test('provider config accepts only bounded credential-free loopback HTTP or abso
       args: Array(EXTERNAL_MCP_LIMITS.args + 1).fill('x'),
       enabled: true,
     },
+    {
+      id: 'tier3-forbidden',
+      transport: 'loopback-http',
+      url: 'http://127.0.0.1:33332/mcp',
+      enabled: true,
+      toolRiskOverrides: { fixture_unknown: 3 },
+    },
+    {
+      id: 'pattern-forbidden',
+      transport: 'loopback-http',
+      url: 'http://127.0.0.1:33332/mcp',
+      enabled: true,
+      toolRiskOverrides: { 'fixture_*': 0 },
+    },
   ]) {
     assert.throws(
       () => parseExternalMcpProvider(value),
@@ -320,7 +356,7 @@ test('provider config accepts only bounded credential-free loopback HTTP or abso
   );
 });
 
-test('loopback HTTP projects only annotated non-destructive reads and keeps health private', async (t) => {
+test('loopback HTTP projects annotation-derived tiers and keeps health private', async (t) => {
   const fixture = await startHttpFixture();
   t.after(() => fixture.close());
   await withTemp(async (root) => {
@@ -337,16 +373,32 @@ test('loopback HTTP projects only annotated non-destructive reads and keeps heal
     const capabilities = runtime.capabilities.search('fixture');
     assert.equal(
       capabilities.length,
-      1,
+      4,
       JSON.stringify(await runtime.health()),
     );
-    const descriptor = capabilities[0];
-    assert.ok(descriptor);
+    const descriptor = capabilities.find((item) =>
+      item.title.includes('fixture_read'),
+    );
+    const writeDescriptor = capabilities.find((item) =>
+      item.title.includes('fixture_write'),
+    );
+    const destroyDescriptor = capabilities.find((item) =>
+      item.title.includes('fixture_destroy'),
+    );
+    const openWorldDescriptor = capabilities.find((item) =>
+      item.title.includes('fixture_open_world'),
+    );
+    assert.ok(descriptor && writeDescriptor && destroyDescriptor);
+    assert.ok(openWorldDescriptor);
     assert.equal(descriptor.operationClass, 'read');
     assert.equal(descriptor.riskTier, 0);
     assert.equal(descriptor.postVerify, 'none');
     assert.deepEqual(descriptor.requiredScopes, []);
-    assert.ok(descriptor.title.includes('fixture_read'));
+    assert.equal(writeDescriptor.operationClass, 'write');
+    assert.equal(writeDescriptor.riskTier, 1);
+    assert.equal(destroyDescriptor.riskTier, 2);
+    assert.equal(openWorldDescriptor.riskTier, 2);
+    assert.equal(runtime.capabilities.search('fixture_unknown').length, 0);
     const receipt = await runtime.capabilities.invoke(
       descriptor.id,
       { value: 'http-ok' },
@@ -354,18 +406,144 @@ test('loopback HTTP projects only annotated non-destructive reads and keeps heal
     );
     assert.equal(receipt.status, 'executed');
     assert.equal(JSON.stringify(receipt.output).includes('fixture_read'), true);
+    const writeReceipt = await runtime.capabilities.invoke(
+      writeDescriptor.id,
+      { value: 'write-ok' },
+      { policyProfile: 'balanced' },
+    );
+    assert.equal(writeReceipt.status, 'executed');
+    assert.equal(fixture.calls.get('fixture_write'), 1);
+    const destroyReceipt = await runtime.capabilities.invoke(
+      destroyDescriptor.id,
+      { value: 'confirmed-once' },
+      { policyProfile: 'balanced' },
+    );
+    assert.equal(destroyReceipt.status, 'confirmation_required');
+    assert.equal(fixture.calls.get('fixture_destroy') ?? 0, 0);
+    assert.ok(destroyReceipt.confirmation);
+    const confirmed = await runtime.capabilities.invokeConfirmed(
+      destroyReceipt.confirmation.ticket,
+      destroyDescriptor.id,
+      { value: 'confirmed-once' },
+      { policyProfile: 'balanced' },
+    );
+    assert.equal(confirmed.status, 'executed');
+    assert.equal(fixture.calls.get('fixture_destroy'), 1);
+    await assert.rejects(
+      runtime.capabilities.invokeConfirmed(
+        destroyReceipt.confirmation.ticket,
+        destroyDescriptor.id,
+        { value: 'confirmed-once' },
+        { policyProfile: 'balanced' },
+      ),
+      (error) =>
+        error instanceof LocalinkError && error.code === 'INVALID_ARGUMENT',
+    );
     const health = await runtime.health();
     assert.equal(health.sharedAssets.externalMcp.providerCount, 2);
     assert.equal(health.sharedAssets.externalMcp.readyProviders, 1);
     assert.equal(health.sharedAssets.externalMcp.degradedProviders, 1);
     assert.equal(health.sharedAssets.externalMcp.registeredReadCapabilities, 1);
-    assert.equal(health.sharedAssets.externalMcp.providers[0]?.skippedTools, 3);
+    assert.equal(health.sharedAssets.externalMcp.registeredCapabilities, 4);
+    assert.deepEqual(
+      health.sharedAssets.externalMcp.registeredCapabilitiesByTier,
+      { 0: 1, 1: 1, 2: 2 },
+    );
+    assert.equal(
+      health.sharedAssets.externalMcp.providers[0]?.eligibleProjectedTools,
+      4,
+    );
+    assert.equal(health.sharedAssets.externalMcp.providers[0]?.skippedTools, 1);
     assert.equal(JSON.stringify(health).includes(fixture.url), false);
     await runtime.close();
   });
 });
 
-test('stdio bridge projects read-only tools, isolates environment, and reaps child on close', async () => {
+test('exact local overrides project unannotated tools and can lower audited destructive annotations', async (t) => {
+  const fixture = await startHttpFixture();
+  t.after(() => fixture.close());
+  await withTemp(async (root) => {
+    const stateRoot = path.join(root, 'state');
+    const setup = await createLocalinkRuntime({ stateRoot });
+    await setup.addHttpProvider('overridden', fixture.url);
+    await setup.setExternalMcpToolRiskOverride(
+      'overridden',
+      'fixture_unknown',
+      0,
+    );
+    await setup.setExternalMcpToolRiskOverride(
+      'overridden',
+      'fixture_destroy',
+      0,
+    );
+    assert.deepEqual(await setup.externalMcpToolRiskOverrides('overridden'), {
+      fixture_unknown: 0,
+      fixture_destroy: 0,
+    });
+    await setup.close();
+
+    const runtime = await createLocalinkRuntime({ stateRoot });
+    const unknown = runtime.capabilities
+      .list()
+      .find((item) => item.title.includes('fixture_unknown'));
+    const destructive = runtime.capabilities
+      .list()
+      .find((item) => item.title.includes('fixture_destroy'));
+    assert.ok(unknown && destructive);
+    assert.equal(unknown.riskTier, 0);
+    assert.equal(destructive.riskTier, 0);
+    assert.ok(unknown.description.includes('local exact-name override'));
+    assert.equal(
+      (
+        await runtime.capabilities.invoke(
+          destructive.id,
+          {},
+          { policyProfile: 'balanced' },
+        )
+      ).status,
+      'executed',
+    );
+    const health = await runtime.health();
+    assert.deepEqual(
+      health.sharedAssets.externalMcp.registeredCapabilitiesByTier,
+      { 0: 3, 1: 1, 2: 1 },
+    );
+    await runtime.removeExternalMcpToolRiskOverride(
+      'overridden',
+      'fixture_unknown',
+    );
+    assert.deepEqual(await runtime.externalMcpToolRiskOverrides('overridden'), {
+      fixture_destroy: 0,
+    });
+    await runtime.close();
+  });
+});
+
+test('unknown exact override is isolated and cannot match or open a tool', async (t) => {
+  const fixture = await startHttpFixture();
+  t.after(() => fixture.close());
+  await withTemp(async (root) => {
+    const stateRoot = path.join(root, 'state');
+    const setup = await createLocalinkRuntime({ stateRoot });
+    await setup.addHttpProvider('unknown-override', fixture.url);
+    await setup.setExternalMcpToolRiskOverride(
+      'unknown-override',
+      'fixture_not_present',
+      0,
+    );
+    await setup.close();
+    const runtime = await createLocalinkRuntime({ stateRoot });
+    assert.equal(runtime.capabilities.list().length, 4);
+    assert.equal(runtime.capabilities.search('fixture_not_present').length, 0);
+    const status = (await runtime.health()).sharedAssets.externalMcp
+      .providers[0];
+    assert.equal(status?.state, 'degraded');
+    assert.equal(status?.reasonCode, 'PROVIDER_TOOL_OVERRIDE_UNKNOWN');
+    await runtime.close();
+  });
+});
+
+test('stdio bridge projects annotated tools, isolates environment, and reaps child on close', async () => {
   await withTemp(async (root) => {
     const stateRoot = path.join(root, 'state');
     const pidFile = path.join(root, 'provider.pid');
@@ -385,8 +563,10 @@ test('stdio bridge projects read-only tools, isolates environment, and reaps chi
       },
     });
     const capabilities = runtime.capabilities.search('fixture');
-    assert.equal(capabilities.length, 1);
-    const descriptor = capabilities[0];
+    assert.equal(capabilities.length, 3);
+    const descriptor = capabilities.find((item) =>
+      item.title.includes('fixture_read'),
+    );
     assert.ok(descriptor);
     const receipt = await runtime.capabilities.invoke(
       descriptor.id,
@@ -404,7 +584,7 @@ test('stdio bridge projects read-only tools, isolates environment, and reaps chi
     );
     const health = await runtime.health();
     assert.equal(health.sharedAssets.externalMcp.readyProviders, 1);
-    assert.equal(health.sharedAssets.externalMcp.providers[0]?.skippedTools, 3);
+    assert.equal(health.sharedAssets.externalMcp.providers[0]?.skippedTools, 1);
     assert.equal(JSON.stringify(health).includes(process.execPath), false);
     assert.equal(JSON.stringify(health).includes(stdioFixture), false);
     const pid = Number(await readFile(pidFile, 'utf8'));
@@ -435,7 +615,9 @@ test('running runtime refreshes external provider capabilities and closes remove
         pidFile,
       ]);
       await running.refreshExternalMcp();
-      const capability = running.capabilities.search('fixture_read')[0];
+      const capability = running.capabilities
+        .list()
+        .find((item) => item.title.includes('fixture_read'));
       assert.ok(capability);
       assert.equal(
         (
@@ -463,7 +645,7 @@ test('running runtime refreshes external provider capabilities and closes remove
           error instanceof LocalinkError && error.code === 'CONFIG_INVALID',
       );
       assert.equal(running.capabilities, previous);
-      assert.equal(running.capabilities.list().length, 1);
+      assert.equal(running.capabilities.list().length, 3);
       await writeFile(
         path.join(stateRoot, 'config', 'external-mcp.json'),
         JSON.stringify({

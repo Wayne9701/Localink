@@ -28,3 +28,11 @@ grace period when necessary.
 
 Capability and Skill registries load only explicitly configured Shared MCP and
 Shared Skill sources. They are empty on a clean machine until configured.
+
+External MCP schema version 1 remains backward compatible. Providers may add a
+bounded `toolRiskOverrides` exact-name map with values 0, 1, or 2. Annotation
+projection and overrides affect only Localink risk classification; provider
+business logic, auth, installation, and verification remain provider-owned.
+Tier 2 confirmation tickets are process-local, short-lived, bound to the exact
+capability/input/tier, and consumed once. Arbitrary remote HTTPS providers and
+Tier 3 projection are not supported.

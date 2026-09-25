@@ -191,6 +191,10 @@ export interface CapabilityInvokeReceipt {
   readonly capabilityId: string;
   readonly status: 'executed' | 'confirmation_required' | 'denied';
   readonly policy: PolicyDecision;
+  readonly confirmation?: {
+    readonly ticket: string;
+    readonly expiresAt: string;
+  };
   readonly output?: unknown;
   readonly verification?: VerificationReceipt;
 }

@@ -215,7 +215,118 @@ test('balanced Tier 2 returns confirm and never executes its handler', async () 
   );
   assert.equal(receipt.status, 'confirmation_required');
   assert.equal(receipt.policy.action, 'confirm');
+  assert.equal(typeof receipt.confirmation?.ticket, 'string');
   assert.equal(executions, 0);
+});
+
+test('Tier 2 confirmation tickets are exact-input, expiring, single-use, and balanced-only', async () => {
+  let now = 1_000;
+  let sequence = 0;
+  let executions = 0;
+  const capabilities = new CapabilityRegistry({
+    now: () => now,
+    confirmationTtlMs: 100,
+    ticketFactory: () => `ticket_${String(++sequence).padStart(40, '0')}`,
+  });
+  capabilities.register(
+    capabilityDescriptor('fixture.confirmed-send', {
+      operationClass: 'write',
+      riskTier: 2,
+      reversible: false,
+    }),
+    async (input) => {
+      executions++;
+      return { output: { input, executions } };
+    },
+  );
+
+  const requested = await capabilities.invoke(
+    'fixture.confirmed-send',
+    { b: 2, a: 1 },
+    { policyProfile: 'balanced' },
+  );
+  const ticket = requested.confirmation?.ticket;
+  assert.ok(ticket);
+  const executed = await capabilities.invokeConfirmed(
+    ticket,
+    'fixture.confirmed-send',
+    { a: 1, b: 2 },
+    { policyProfile: 'balanced' },
+  );
+  assert.equal(executed.status, 'executed');
+  assert.equal(executed.policy.reason.code, 'POLICY_BALANCED_TIER_2_CONFIRMED');
+  assert.equal(executions, 1);
+  await assert.rejects(
+    capabilities.invokeConfirmed(
+      ticket,
+      'fixture.confirmed-send',
+      { a: 1, b: 2 },
+      { policyProfile: 'balanced' },
+    ),
+    hasCode('INVALID_ARGUMENT'),
+  );
+  assert.equal(executions, 1);
+
+  const mismatch = await capabilities.invoke(
+    'fixture.confirmed-send',
+    { value: 'expected' },
+    { policyProfile: 'balanced' },
+  );
+  assert.ok(mismatch.confirmation);
+  await assert.rejects(
+    capabilities.invokeConfirmed(
+      mismatch.confirmation.ticket,
+      'fixture.confirmed-send',
+      { value: 'different' },
+      { policyProfile: 'balanced' },
+    ),
+    hasCode('INVALID_ARGUMENT'),
+  );
+  await assert.rejects(
+    capabilities.invokeConfirmed(
+      mismatch.confirmation.ticket,
+      'fixture.confirmed-send',
+      { value: 'expected' },
+      { policyProfile: 'balanced' },
+    ),
+    hasCode('INVALID_ARGUMENT'),
+  );
+  assert.equal(executions, 1);
+
+  const expiring = await capabilities.invoke(
+    'fixture.confirmed-send',
+    {},
+    { policyProfile: 'balanced' },
+  );
+  assert.ok(expiring.confirmation);
+  now += 100;
+  await assert.rejects(
+    capabilities.invokeConfirmed(
+      expiring.confirmation.ticket,
+      'fixture.confirmed-send',
+      {},
+      { policyProfile: 'balanced' },
+    ),
+    hasCode('INVALID_ARGUMENT'),
+  );
+  assert.equal(executions, 1);
+
+  const openAttempt = await capabilities.invoke(
+    'fixture.confirmed-send',
+    {},
+    { policyProfile: 'balanced' },
+  );
+  assert.ok(openAttempt.confirmation);
+  await assert.rejects(
+    capabilities.invokeConfirmed(
+      openAttempt.confirmation.ticket,
+      'fixture.confirmed-send',
+      {},
+      { policyProfile: 'open' },
+    ),
+    hasCode('POLICY_DENIED'),
+  );
+  assert.equal(executions, 1);
 });
 
 test('strict Tier 1 confirms and open or workspace override cannot bypass Tier 3', () => {

@@ -52,6 +52,8 @@ test('fresh runtime persists stable canonical workspace identity across restart 
           readyProviders: 0,
           degradedProviders: 0,
           registeredReadCapabilities: 0,
+          registeredCapabilities: 0,
+          registeredCapabilitiesByTier: { 0: 0, 1: 0, 2: 0 },
           providers: [],
         },
       },

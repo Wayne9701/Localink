@@ -72,6 +72,15 @@ const fixtureContext = z.strictObject({
     .optional(),
 });
 const capabilityInvoke = z.strictObject({ capabilityId: id, input: z.json() });
+const capabilityConfirm = z.strictObject({
+  ticket: z
+    .string()
+    .min(32)
+    .max(128)
+    .regex(/^[A-Za-z0-9_-]+$/u),
+  capabilityId: id,
+  input: z.json(),
+});
 const processBase = {
   workspaceId,
   command: z
@@ -102,6 +111,7 @@ export const toolSchemas = {
   'localink.capability_search': search,
   'localink.capability_describe': z.strictObject({ capabilityId: id }),
   'localink.capability_invoke': capabilityInvoke,
+  'localink.capability_confirm': capabilityConfirm,
   'localink.skill_search': search,
   'localink.skill_read': z.strictObject({
     skillId: id,
@@ -261,6 +271,8 @@ export const toolDescriptions: Record<ToolName, string> = {
     'Describe one capability using V1 public metadata.',
   'localink.capability_invoke':
     'Invoke a capability through Localink policy and verification. Supplied context is not authentication.',
+  'localink.capability_confirm':
+    'Consume one short-lived confirmation ticket for the exact Tier 2 capability and input previously requested.',
   'localink.skill_search':
     'Search registered, untrusted Skill assets; never execute them.',
   'localink.skill_read':
@@ -327,12 +339,17 @@ const PROCESS = new Set<ToolName>([
   'localink.process_stop',
 ]);
 const CONSERVATIVE_DESTRUCTIVE = new Set<ToolName>([
+  'localink.capability_confirm',
   'localink.files_move',
   'localink.files_archive',
   'localink.process_exec',
   'localink.process_start',
   'localink.process_input',
   'localink.process_stop',
+]);
+const OPEN_WORLD = new Set<ToolName>([
+  ...PROCESS,
+  'localink.capability_confirm',
 ]);
 export const toolAnnotations: Record<
   ToolName,
@@ -346,7 +363,7 @@ export const toolAnnotations: Record<
     name,
     {
       readOnlyHint: READ_ONLY.has(name),
-      openWorldHint: PROCESS.has(name),
+      openWorldHint: OPEN_WORLD.has(name),
       destructiveHint: CONSERVATIVE_DESTRUCTIVE.has(name),
     },
   ]),

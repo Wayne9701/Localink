@@ -31,11 +31,16 @@ import {
   EXTERNAL_MCP_SCHEMA_VERSION,
   ExternalMcpManager,
   addExternalMcpProvider,
+  listExternalMcpToolRiskOverrides,
   removeExternalMcpProvider,
+  removeExternalMcpToolRiskOverride,
+  setExternalMcpToolRiskOverride,
   validateExternalMcpConfig,
   validExternalMcpProviders,
   type ExternalMcpConfig,
   type ExternalMcpProvider,
+  type ExternalMcpRiskTier,
+  type ExternalMcpToolRiskOverrides,
 } from './external-mcp.js';
 import {
   SKILL_SOURCE_SCHEMA_VERSION,
@@ -365,6 +370,36 @@ export class LocalinkRuntime {
     );
   }
 
+  async externalMcpToolRiskOverrides(
+    id: string,
+  ): Promise<ExternalMcpToolRiskOverrides> {
+    return listExternalMcpToolRiskOverrides(this.#externalMcpStore, id);
+  }
+
+  async setExternalMcpToolRiskOverride(
+    id: string,
+    toolName: string,
+    riskTier: ExternalMcpRiskTier,
+  ): Promise<ExternalMcpProvider> {
+    return this.#mutate(() =>
+      setExternalMcpToolRiskOverride(
+        this.#externalMcpStore,
+        id,
+        toolName,
+        riskTier,
+      ),
+    );
+  }
+
+  async removeExternalMcpToolRiskOverride(
+    id: string,
+    toolName: string,
+  ): Promise<ExternalMcpProvider> {
+    return this.#mutate(() =>
+      removeExternalMcpToolRiskOverride(this.#externalMcpStore, id, toolName),
+    );
+  }
+
   processPolicy(): ProcessPolicy {
     return { ...this.#processPolicy };
   }
@@ -407,7 +442,7 @@ export class LocalinkRuntime {
         contractVersion: CONTRACT_VERSION_V1,
         id: EXTERNAL_MCP_MODULE_ID,
         version: '1.0.0',
-        title: 'External MCP Read Bridge',
+        title: 'External MCP Risk-aware Bridge',
         runtime: { apiVersion: CONTRACT_VERSION_V1 },
       },
     });

@@ -59,6 +59,8 @@ async function runAttempt() {
       operationClass: description.operationClass,
       riskTier: description.riskTier,
       eligibleReadTools: provider.eligibleReadTools,
+      eligibleProjectedTools: provider.eligibleProjectedTools,
+      projectedToolsByTier: provider.projectedToolsByTier,
       skippedTools: provider.skippedTools,
       boundedBytes: Buffer.byteLength(JSON.stringify(invoked)),
     };
@@ -98,7 +100,7 @@ try {
   );
 } catch {
   process.stderr.write(
-    `${JSON.stringify({ ok: false, code: 'LARK_PROVIDER_E2E_FAILED', message: 'Read-only Lark bridge failed after the allowed retry budget.' })}\n`,
+    `${JSON.stringify({ ok: false, code: 'LARK_PROVIDER_E2E_FAILED', message: 'Risk-aware Lark bridge failed after the allowed retry budget.' })}\n`,
   );
   process.exitCode = 1;
 } finally {

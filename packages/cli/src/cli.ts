@@ -1031,6 +1031,48 @@ async function main(): Promise<void> {
     if (
       args.length === 4 &&
       args[0] === 'mcp-provider' &&
+      args[1] === 'risk' &&
+      args[2] === 'list' &&
+      args[3] !== undefined
+    ) {
+      output({
+        providerId: args[3],
+        overrides: await runtime.externalMcpToolRiskOverrides(args[3]),
+      });
+      return;
+    }
+    if (
+      args.length === 6 &&
+      args[0] === 'mcp-provider' &&
+      args[1] === 'risk' &&
+      args[2] === 'set' &&
+      args[3] !== undefined &&
+      args[4] !== undefined &&
+      ['0', '1', '2'].includes(args[5] ?? '')
+    ) {
+      output(
+        await runtime.setExternalMcpToolRiskOverride(
+          args[3],
+          args[4],
+          Number(args[5]) as 0 | 1 | 2,
+        ),
+      );
+      return;
+    }
+    if (
+      args.length === 5 &&
+      args[0] === 'mcp-provider' &&
+      args[1] === 'risk' &&
+      args[2] === 'remove' &&
+      args[3] !== undefined &&
+      args[4] !== undefined
+    ) {
+      output(await runtime.removeExternalMcpToolRiskOverride(args[3], args[4]));
+      return;
+    }
+    if (
+      args.length === 4 &&
+      args[0] === 'mcp-provider' &&
       args[1] === 'add-http' &&
       args[2] !== undefined &&
       args[3] !== undefined
@@ -1077,7 +1119,7 @@ async function main(): Promise<void> {
     }
     throw new LocalinkError(
       'INVALID_ARGUMENT',
-      'Usage: localink release build|status|list|install|rollback --json | localink doctor --json | localink service status|bootstrap|bootout --json | localink service restart <core|tunnel> --json | localink tunnel configure <tunnel-id> --json | localink tunnel status --json | localink tunnel migrate-keychain-auth --json | localink core self-test --json | runtime health --json | workspace add <name> <absolute-root> --json | workspace list --json | workspace inspect <id> --json | workspace remove <id> --json | process policy --json | process enable --json | process disable --json | skill-source list --json | skill-source add <id> <absolute-root> --json | skill-source remove <id> --json | mcp-provider list --json | mcp-provider add-http <id> <loopback-url> --json | mcp-provider add-stdio <id> <absolute-command> [args...] --json | mcp-provider remove <id> --json',
+      'Usage: localink release build|status|list|install|rollback --json | localink doctor --json | localink service status|bootstrap|bootout --json | localink service restart <core|tunnel> --json | localink tunnel configure <tunnel-id> --json | localink tunnel status --json | localink tunnel migrate-keychain-auth --json | localink core self-test --json | runtime health --json | workspace add <name> <absolute-root> --json | workspace list --json | workspace inspect <id> --json | workspace remove <id> --json | process policy --json | process enable --json | process disable --json | skill-source list --json | skill-source add <id> <absolute-root> --json | skill-source remove <id> --json | mcp-provider list --json | mcp-provider add-http <id> <loopback-url> --json | mcp-provider add-stdio <id> <absolute-command> [args...] --json | mcp-provider risk list <id> --json | mcp-provider risk set <id> <exact-tool-name> <0|1|2> --json | mcp-provider risk remove <id> <exact-tool-name> --json | mcp-provider remove <id> --json',
     );
   } finally {
     await runtime.close();

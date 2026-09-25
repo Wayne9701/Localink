@@ -47,7 +47,7 @@ server/adapter over one process-scoped runtime. Runtime state persists across
 requests; caller context does not. There is no persistent MCP session and no
 `Mcp-Session-Id` dependency.
 
-## Public tools: exactly 26
+## Public tools: exactly 27
 
 | Tool                                                       | Input / purpose                                                                           |
 | ---------------------------------------------------------- | ----------------------------------------------------------------------------------------- |
@@ -55,6 +55,7 @@ requests; caller context does not. There is no persistent MCP session and no
 | `localink.capability_search`                               | Optional `query` (256 characters), `limit` (1–50, default 20)                             |
 | `localink.capability_describe`                             | `capabilityId`; projected V1 descriptor                                                   |
 | `localink.capability_invoke`                               | `capabilityId`, JSON `input`; always invokes through Core                                 |
+| `localink.capability_confirm`                              | Single-use ticket plus the exact Tier 2 `capabilityId` and JSON `input`                   |
 | `localink.skill_search`                                    | Same bounded query/limit; Registry assets only                                            |
 | `localink.skill_read`                                      | `skillId`, optional `maxBytes` (1–16384, default 8192); untrusted asset boundary          |
 | `localink.workspace_list` / `workspace_inspect`            | Public-safe metadata; never absolute roots                                                |
@@ -74,6 +75,12 @@ requests; caller context does not. There is no persistent MCP session and no
 Real runtime capability and Skill registries load explicitly configured Shared
 MCP and Shared Skill sources. The fixture runtime and synthetic invocation
 context remain explicit test-only entrypoints, never product defaults.
+
+Production callers cannot choose `policyProfile=open`. Normal invocation uses
+balanced policy: tiers 0 and 1 execute, Tier 2 returns a confirmation ticket
+without calling the provider, and Tier 3 is denied. The confirmation tool is
+itself annotated destructive and open-world and consumes only a matching,
+unexpired, process-local ticket once.
 
 ## Bounds and errors
 

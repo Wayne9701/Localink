@@ -20,6 +20,9 @@ export const EXTERNAL_MCP_MODULE_ID = 'localink.external_mcp';
 export const EXTERNAL_MCP_LIMITS = {
   providers: 20,
   toolsPerProvider: 1000,
+  riskOverridesPerProvider: 256,
+  riskOverrideNameBytes: 256,
+  riskOverrideBytes: 32 * 1024,
   args: 64,
   argumentBytes: 4096,
   totalArgumentBytes: 32 * 1024,
@@ -33,12 +36,19 @@ const SAFE_ID = /^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*$/u;
 const LOOPBACK_HOSTS = new Set(['localhost', '127.0.0.1', '::1', '[::1]']);
 const SECRET_ARGUMENT =
   /(?:^|[-_])(token|cookie|password|passwd|api[-_]?key|client[-_]?secret|oauth)(?:$|[=_-])/iu;
+const EXACT_TOOL_NAME = /^[A-Za-z0-9][A-Za-z0-9._:/-]*$/u;
+
+export type ExternalMcpRiskTier = 0 | 1 | 2;
+export type ExternalMcpToolRiskOverrides = Readonly<
+  Record<string, ExternalMcpRiskTier>
+>;
 
 export interface LoopbackHttpProvider {
   readonly id: string;
   readonly transport: 'loopback-http';
   readonly url: string;
   readonly enabled: boolean;
+  readonly toolRiskOverrides?: ExternalMcpToolRiskOverrides;
 }
 
 export interface StdioProvider {
@@ -47,6 +57,7 @@ export interface StdioProvider {
   readonly command: string;
   readonly args: readonly string[];
   readonly enabled: boolean;
+  readonly toolRiskOverrides?: ExternalMcpToolRiskOverrides;
 }
 
 export type ExternalMcpProvider = LoopbackHttpProvider | StdioProvider;
@@ -66,6 +77,8 @@ export interface ExternalMcpProviderStatus {
   transport: ExternalMcpProvider['transport'] | 'invalid';
   state: 'ready' | 'disabled' | 'degraded';
   eligibleReadTools: number;
+  eligibleProjectedTools: number;
+  projectedToolsByTier: Readonly<Record<ExternalMcpRiskTier, number>>;
   skippedTools: number;
   reasonCode?: string;
 }
@@ -75,6 +88,10 @@ export interface ExternalMcpHealth {
   readonly readyProviders: number;
   readonly degradedProviders: number;
   readonly registeredReadCapabilities: number;
+  readonly registeredCapabilities: number;
+  readonly registeredCapabilitiesByTier: Readonly<
+    Record<ExternalMcpRiskTier, number>
+  >;
   readonly providers: readonly ExternalMcpProviderStatus[];
 }
 
@@ -174,6 +191,37 @@ function parseArgs(value: unknown): string[] {
   return [...(value as string[])];
 }
 
+function parseToolRiskOverrides(
+  value: unknown,
+): ExternalMcpToolRiskOverrides | undefined {
+  if (value === undefined) return undefined;
+  if (!isRecord(value)) {
+    throw new LocalinkError(
+      'CONFIG_INVALID',
+      'Tool risk overrides must be an exact-name object.',
+    );
+  }
+  const entries = Object.entries(value);
+  if (
+    entries.length > EXTERNAL_MCP_LIMITS.riskOverridesPerProvider ||
+    Buffer.byteLength(JSON.stringify(value)) >
+      EXTERNAL_MCP_LIMITS.riskOverrideBytes ||
+    entries.some(
+      ([name, tier]) =>
+        !EXACT_TOOL_NAME.test(name) ||
+        Buffer.byteLength(name) > EXTERNAL_MCP_LIMITS.riskOverrideNameBytes ||
+        ![0, 1, 2].includes(Number(tier)) ||
+        typeof tier !== 'number',
+    )
+  ) {
+    throw new LocalinkError(
+      'CONFIG_INVALID',
+      'Tool risk overrides must use bounded exact names and tiers 0, 1, or 2.',
+    );
+  }
+  return Object.fromEntries(entries) as Record<string, ExternalMcpRiskTier>;
+}
+
 export function parseExternalMcpProvider(value: unknown): ExternalMcpProvider {
   if (
     !isRecord(value) ||
@@ -186,8 +234,17 @@ export function parseExternalMcpProvider(value: unknown): ExternalMcpProvider {
       'Provider contains invalid fields.',
     );
   }
+  const toolRiskOverrides = parseToolRiskOverrides(value.toolRiskOverrides);
   if (value.transport === 'loopback-http') {
-    if (!strictKeys(value, ['id', 'transport', 'url', 'enabled']))
+    if (
+      !strictKeys(value, [
+        'id',
+        'transport',
+        'url',
+        'enabled',
+        'toolRiskOverrides',
+      ])
+    )
       throw new LocalinkError(
         'CONFIG_INVALID',
         'HTTP provider contains unsupported or secret fields.',
@@ -197,11 +254,19 @@ export function parseExternalMcpProvider(value: unknown): ExternalMcpProvider {
       transport: 'loopback-http',
       url: parseLoopbackUrl(value.url),
       enabled: value.enabled,
+      ...(toolRiskOverrides === undefined ? {} : { toolRiskOverrides }),
     };
   }
   if (value.transport === 'stdio') {
     if (
-      !strictKeys(value, ['id', 'transport', 'command', 'args', 'enabled']) ||
+      !strictKeys(value, [
+        'id',
+        'transport',
+        'command',
+        'args',
+        'enabled',
+        'toolRiskOverrides',
+      ]) ||
       typeof value.command !== 'string' ||
       !path.isAbsolute(value.command) ||
       value.command.includes('\0')
@@ -217,6 +282,7 @@ export function parseExternalMcpProvider(value: unknown): ExternalMcpProvider {
       command: path.resolve(value.command),
       args: parseArgs(value.args),
       enabled: value.enabled,
+      ...(toolRiskOverrides === undefined ? {} : { toolRiskOverrides }),
     };
   }
   throw new LocalinkError(
@@ -322,24 +388,44 @@ function projectedSchema(tool: Tool): Readonly<Record<string, unknown>> {
 function capabilityDescriptor(
   provider: ExternalMcpProvider,
   tool: Tool,
+  riskTier: ExternalMcpRiskTier,
+  riskSource: 'annotations' | 'local exact-name override',
 ): CapabilityDescriptor {
   return {
     contractVersion: CONTRACT_VERSION_V1,
     id: externalCapabilityId(provider.id, tool.name),
     moduleId: EXTERNAL_MCP_MODULE_ID,
-    version: '1.0.0-external-mcp-v1',
+    version: '1.0.0-external-mcp-v2',
     title: `${tool.title ?? tool.name} (${provider.id})`,
-    description: `${tool.description ?? 'External MCP read tool.'} Provider: ${provider.id}; original tool: ${tool.name}.`,
+    description: `${tool.description ?? 'External MCP tool.'} Provider: ${provider.id}; original tool: ${tool.name}; Localink risk tier ${riskTier} from ${riskSource}.`,
     inputSchema: { kind: 'inline', schema: projectedSchema(tool) },
     outputSummary: 'Bounded external MCP CallToolResult.',
-    operationClass: 'read',
+    operationClass: riskTier === 0 ? 'read' : 'write',
     requiredScopes: [],
-    riskTier: 0,
-    reversible: true,
+    riskTier,
+    reversible: riskTier === 0,
     supportsPrecondition: false,
     postVerify: 'none',
     publicSemantic: false,
   };
+}
+
+function annotationRiskTier(tool: Tool): ExternalMcpRiskTier | undefined {
+  const annotations = tool.annotations;
+  if (!isRecord(annotations)) return undefined;
+  if (
+    annotations.destructiveHint === true ||
+    annotations.openWorldHint === true
+  ) {
+    return 2;
+  }
+  if (annotations.readOnlyHint === true) return 0;
+  if (annotations.readOnlyHint === false) return 1;
+  return undefined;
+}
+
+function emptyTierCounts(): Record<ExternalMcpRiskTier, number> {
+  return { 0: 0, 1: 0, 2: 0 };
 }
 
 async function closeConnection(connection: ProviderConnection): Promise<void> {
@@ -370,6 +456,8 @@ export class ExternalMcpManager {
         transport: 'invalid',
         state: 'degraded',
         eligibleReadTools: 0,
+        eligibleProjectedTools: 0,
+        projectedToolsByTier: emptyTierCounts(),
         skippedTools: 0,
         reasonCode: 'PROVIDER_CONFIG_INVALID',
       });
@@ -381,6 +469,12 @@ export class ExternalMcpManager {
   }
 
   health(): ExternalMcpHealth {
+    const tierCounts = this.#statuses.reduce((counts, item) => {
+      counts[0] += item.projectedToolsByTier[0];
+      counts[1] += item.projectedToolsByTier[1];
+      counts[2] += item.projectedToolsByTier[2];
+      return counts;
+    }, emptyTierCounts());
     return {
       providerCount: this.#providerCount,
       readyProviders: this.#statuses.filter((item) => item.state === 'ready')
@@ -392,7 +486,12 @@ export class ExternalMcpManager {
         (count, item) => count + item.eligibleReadTools,
         0,
       ),
-      providers: this.#statuses.map((item) => ({ ...item })),
+      registeredCapabilities: tierCounts[0] + tierCounts[1] + tierCounts[2],
+      registeredCapabilitiesByTier: tierCounts,
+      providers: this.#statuses.map((item) => ({
+        ...item,
+        projectedToolsByTier: { ...item.projectedToolsByTier },
+      })),
     };
   }
 
@@ -411,6 +510,8 @@ export class ExternalMcpManager {
         transport: provider.transport,
         state: 'disabled',
         eligibleReadTools: 0,
+        eligibleProjectedTools: 0,
+        projectedToolsByTier: emptyTierCounts(),
         skippedTools: 0,
       });
       return;
@@ -458,27 +559,51 @@ export class ExternalMcpManager {
       ).tools;
       const tools = listedTools.slice(0, EXTERNAL_MCP_LIMITS.toolsPerProvider);
       let eligibleReadTools = 0;
+      const projectedToolsByTier = emptyTierCounts();
       let skippedTools = listedTools.length - tools.length;
       const status: ExternalMcpProviderStatus = {
         id: provider.id,
         transport: provider.transport,
         state: 'ready',
         eligibleReadTools: 0,
+        eligibleProjectedTools: 0,
+        projectedToolsByTier,
         skippedTools: 0,
       };
+      const listedNames = new Set(tools.map((tool) => tool.name));
+      const unknownOverrides = Object.keys(
+        provider.toolRiskOverrides ?? {},
+      ).filter((name) => !listedNames.has(name));
+      if (unknownOverrides.length > 0) {
+        status.state = 'degraded';
+        status.reasonCode = 'PROVIDER_TOOL_OVERRIDE_UNKNOWN';
+      }
+      let providerCallAvailable = true;
       for (const tool of tools) {
-        if (
-          tool.annotations?.readOnlyHint !== true ||
-          tool.annotations.destructiveHint === true
-        ) {
+        const override = Object.hasOwn(
+          provider.toolRiskOverrides ?? {},
+          tool.name,
+        )
+          ? provider.toolRiskOverrides?.[tool.name]
+          : undefined;
+        const riskTier = override ?? annotationRiskTier(tool);
+        if (riskTier === undefined) {
           skippedTools++;
           continue;
         }
         try {
-          const descriptor = capabilityDescriptor(provider, tool);
+          const descriptor = capabilityDescriptor(
+            provider,
+            tool,
+            riskTier,
+            override === undefined
+              ? 'annotations'
+              : 'local exact-name override',
+          );
           const fixedToolName = tool.name;
           this.#registry.register(descriptor, async (input) => {
             try {
+              if (!providerCallAvailable) throw new Error('provider-degraded');
               if (!isRecord(input)) {
                 throw new LocalinkError(
                   'INVALID_ARGUMENT',
@@ -492,17 +617,23 @@ export class ExternalMcpManager {
               );
               return { output };
             } catch (error) {
+              providerCallAvailable = false;
               status.state = 'degraded';
               status.reasonCode = 'PROVIDER_CALL_FAILED';
               throw error;
             }
           });
-          eligibleReadTools++;
+          projectedToolsByTier[riskTier]++;
+          if (riskTier === 0) eligibleReadTools++;
         } catch {
           skippedTools++;
         }
       }
       status.eligibleReadTools = eligibleReadTools;
+      status.eligibleProjectedTools =
+        projectedToolsByTier[0] +
+        projectedToolsByTier[1] +
+        projectedToolsByTier[2];
       status.skippedTools = skippedTools;
       this.#connections.set(provider.id, connection);
       this.#statuses.push(status);
@@ -513,6 +644,8 @@ export class ExternalMcpManager {
         transport: provider.transport,
         state: 'degraded',
         eligibleReadTools: 0,
+        eligibleProjectedTools: 0,
+        projectedToolsByTier: emptyTierCounts(),
         skippedTools: 0,
         reasonCode: 'PROVIDER_UNAVAILABLE',
       });
@@ -562,4 +695,85 @@ export async function removeExternalMcpProvider(
     providers: providers.filter((item) => item.id !== id),
   });
   return provider;
+}
+
+function providerWithOverrides(
+  provider: ExternalMcpProvider,
+  overrides: ExternalMcpToolRiskOverrides | undefined,
+): ExternalMcpProvider {
+  const { toolRiskOverrides: _previous, ...base } = provider;
+  void _previous;
+  return {
+    ...base,
+    ...(overrides === undefined || Object.keys(overrides).length === 0
+      ? {}
+      : { toolRiskOverrides: overrides }),
+  } as ExternalMcpProvider;
+}
+
+async function configuredProvider(
+  store: ExternalMcpStoreLike,
+  id: string,
+): Promise<{
+  providers: ExternalMcpProvider[];
+  provider: ExternalMcpProvider;
+}> {
+  const config = (await store.read()) ?? {
+    version: EXTERNAL_MCP_SCHEMA_VERSION,
+    providers: [],
+  };
+  const providers = validExternalMcpProviders(config);
+  const provider = providers.find((item) => item.id === id);
+  if (provider === undefined)
+    throw new LocalinkError('NOT_FOUND', 'MCP provider was not found.');
+  return { providers, provider };
+}
+
+export async function listExternalMcpToolRiskOverrides(
+  store: ExternalMcpStoreLike,
+  id: string,
+): Promise<ExternalMcpToolRiskOverrides> {
+  const { provider } = await configuredProvider(store, id);
+  return { ...(provider.toolRiskOverrides ?? {}) };
+}
+
+export async function setExternalMcpToolRiskOverride(
+  store: ExternalMcpStoreLike,
+  id: string,
+  toolName: string,
+  riskTier: number,
+): Promise<ExternalMcpProvider> {
+  const parsed = parseToolRiskOverrides({ [toolName]: riskTier });
+  if (parsed === undefined)
+    throw new LocalinkError('CONFIG_INVALID', 'Tool risk override is invalid.');
+  const { providers, provider } = await configuredProvider(store, id);
+  const overrides = parseToolRiskOverrides({
+    ...(provider.toolRiskOverrides ?? {}),
+    ...parsed,
+  });
+  const updated = providerWithOverrides(provider, overrides);
+  await store.write({
+    version: EXTERNAL_MCP_SCHEMA_VERSION,
+    providers: providers.map((item) => (item.id === id ? updated : item)),
+  });
+  return updated;
+}
+
+export async function removeExternalMcpToolRiskOverride(
+  store: ExternalMcpStoreLike,
+  id: string,
+  toolName: string,
+): Promise<ExternalMcpProvider> {
+  const { providers, provider } = await configuredProvider(store, id);
+  if (!Object.hasOwn(provider.toolRiskOverrides ?? {}, toolName)) {
+    throw new LocalinkError('NOT_FOUND', 'Tool risk override was not found.');
+  }
+  const overrides = { ...(provider.toolRiskOverrides ?? {}) };
+  delete overrides[toolName];
+  const updated = providerWithOverrides(provider, overrides);
+  await store.write({
+    version: EXTERNAL_MCP_SCHEMA_VERSION,
+    providers: providers.map((item) => (item.id === id ? updated : item)),
+  });
+  return updated;
 }
