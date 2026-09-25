@@ -372,16 +372,31 @@ export class LocalServiceController {
   }
 
   async bootstrap(tunnelReady: boolean): Promise<ServiceBootstrapReceipt> {
+    return this.#bootstrapSelected(
+      new Set<ServiceId>([
+        'localink-core',
+        'localink-recovery',
+        ...(tunnelReady ? (['localink-tunnel'] as const) : []),
+      ]),
+    );
+  }
+
+  /**
+   * Starts only Tunnel after Core has passed a live MCP readiness gate.
+   * Release activation uses this instead of re-running Core's LaunchAgent.
+   */
+  async bootstrapTunnel(): Promise<ServiceBootstrapReceipt> {
+    return this.#bootstrapSelected(new Set<ServiceId>(['localink-tunnel']));
+  }
+
+  async #bootstrapSelected(
+    selected: ReadonlySet<ServiceId>,
+  ): Promise<ServiceBootstrapReceipt> {
     await this.preflight();
     await Promise.all([
       mkdir(this.#context.stateRoot, { recursive: true, mode: 0o700 }),
       mkdir(this.#context.configRoot, { recursive: true, mode: 0o700 }),
       mkdir(this.#context.logRoot, { recursive: true, mode: 0o700 }),
-    ]);
-    const selected = new Set<ServiceId>([
-      'localink-core',
-      'localink-recovery',
-      ...(tunnelReady ? (['localink-tunnel'] as const) : []),
     ]);
     const bootstrapped: ServiceId[] = [];
     const skipped: ServiceId[] = [];

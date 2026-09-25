@@ -2,7 +2,9 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
   ReleaseReadinessError,
+  activateCoreFirst,
   waitForControlPlaneReadiness,
+  waitForCoreStartup,
   waitForLocalStartup,
 } from '../src/release-readiness.js';
 
@@ -69,6 +71,188 @@ test('a stale persisted status cannot satisfy the live local-startup gate', asyn
       error.code === 'LOCAL_MCP_FAILED',
   );
   assert.equal(clock.now(), 1_000);
+});
+
+test('core gate waits for exact live MCP readiness before Tunnel can start', async () => {
+  const clock = fakeClock();
+  const events: string[] = [];
+  await activateCoreFirst({
+    rebootstrapCore: async () => {
+      events.push('core-rebootstrap');
+    },
+    waitForCore: async () => {
+      await waitForCoreStartup(
+        async () => ({
+          mcpReady: clock.now() >= 1_000,
+          ...(clock.now() >= 1_000 ? { toolCount: 27 } : {}),
+          coreInstalled: true,
+          coreRunning: true,
+          recoveryInstalled: true,
+        }),
+        {
+          ...clock,
+          expectedToolCount: 27,
+          timeoutMs: 2_000,
+          intervalMs: 250,
+        },
+      );
+      events.push('core-ready');
+    },
+    bootstrapTunnel: async () => {
+      events.push('tunnel-bootstrap');
+    },
+    waitForLocalServices: async () => {
+      events.push('local-services-ready');
+    },
+    waitForControlPlane: async () => {
+      events.push('control-plane-ready');
+    },
+  });
+  assert.deepEqual(events, [
+    'core-rebootstrap',
+    'core-ready',
+    'tunnel-bootstrap',
+    'local-services-ready',
+    'control-plane-ready',
+  ]);
+  assert.equal(clock.now(), 1_000);
+});
+
+test('core readiness timeout fails closed without starting Tunnel', async () => {
+  const clock = fakeClock();
+  let tunnelStarted = false;
+  await assert.rejects(
+    activateCoreFirst({
+      rebootstrapCore: async () => undefined,
+      waitForCore: async () =>
+        waitForCoreStartup(
+          async () => ({
+            mcpReady: false,
+            coreInstalled: true,
+            coreRunning: true,
+            recoveryInstalled: true,
+          }),
+          {
+            ...clock,
+            expectedToolCount: 27,
+            timeoutMs: 1_000,
+            intervalMs: 250,
+          },
+        ),
+      bootstrapTunnel: async () => {
+        tunnelStarted = true;
+      },
+      waitForLocalServices: async () => undefined,
+      waitForControlPlane: async () => undefined,
+    }),
+    (error) =>
+      error instanceof ReleaseReadinessError &&
+      error.code === 'LOCAL_MCP_FAILED',
+  );
+  assert.equal(tunnelStarted, false);
+  assert.equal(clock.now(), 1_000);
+});
+
+test('core-first activation requires a fresh control-plane poll after Tunnel bootstrap', async () => {
+  const clock = fakeClock();
+  const events: string[] = [];
+  await activateCoreFirst({
+    rebootstrapCore: async () => {
+      events.push('core-rebootstrap');
+    },
+    waitForCore: async () => {
+      events.push('core-ready');
+    },
+    bootstrapTunnel: async () => {
+      events.push('tunnel-bootstrap');
+    },
+    waitForLocalServices: async () => {
+      events.push('local-services-ready');
+    },
+    waitForControlPlane: async () => {
+      await waitForControlPlaneReadiness(
+        async () => ({
+          coreMcpReady: true,
+          tunnelRunning: true,
+          // A ready value from before this Tunnel boot is deliberately not
+          // accepted; only the live probe after bootstrap changes this.
+          pollReady: clock.now() >= 1_000,
+        }),
+        { ...clock, timeoutMs: 2_000, intervalMs: 250 },
+      );
+      events.push('control-plane-ready');
+    },
+  });
+  assert.deepEqual(events, [
+    'core-rebootstrap',
+    'core-ready',
+    'tunnel-bootstrap',
+    'local-services-ready',
+    'control-plane-ready',
+  ]);
+  assert.equal(clock.now(), 1_000);
+});
+
+test('stale Tunnel startup readiness cannot satisfy the control-plane gate', async () => {
+  const clock = fakeClock();
+  const staleTunnelStatus = {
+    healthz: 200,
+    readyz: 200,
+    controlPlanePollOk: false,
+  } as const;
+  await assert.rejects(
+    waitForControlPlaneReadiness(
+      async () => ({
+        coreMcpReady: true,
+        tunnelRunning: true,
+        // healthz/readyz alone can remain stale after a startup race. The
+        // release path supplies this only from `health --require-control-plane-poll`.
+        pollReady: staleTunnelStatus.controlPlanePollOk,
+      }),
+      { ...clock, timeoutMs: 1_000, intervalMs: 250 },
+    ),
+    (error) =>
+      error instanceof ReleaseReadinessError &&
+      error.code === 'CONTROL_PLANE_POLL_TIMEOUT',
+  );
+  assert.equal(staleTunnelStatus.readyz, 200);
+  assert.equal(clock.now(), 1_000);
+});
+
+test('prior-service restoration can use the same core-first safe sequence', async () => {
+  const events: string[] = [];
+  const restore = async (name: string) =>
+    activateCoreFirst({
+      rebootstrapCore: async () => {
+        events.push(`${name}:core-rebootstrap`);
+      },
+      waitForCore: async () => {
+        events.push(`${name}:core-ready`);
+      },
+      bootstrapTunnel: async () => {
+        events.push(`${name}:tunnel-bootstrap`);
+      },
+      waitForLocalServices: async () => {
+        events.push(`${name}:local-ready`);
+      },
+      waitForControlPlane: async () => {
+        events.push(`${name}:poll-ready`);
+      },
+    });
+  await restore('activation');
+  await restore('prior');
+  assert.deepEqual(events, [
+    'activation:core-rebootstrap',
+    'activation:core-ready',
+    'activation:tunnel-bootstrap',
+    'activation:local-ready',
+    'activation:poll-ready',
+    'prior:core-rebootstrap',
+    'prior:core-ready',
+    'prior:tunnel-bootstrap',
+    'prior:local-ready',
+    'prior:poll-ready',
+  ]);
 });
 
 test('control-plane readiness may arrive after the old 20s gate but before the 60s bound', async () => {

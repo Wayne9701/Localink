@@ -22,6 +22,8 @@ import {
 } from '@localink/release';
 import {
   ReleaseReadinessError,
+  activateCoreFirst,
+  waitForCoreStartup,
   waitForControlPlaneReadiness,
   waitForLocalStartup,
 } from './release-readiness.js';
@@ -701,6 +703,33 @@ async function waitForManagedLocalStartup(
   );
 }
 
+async function waitForManagedCoreStartup(
+  context: InstallationContext,
+): Promise<void> {
+  const controller = new LocalServiceController(context);
+  await waitForCoreStartup(
+    async () => {
+      const [mcp, core, recovery] = await Promise.all([
+        probeLocalMcp(),
+        controller.status('localink-core'),
+        controller.status('localink-recovery'),
+      ]);
+      return {
+        mcpReady: mcp.readiness === 'ready',
+        ...(mcp.toolCount === undefined ? {} : { toolCount: mcp.toolCount }),
+        coreInstalled: core.installed,
+        coreRunning: core.processRunning,
+        recoveryInstalled: recovery.installed,
+      };
+    },
+    {
+      expectedToolCount: TOOL_NAMES.length,
+      timeoutMs: 20_000,
+      intervalMs: 250,
+    },
+  );
+}
+
 async function waitForManagedControlPlane(
   context: InstallationContext,
 ): Promise<void> {
@@ -733,13 +762,6 @@ async function waitForManagedControlPlane(
   );
 }
 
-async function waitForManagedReadiness(
-  context: InstallationContext,
-): Promise<void> {
-  await waitForManagedLocalStartup(context);
-  await waitForManagedControlPlane(context);
-}
-
 async function activateManagedContext(
   context: InstallationContext,
 ): Promise<void> {
@@ -750,8 +772,17 @@ async function activateManagedContext(
     );
   }
   const controller = new LocalServiceController(context);
-  await controller.rebootstrap(true);
-  await waitForManagedReadiness(context);
+  await activateCoreFirst({
+    rebootstrapCore: async () => {
+      await controller.rebootstrap(false);
+    },
+    waitForCore: async () => waitForManagedCoreStartup(context),
+    bootstrapTunnel: async () => {
+      await controller.bootstrapTunnel();
+    },
+    waitForLocalServices: async () => waitForManagedLocalStartup(context),
+    waitForControlPlane: async () => waitForManagedControlPlane(context),
+  });
 }
 
 function receiptSucceeded(receipt: ReleaseReceipt): boolean {

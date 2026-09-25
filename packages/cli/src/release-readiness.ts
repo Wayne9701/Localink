@@ -26,6 +26,14 @@ export interface LocalStartupSnapshot {
   readonly recoveryInstalled: boolean;
 }
 
+export interface CoreStartupSnapshot {
+  readonly mcpReady: boolean;
+  readonly toolCount?: number;
+  readonly coreInstalled: boolean;
+  readonly coreRunning: boolean;
+  readonly recoveryInstalled: boolean;
+}
+
 export interface ControlPlaneSnapshot {
   readonly coreMcpReady: boolean;
   readonly tunnelRunning: boolean;
@@ -40,6 +48,74 @@ interface WaitClock {
 
 const realSleep = (ms: number): Promise<void> =>
   new Promise((resolve) => setTimeout(resolve, ms));
+
+export async function waitForCoreStartup(
+  probe: () => Promise<CoreStartupSnapshot>,
+  options: WaitClock & {
+    readonly timeoutMs?: number;
+    readonly intervalMs?: number;
+    readonly expectedToolCount: number;
+  },
+): Promise<void> {
+  const now = options.now ?? Date.now;
+  const sleep = options.sleep ?? realSleep;
+  const timeoutMs = options.timeoutMs ?? 20_000;
+  const intervalMs = options.intervalMs ?? 250;
+  const deadline = now() + timeoutMs;
+  let last: CoreStartupSnapshot | undefined;
+
+  while (now() < deadline) {
+    last = await probe();
+    if (
+      last.mcpReady &&
+      last.toolCount === options.expectedToolCount &&
+      last.coreInstalled &&
+      last.coreRunning &&
+      last.recoveryInstalled
+    ) {
+      return;
+    }
+    await sleep(intervalMs);
+  }
+
+  if (
+    last?.coreInstalled === true &&
+    last.coreRunning === true &&
+    (!last.mcpReady || last.toolCount !== options.expectedToolCount)
+  ) {
+    throw new ReleaseReadinessError(
+      'LOCAL_MCP_FAILED',
+      'Local MCP did not become ready before Tunnel startup.',
+    );
+  }
+
+  throw new ReleaseReadinessError(
+    'LOCAL_STARTUP_TIMEOUT',
+    'Core and Recovery did not become ready before Tunnel startup.',
+  );
+}
+
+export interface CoreFirstActivation {
+  readonly rebootstrapCore: () => Promise<void>;
+  readonly waitForCore: () => Promise<void>;
+  readonly bootstrapTunnel: () => Promise<void>;
+  readonly waitForLocalServices: () => Promise<void>;
+  readonly waitForControlPlane: () => Promise<void>;
+}
+
+/**
+ * Prevent Tunnel's startup probes from racing the Core MCP listener. Every
+ * release activation and restoration must use this same fail-closed sequence.
+ */
+export async function activateCoreFirst(
+  activation: CoreFirstActivation,
+): Promise<void> {
+  await activation.rebootstrapCore();
+  await activation.waitForCore();
+  await activation.bootstrapTunnel();
+  await activation.waitForLocalServices();
+  await activation.waitForControlPlane();
+}
 
 export async function waitForLocalStartup(
   probe: () => Promise<LocalStartupSnapshot>,
