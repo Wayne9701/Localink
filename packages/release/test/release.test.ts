@@ -350,6 +350,87 @@ test('failures before and after switch are bounded and restore the prior release
   });
 });
 
+test('failed activation restores the exact prior pointers and invokes the prior-service recovery hook', async () => {
+  await withFixture(async (root) => {
+    const artifactA = await fixtureArtifact(root, 'release-a', 'A');
+    const artifactB = await fixtureArtifact(root, 'release-b', 'B');
+    const installRoot = path.join(root, '.localink');
+    await new ReleaseManager({
+      root: installRoot,
+      allowFixtureRoot: true,
+    }).install(artifactA);
+
+    const events: string[] = [];
+    const manager = new ReleaseManager({
+      root: installRoot,
+      allowFixtureRoot: true,
+      hooks: {
+        activate: async (_releasePath, manifest) => {
+          events.push(`activate:${manifest.releaseId}`);
+          if (manifest.releaseId === 'release-b') {
+            throw Object.assign(new Error('synthetic activation failure'), {
+              code: 'LOCAL_MCP_FAILED',
+            });
+          }
+        },
+        restorePrior: async ({ currentReleaseId, previousReleaseId }) => {
+          events.push(`restore:${currentReleaseId}:${previousReleaseId}`);
+        },
+      },
+    });
+
+    const result = await manager.install(artifactB);
+    assert.equal(result.status, 'failed_rolled_back');
+    assert.equal(result.servicesVerified, true);
+    assert.deepEqual(events, [
+      'activate:release-b',
+      'restore:release-a:undefined',
+    ]);
+    assert.deepEqual(await manager.status(), {
+      current: 'release-a',
+      releases: ['release-a', 'release-b'],
+    });
+  });
+});
+
+test('an activation cannot report success when its lifecycle hook changes current pointer', async () => {
+  await withFixture(async (root) => {
+    const artifactA = await fixtureArtifact(root, 'release-a', 'A');
+    const artifactB = await fixtureArtifact(root, 'release-b', 'B');
+    const installRoot = path.join(root, '.localink');
+    await new ReleaseManager({
+      root: installRoot,
+      allowFixtureRoot: true,
+    }).install(artifactA);
+
+    let restores = 0;
+    const manager = new ReleaseManager({
+      root: installRoot,
+      allowFixtureRoot: true,
+      hooks: {
+        activate: async (_releasePath, manifest) => {
+          if (manifest.releaseId !== 'release-b') return;
+          const current = path.join(installRoot, 'app', 'current');
+          await rm(current);
+          await symlink('releases/release-a', current);
+        },
+        restorePrior: async () => {
+          restores += 1;
+        },
+      },
+    });
+
+    const result = await manager.install(artifactB);
+    assert.equal(result.status, 'failed_rolled_back');
+    assert.equal(result.failureDetailCode, 'RELEASE_POINTER_STATE_MISMATCH');
+    assert.equal(restores, 1);
+    assert.deepEqual(await manager.status(), {
+      current: 'release-a',
+      releases: ['release-a', 'release-b'],
+    });
+  });
+});
+
 test('failed first activation restores the prior live arrangement without a broken launcher', async () => {
   await withFixture(async (root) => {
     const artifact = await fixtureArtifact(root, 'release-a', 'A');
@@ -434,6 +515,29 @@ test('release receipts preserve launchd transition codes on activation and autom
     assert.equal(result.rollbackFailureDetailCode, 'LAUNCHCTL_UNLOAD_TIMEOUT');
     assert.equal(safeStops, 1);
     assert.equal(JSON.stringify(result).includes('synthetic private'), false);
+
+    const unavailableSafeStop = new ReleaseManager({
+      root: path.join(root, 'unavailable-safe-stop', '.localink'),
+      allowFixtureRoot: true,
+      hooks: {
+        activate: async () => {
+          throw Object.assign(new Error('synthetic activation'), {
+            code: 'LAUNCHCTL_BOOTSTRAP_FAILED',
+          });
+        },
+        restorePrior: async () => {
+          throw Object.assign(new Error('synthetic restore'), {
+            code: 'LAUNCHCTL_UNLOAD_TIMEOUT',
+          });
+        },
+      },
+    });
+    const unavailableResult = await unavailableSafeStop.install(artifact);
+    assert.equal(unavailableResult.status, 'failed_safe_stop');
+    assert.equal(
+      unavailableResult.safeStopFailureDetailCode,
+      'SAFE_STOP_UNAVAILABLE',
+    );
   });
 });
 

@@ -38,6 +38,39 @@ test('local startup waits for MCP and managed services without requiring control
   assert.equal(clock.now(), 2_000);
 });
 
+test('a stale persisted status cannot satisfy the live local-startup gate', async () => {
+  const clock = fakeClock();
+  // This represents a formerly-ready service-status.json. The release gate
+  // receives only fresh launchd/MCP observations from its live probe.
+  const stalePersistedStatus = {
+    localMcpReadiness: 'ready',
+    checkedAt: '2020-01-01T00:00:00.000Z',
+  } as const;
+  assert.equal(stalePersistedStatus.localMcpReadiness, 'ready');
+  await assert.rejects(
+    waitForLocalStartup(
+      async () => ({
+        mcpReady: false,
+        coreInstalled: true,
+        coreRunning: true,
+        tunnelInstalled: true,
+        tunnelRunning: true,
+        recoveryInstalled: true,
+      }),
+      {
+        ...clock,
+        expectedToolCount: 27,
+        timeoutMs: 1_000,
+        intervalMs: 250,
+      },
+    ),
+    (error) =>
+      error instanceof ReleaseReadinessError &&
+      error.code === 'LOCAL_MCP_FAILED',
+  );
+  assert.equal(clock.now(), 1_000);
+});
+
 test('control-plane readiness may arrive after the old 20s gate but before the 60s bound', async () => {
   const clock = fakeClock();
   await waitForControlPlaneReadiness(

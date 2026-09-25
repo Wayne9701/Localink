@@ -788,9 +788,15 @@ async function handleRelease(args: readonly string[]): Promise<boolean> {
     hooks: {
       beforeSwitch: verifyPackagedRuntime,
       activate: async () => activateManagedContext(stableContext),
-      restorePrior: async () => {
+      restorePrior: async ({ currentReleaseId }) => {
         try {
-          await activateManagedContext(priorContext);
+          // A prior release pointer means the managed arrangement is the
+          // stable launcher/current prefix, even if an administrator invoked
+          // this command from a checkout. A first install has no pointer, so
+          // it restores the pre-release (typically checkout) arrangement.
+          await activateManagedContext(
+            currentReleaseId === undefined ? priorContext : stableContext,
+          );
         } catch {
           throw new ReleaseReadinessError(
             'ROLLBACK_READINESS_FAILED',
@@ -800,6 +806,17 @@ async function handleRelease(args: readonly string[]): Promise<boolean> {
       },
       safeStop: async () => {
         await stableController.bootout();
+        const statuses = await Promise.all([
+          stableController.status('localink-core'),
+          stableController.status('localink-tunnel'),
+          stableController.status('localink-recovery'),
+        ]);
+        if (statuses.some((status) => status.installed)) {
+          throw new ReleaseReadinessError(
+            'ROLLBACK_READINESS_FAILED',
+            'Localink services did not reach the requested safe-stop state.',
+          );
+        }
       },
     },
   });

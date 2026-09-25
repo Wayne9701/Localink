@@ -22,6 +22,7 @@ import type {
   ReleaseLayout,
   ReleaseManifest,
   ReleaseReceipt,
+  ReleaseRestoreContext,
   ReleaseStatus,
 } from './types.js';
 
@@ -57,6 +58,7 @@ function receipt(
     readonly reasonCode?: string;
     readonly failureDetailCode?: string | undefined;
     readonly rollbackFailureDetailCode?: string | undefined;
+    readonly safeStopFailureDetailCode?: string | undefined;
   },
 ): ReleaseReceipt {
   return {
@@ -81,6 +83,9 @@ function receipt(
     ...(options.rollbackFailureDetailCode === undefined
       ? {}
       : { rollbackFailureDetailCode: options.rollbackFailureDetailCode }),
+    ...(options.safeStopFailureDetailCode === undefined
+      ? {}
+      : { safeStopFailureDetailCode: options.safeStopFailureDetailCode }),
   };
 }
 
@@ -266,6 +271,52 @@ export class ReleaseManager {
     }
   }
 
+  async #assertPointers(
+    layout: ReleaseLayout,
+    expected: Pick<PointerSnapshot, 'current' | 'previous'>,
+  ): Promise<void> {
+    const actual = await this.#snapshot(layout);
+    if (
+      actual.current !== expected.current ||
+      actual.previous !== expected.previous
+    ) {
+      throw new ReleaseError(
+        'RELEASE_POINTER_STATE_MISMATCH',
+        'Release pointers do not match the requested lifecycle state.',
+      );
+    }
+  }
+
+  async #restorePriorServices(
+    layout: ReleaseLayout,
+    snapshot: PointerSnapshot,
+  ): Promise<void> {
+    const context: ReleaseRestoreContext = {
+      ...(snapshot.current === undefined
+        ? {}
+        : { currentReleaseId: snapshot.current }),
+      ...(snapshot.previous === undefined
+        ? {}
+        : { previousReleaseId: snapshot.previous }),
+    };
+    if (this.#hooks.restorePrior !== undefined) {
+      await this.#hooks.restorePrior(context);
+      return;
+    }
+    if (snapshot.current !== undefined)
+      await this.#activate(layout, snapshot.current);
+  }
+
+  async #safeStop(): Promise<string | undefined> {
+    if (this.#hooks.safeStop === undefined) return 'SAFE_STOP_UNAVAILABLE';
+    try {
+      await this.#hooks.safeStop();
+      return undefined;
+    } catch (error) {
+      return errorCode(error) ?? 'SAFE_STOP_FAILED';
+    }
+  }
+
   async #activate(layout: ReleaseLayout, releaseId: string): Promise<void> {
     const releasePath = path.join(layout.releasesRoot, releaseId);
     const manifest = await validateReleaseArtifact(releasePath);
@@ -327,7 +378,19 @@ export class ReleaseManager {
     await atomicPointer(layout.previousPointer, snapshot.current);
     await atomicPointer(layout.currentPointer, releaseId);
     try {
+      await this.#assertPointers(layout, {
+        current: releaseId,
+        ...(snapshot.current === undefined
+          ? {}
+          : { previous: snapshot.current }),
+      });
       await this.#activate(layout, releaseId);
+      await this.#assertPointers(layout, {
+        current: releaseId,
+        ...(snapshot.current === undefined
+          ? {}
+          : { previous: snapshot.current }),
+      });
       return receipt('install', 'activated', releaseId, {
         previousReleaseId: snapshot.current,
         pointerSwitched: true,
@@ -336,9 +399,9 @@ export class ReleaseManager {
     } catch (activationError) {
       try {
         await this.#restorePointers(layout, snapshot);
-        if (snapshot.current !== undefined)
-          await this.#activate(layout, snapshot.current);
-        else await this.#hooks.restorePrior?.();
+        await this.#assertPointers(layout, snapshot);
+        await this.#restorePriorServices(layout, snapshot);
+        await this.#assertPointers(layout, snapshot);
         return receipt('install', 'failed_rolled_back', releaseId, {
           previousReleaseId: snapshot.current,
           pointerSwitched: true,
@@ -347,7 +410,7 @@ export class ReleaseManager {
           failureDetailCode: errorCode(activationError),
         });
       } catch (rollbackError) {
-        await this.#hooks.safeStop?.().catch(() => undefined);
+        const safeStopFailureDetailCode = await this.#safeStop();
         return receipt('install', 'failed_safe_stop', releaseId, {
           previousReleaseId: snapshot.current,
           pointerSwitched: true,
@@ -355,6 +418,7 @@ export class ReleaseManager {
           reasonCode: 'ACTIVATION_AND_ROLLBACK_FAILED',
           failureDetailCode: errorCode(activationError),
           rollbackFailureDetailCode: errorCode(rollbackError),
+          safeStopFailureDetailCode,
         });
       }
     }
@@ -384,7 +448,15 @@ export class ReleaseManager {
     await atomicPointer(layout.previousPointer, snapshot.current);
     await atomicPointer(layout.currentPointer, snapshot.previous);
     try {
+      await this.#assertPointers(layout, {
+        current: snapshot.previous,
+        previous: snapshot.current,
+      });
       await this.#activate(layout, snapshot.previous);
+      await this.#assertPointers(layout, {
+        current: snapshot.previous,
+        previous: snapshot.current,
+      });
       return receipt('rollback', 'rolled_back', snapshot.previous, {
         previousReleaseId: snapshot.current,
         pointerSwitched: true,
@@ -393,7 +465,9 @@ export class ReleaseManager {
     } catch (activationError) {
       try {
         await this.#restorePointers(layout, snapshot);
-        await this.#activate(layout, snapshot.current);
+        await this.#assertPointers(layout, snapshot);
+        await this.#restorePriorServices(layout, snapshot);
+        await this.#assertPointers(layout, snapshot);
         return receipt('rollback', 'failed_rolled_back', snapshot.previous, {
           previousReleaseId: snapshot.current,
           pointerSwitched: true,
@@ -402,7 +476,7 @@ export class ReleaseManager {
           failureDetailCode: errorCode(activationError),
         });
       } catch (restoreError) {
-        await this.#hooks.safeStop?.().catch(() => undefined);
+        const safeStopFailureDetailCode = await this.#safeStop();
         return receipt('rollback', 'failed_safe_stop', snapshot.previous, {
           previousReleaseId: snapshot.current,
           pointerSwitched: true,
@@ -410,6 +484,7 @@ export class ReleaseManager {
           reasonCode: 'ROLLBACK_AND_RESTORE_FAILED',
           failureDetailCode: errorCode(activationError),
           rollbackFailureDetailCode: errorCode(restoreError),
+          safeStopFailureDetailCode,
         });
       }
     }

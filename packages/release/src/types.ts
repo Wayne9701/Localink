@@ -69,6 +69,13 @@ export interface ReleaseReceipt {
   readonly reasonCode?: string;
   readonly failureDetailCode?: string;
   readonly rollbackFailureDetailCode?: string;
+  readonly safeStopFailureDetailCode?: string;
+}
+
+export interface ReleaseRestoreContext {
+  /** The exact pointers that must be in effect while prior services recover. */
+  readonly currentReleaseId?: string;
+  readonly previousReleaseId?: string;
 }
 
 export interface ReleaseActivationHooks {
@@ -80,6 +87,12 @@ export interface ReleaseActivationHooks {
     releasePath: string,
     manifest: ReleaseManifest,
   ) => Promise<void>;
-  readonly restorePrior?: () => Promise<void>;
+  /**
+   * Re-establish the service arrangement that existed before the attempted
+   * transition. This is deliberately separate from activating a release: a
+   * caller may need a different installation context for a pre-release
+   * arrangement.
+   */
+  readonly restorePrior?: (context: ReleaseRestoreContext) => Promise<void>;
   readonly safeStop?: () => Promise<void>;
 }
