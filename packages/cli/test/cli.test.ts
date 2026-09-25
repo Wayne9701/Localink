@@ -190,6 +190,36 @@ test('CLI persists local-only Skill source and external MCP provider configurati
       await runCli(stateRoot, ['mcp-provider', 'list', '--json']),
       { providers: [provider] },
     );
+    const richProvider = await runCli(stateRoot, [
+      'mcp-provider',
+      'rich-content',
+      'set',
+      'fixture',
+      '5000000',
+      '--json',
+    ]);
+    assert.deepEqual(richProvider.richContent, {
+      images: {
+        enabled: true,
+        maxDecodedBytes: 5_000_000,
+        maxBlocks: 1,
+        mimeTypes: ['image/png', 'image/jpeg'],
+      },
+    });
+    assert.deepEqual(
+      await runCli(stateRoot, ['mcp-provider', 'list', '--json']),
+      { providers: [richProvider] },
+    );
+    assert.deepEqual(
+      await runCli(stateRoot, [
+        'mcp-provider',
+        'rich-content',
+        'remove',
+        'fixture',
+        '--json',
+      ]),
+      provider,
+    );
     const overridden = await runCli(stateRoot, [
       'mcp-provider',
       'risk',

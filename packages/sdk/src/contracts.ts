@@ -174,6 +174,13 @@ export interface VerificationReceipt {
 export interface CapabilityHandlerResult {
   readonly output: unknown;
   readonly verification?: VerificationReceipt;
+  readonly richContent?: readonly RichImageBlock[];
+}
+
+export interface RichImageBlock {
+  readonly type: 'image';
+  readonly data: string;
+  readonly mimeType: 'image/png' | 'image/jpeg';
 }
 
 export type CapabilityHandler = (
@@ -197,6 +204,7 @@ export interface CapabilityInvokeReceipt {
   };
   readonly output?: unknown;
   readonly verification?: VerificationReceipt;
+  readonly richContent?: readonly RichImageBlock[];
 }
 
 export interface SecretValueHandle {

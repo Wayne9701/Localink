@@ -35,6 +35,7 @@ import {
   removeExternalMcpProvider,
   removeExternalMcpToolRiskOverride,
   setExternalMcpToolRiskOverride,
+  setExternalMcpRichImagePolicy,
   validateExternalMcpConfig,
   validExternalMcpProviders,
   type ExternalMcpConfig,
@@ -397,6 +398,19 @@ export class LocalinkRuntime {
   ): Promise<ExternalMcpProvider> {
     return this.#mutate(() =>
       removeExternalMcpToolRiskOverride(this.#externalMcpStore, id, toolName),
+    );
+  }
+
+  async setExternalMcpRichImagePolicy(
+    id: string,
+    maxDecodedBytes: number | undefined,
+  ): Promise<ExternalMcpProvider> {
+    return this.#mutate(() =>
+      setExternalMcpRichImagePolicy(
+        this.#externalMcpStore,
+        id,
+        maxDecodedBytes,
+      ),
     );
   }
 

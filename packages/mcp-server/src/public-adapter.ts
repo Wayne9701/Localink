@@ -1,6 +1,7 @@
 import type {
   CapabilityDescriptor,
   CapabilityInvokeContext,
+  CapabilityInvokeReceipt,
 } from '@localink/sdk';
 import { LocalinkError } from '@localink/sdk';
 import type { CallToolResult } from '@modelcontextprotocol/server';
@@ -9,6 +10,7 @@ import {
   assertResultLimit,
   RESULT_LIMITS,
 } from './bounded-result.js';
+import { boundedRichResult } from './bounded-rich-result.js';
 import { invalidInput, publicError } from './errors.js';
 import type { PublicRuntime } from './runtime.js';
 import {
@@ -129,6 +131,23 @@ export class PublicAdapter {
         throw new LocalinkError('SIZE_LIMIT_EXCEEDED', 'Input too large.');
       }
       const result = await this.dispatch(name as ToolName, args ?? {});
+      if (
+        name === 'localink.capability_invoke' &&
+        typeof result === 'object' &&
+        result !== null &&
+        'richContent' in result
+      ) {
+        const receipt = result as CapabilityInvokeReceipt;
+        if (
+          this.runtime.capabilities.describe(receipt.capabilityId).riskTier !==
+          0
+        )
+          throw new LocalinkError(
+            'CONTRACT_INVALID',
+            'Rich result requires Tier 0.',
+          );
+        return boundedRichResult(receipt, this.resultLimit);
+      }
       return boundedResult(result, false, this.resultLimit);
     } catch (error) {
       return boundedResult(

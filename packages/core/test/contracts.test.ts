@@ -153,6 +153,72 @@ test('capability search, describe, availability, and Tier 0 invoke are determini
   assert.equal(receipt.policy.action, 'allow');
 });
 
+test('rich receipt is confined to executed Tier 0 and never enters confirmation', async () => {
+  const capabilities = new CapabilityRegistry();
+  const richContent = [
+    {
+      type: 'image' as const,
+      mimeType: 'image/png' as const,
+      data: Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]).toString('base64'),
+    },
+  ];
+  capabilities.register(
+    capabilityDescriptor('fixture.rich-read'),
+    async () => ({
+      output: { ok: true },
+      richContent,
+    }),
+  );
+  const read = await capabilities.invoke(
+    'fixture.rich-read',
+    {},
+    { policyProfile: 'balanced' },
+  );
+  assert.equal(read.status, 'executed');
+  assert.deepEqual(read.richContent, richContent);
+  capabilities.register(
+    capabilityDescriptor('fixture.rich-write', {
+      operationClass: 'write',
+      riskTier: 1,
+      postVerify: 'none',
+    }),
+    async () => ({ output: {}, richContent }),
+  );
+  await assert.rejects(
+    capabilities.invoke(
+      'fixture.rich-write',
+      {},
+      { policyProfile: 'balanced' },
+    ),
+    hasCode('CONTRACT_INVALID'),
+  );
+  capabilities.register(
+    capabilityDescriptor('fixture.rich-confirm', {
+      operationClass: 'write',
+      riskTier: 2,
+      reversible: false,
+    }),
+    async () => ({ output: {}, richContent }),
+  );
+  const pending = await capabilities.invoke(
+    'fixture.rich-confirm',
+    {},
+    { policyProfile: 'balanced' },
+  );
+  assert.equal(pending.status, 'confirmation_required');
+  assert.equal(pending.richContent, undefined);
+  assert.ok(pending.confirmation);
+  await assert.rejects(
+    capabilities.invokeConfirmed(
+      pending.confirmation.ticket,
+      'fixture.rich-confirm',
+      {},
+      { policyProfile: 'balanced' },
+    ),
+    hasCode('CONTRACT_INVALID'),
+  );
+});
+
 test('balanced Tier 1 executes only with the required verified receipt', async () => {
   const capabilities = new CapabilityRegistry();
   capabilities.register(

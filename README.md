@@ -42,3 +42,5 @@ localink mcp-provider risk remove <provider-id> <exact-tool-name> --json
 ```
 
 Overrides are exact names only—no glob or regex—and cannot select Tier 3. Existing schema-v1 provider entries without `toolRiskOverrides` remain valid.
+
+Bounded image passthrough for an explicitly opted External MCP provider is documented in [the rich image bridge contract](docs/RICH_IMAGE_BRIDGE_3B2.md). It does not register or activate a provider.

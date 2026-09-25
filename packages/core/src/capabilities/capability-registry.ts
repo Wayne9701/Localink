@@ -362,6 +362,15 @@ export class CapabilityRegistry {
         { capabilityId },
       );
     }
+    if (
+      result.richContent !== undefined &&
+      (entry.descriptor.riskTier !== 0 || decision.tier !== 0)
+    ) {
+      throw new LocalinkError(
+        'CONTRACT_INVALID',
+        'Rich content is restricted to successful Tier 0 invocations.',
+      );
+    }
     return {
       capabilityId,
       status: 'executed',
@@ -370,6 +379,9 @@ export class CapabilityRegistry {
       ...(result.verification === undefined
         ? {}
         : { verification: result.verification }),
+      ...(result.richContent === undefined
+        ? {}
+        : { richContent: result.richContent }),
     };
   }
 

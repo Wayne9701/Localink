@@ -4,6 +4,7 @@ import test from 'node:test';
 import { fileURLToPath } from 'node:url';
 import { LocalinkError } from '@localink/sdk';
 import { SecretValue } from '@localink/core';
+import { CapabilityRegistry } from '@localink/core';
 import { boundedResult, RESULT_LIMITS } from '../src/bounded-result.js';
 import {
   createFixtureRuntime,
@@ -11,6 +12,62 @@ import {
 } from '../src/fixture-runtime.js';
 import { PublicAdapter } from '../src/public-adapter.js';
 import { at, envelope } from './helpers.js';
+
+test('public adapter revalidates rich images and rejects repeated payload metadata', async () => {
+  const fixture = await createFixtureRuntime();
+  const capabilities = new CapabilityRegistry();
+  const data = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]).toString(
+    'base64',
+  );
+  const descriptor = fixture.capabilities.describe('fixture.read');
+  capabilities.register(
+    { ...descriptor, id: 'fixture.rich-valid' },
+    async () => ({
+      output: { rootId: 'fixture' },
+      richContent: [{ type: 'image', mimeType: 'image/png', data }],
+    }),
+  );
+  capabilities.register(
+    { ...descriptor, id: 'fixture.rich-duplicate' },
+    async () => ({
+      output: { data },
+      richContent: [{ type: 'image', mimeType: 'image/png', data }],
+    }),
+  );
+  capabilities.register(
+    { ...descriptor, id: 'fixture.rich-invalid' },
+    async () => ({
+      output: {},
+      richContent: [{ type: 'image', mimeType: 'image/png', data: 'bad***' }],
+    }),
+  );
+  const adapter = new PublicAdapter({
+    ...fixture,
+    capabilities,
+    validateInput: () => undefined,
+  });
+  const valid = await adapter.call('localink.capability_invoke', {
+    capabilityId: 'fixture.rich-valid',
+    input: {},
+  });
+  assert.equal(valid.isError, false);
+  assert.equal(valid.content[1]?.type, 'image');
+  assert.equal(JSON.stringify(valid.structuredContent).includes(data), false);
+  for (const capabilityId of [
+    'fixture.rich-duplicate',
+    'fixture.rich-invalid',
+  ]) {
+    const result = await adapter.call('localink.capability_invoke', {
+      capabilityId,
+      input: {},
+    });
+    assert.equal(result.isError, true);
+    assert.equal(
+      result.content.some((item) => item.type === 'image'),
+      false,
+    );
+  }
+});
 
 test('bounding: override limits, valid JSON, unicode, array prefixes, truthful byte metadata', () => {
   const rows = Array.from({ length: 1000 }, (_, index) => ({

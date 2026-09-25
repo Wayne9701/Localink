@@ -5,7 +5,11 @@ import type { CapabilityRegistry } from '@localink/core';
 import {
   CONTRACT_VERSION_V1,
   LocalinkError,
+  RICH_IMAGE_HARD_MAX_BYTES,
+  RICH_IMAGE_MIME_TYPES,
+  validateRichImageBlock,
   type CapabilityDescriptor,
+  type RichImageBlock,
 } from '@localink/sdk';
 import {
   Client,
@@ -30,6 +34,9 @@ export const EXTERNAL_MCP_LIMITS = {
   connectTimeoutMs: 5_000,
   callTimeoutMs: 30_000,
   transportBufferBytes: 1024 * 1024,
+  richMetadataBytes: 64 * 1024,
+  richTransportHeadroomBytes: 256 * 1024,
+  richTransportHardMaxBytes: 8 * 1024 * 1024,
 } as const;
 
 const SAFE_ID = /^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*$/u;
@@ -43,12 +50,22 @@ export type ExternalMcpToolRiskOverrides = Readonly<
   Record<string, ExternalMcpRiskTier>
 >;
 
+export interface ExternalMcpRichContentPolicy {
+  readonly images: {
+    readonly enabled: boolean;
+    readonly maxDecodedBytes?: number;
+    readonly maxBlocks?: 1;
+    readonly mimeTypes?: readonly ('image/png' | 'image/jpeg')[];
+  };
+}
+
 export interface LoopbackHttpProvider {
   readonly id: string;
   readonly transport: 'loopback-http';
   readonly url: string;
   readonly enabled: boolean;
   readonly toolRiskOverrides?: ExternalMcpToolRiskOverrides;
+  readonly richContent?: ExternalMcpRichContentPolicy;
 }
 
 export interface StdioProvider {
@@ -58,6 +75,7 @@ export interface StdioProvider {
   readonly args: readonly string[];
   readonly enabled: boolean;
   readonly toolRiskOverrides?: ExternalMcpToolRiskOverrides;
+  readonly richContent?: ExternalMcpRichContentPolicy;
 }
 
 export type ExternalMcpProvider = LoopbackHttpProvider | StdioProvider;
@@ -222,6 +240,141 @@ function parseToolRiskOverrides(
   return Object.fromEntries(entries) as Record<string, ExternalMcpRiskTier>;
 }
 
+function parseRichContent(
+  value: unknown,
+): ExternalMcpRichContentPolicy | undefined {
+  if (value === undefined) return undefined;
+  if (
+    !isRecord(value) ||
+    !strictKeys(value, ['images']) ||
+    !isRecord(value.images)
+  )
+    throw new LocalinkError(
+      'CONFIG_INVALID',
+      'Rich content policy is invalid.',
+    );
+  const images = value.images;
+  if (images.enabled === false && strictKeys(images, ['enabled']))
+    return { images: { enabled: false } };
+  if (
+    images.enabled !== true ||
+    !strictKeys(images, [
+      'enabled',
+      'maxDecodedBytes',
+      'maxBlocks',
+      'mimeTypes',
+    ]) ||
+    !Number.isSafeInteger(images.maxDecodedBytes) ||
+    (images.maxDecodedBytes as number) < 1 ||
+    (images.maxDecodedBytes as number) > RICH_IMAGE_HARD_MAX_BYTES ||
+    images.maxBlocks !== 1 ||
+    !Array.isArray(images.mimeTypes) ||
+    images.mimeTypes.length < 1 ||
+    images.mimeTypes.length > 2 ||
+    new Set(images.mimeTypes).size !== images.mimeTypes.length ||
+    images.mimeTypes.some((mime) => !RICH_IMAGE_MIME_TYPES.includes(mime))
+  ) {
+    throw new LocalinkError(
+      'CONFIG_INVALID',
+      'Rich image policy exceeds bounds.',
+    );
+  }
+  return {
+    images: {
+      enabled: true,
+      maxDecodedBytes: images.maxDecodedBytes as number,
+      maxBlocks: 1,
+      mimeTypes: images.mimeTypes as ('image/png' | 'image/jpeg')[],
+    },
+  };
+}
+
+export function externalMcpTransportBufferBytes(
+  provider: ExternalMcpProvider,
+): number {
+  const images = provider.richContent?.images;
+  if (provider.transport !== 'stdio' || images?.enabled !== true)
+    return EXTERNAL_MCP_LIMITS.transportBufferBytes;
+  const size = images.maxDecodedBytes;
+  if (
+    !Number.isSafeInteger(size) ||
+    size === undefined ||
+    size < 1 ||
+    size > RICH_IMAGE_HARD_MAX_BYTES
+  )
+    throw new LocalinkError('CONFIG_INVALID', 'Rich image size is invalid.');
+  return Math.min(
+    EXTERNAL_MCP_LIMITS.richTransportHardMaxBytes,
+    Math.max(
+      EXTERNAL_MCP_LIMITS.transportBufferBytes,
+      Math.ceil(size / 3) * 4 + EXTERNAL_MCP_LIMITS.richTransportHeadroomBytes,
+    ),
+  );
+}
+
+function normalizeRichResult(
+  output: unknown,
+  provider: ExternalMcpProvider,
+  eligible: boolean,
+): { output: unknown; richContent?: readonly RichImageBlock[] } {
+  if (!isRecord(output) || !Array.isArray(output.content)) return { output };
+  if (
+    provider.richContent?.images.enabled === true &&
+    output.content.some(
+      (block: unknown) =>
+        !isRecord(block) || !['text', 'image'].includes(String(block.type)),
+    )
+  ) {
+    throw new LocalinkError(
+      'CONTRACT_INVALID',
+      'Unsupported rich content block.',
+    );
+  }
+  const images = output.content.filter(
+    (block: unknown) => isRecord(block) && block.type === 'image',
+  );
+  if (images.length === 0) return { output };
+  if (!eligible || output.isError === true || images.length !== 1) {
+    throw new LocalinkError(
+      'CONTRACT_INVALID',
+      'Rich image result is not eligible.',
+    );
+  }
+  const policy = provider.richContent?.images;
+  if (
+    policy?.enabled !== true ||
+    policy.maxDecodedBytes === undefined ||
+    policy.mimeTypes === undefined
+  )
+    throw new LocalinkError(
+      'CONTRACT_INVALID',
+      'Rich image policy is unavailable.',
+    );
+  const image = validateRichImageBlock(
+    images[0],
+    policy.maxDecodedBytes,
+    policy.mimeTypes,
+  );
+  const metadata = {
+    ...output,
+    content: output.content.filter(
+      (block: unknown) => isRecord(block) && block.type === 'text',
+    ),
+  };
+  const serialized = JSON.stringify(metadata);
+  if (
+    serialized === undefined ||
+    Buffer.byteLength(serialized) > EXTERNAL_MCP_LIMITS.richMetadataBytes ||
+    serialized.includes(image.data)
+  ) {
+    throw new LocalinkError(
+      'SIZE_LIMIT_EXCEEDED',
+      'Rich image metadata exceeds boundary.',
+    );
+  }
+  return { output: JSON.parse(serialized) as unknown, richContent: [image] };
+}
+
 export function parseExternalMcpProvider(value: unknown): ExternalMcpProvider {
   if (
     !isRecord(value) ||
@@ -235,6 +388,7 @@ export function parseExternalMcpProvider(value: unknown): ExternalMcpProvider {
     );
   }
   const toolRiskOverrides = parseToolRiskOverrides(value.toolRiskOverrides);
+  const richContent = parseRichContent(value.richContent);
   if (value.transport === 'loopback-http') {
     if (
       !strictKeys(value, [
@@ -243,6 +397,7 @@ export function parseExternalMcpProvider(value: unknown): ExternalMcpProvider {
         'url',
         'enabled',
         'toolRiskOverrides',
+        'richContent',
       ])
     )
       throw new LocalinkError(
@@ -255,6 +410,7 @@ export function parseExternalMcpProvider(value: unknown): ExternalMcpProvider {
       url: parseLoopbackUrl(value.url),
       enabled: value.enabled,
       ...(toolRiskOverrides === undefined ? {} : { toolRiskOverrides }),
+      ...(richContent === undefined ? {} : { richContent }),
     };
   }
   if (value.transport === 'stdio') {
@@ -266,6 +422,7 @@ export function parseExternalMcpProvider(value: unknown): ExternalMcpProvider {
         'args',
         'enabled',
         'toolRiskOverrides',
+        'richContent',
       ]) ||
       typeof value.command !== 'string' ||
       !path.isAbsolute(value.command) ||
@@ -283,6 +440,7 @@ export function parseExternalMcpProvider(value: unknown): ExternalMcpProvider {
       args: parseArgs(value.args),
       enabled: value.enabled,
       ...(toolRiskOverrides === undefined ? {} : { toolRiskOverrides }),
+      ...(richContent === undefined ? {} : { richContent }),
     };
   }
   throw new LocalinkError(
@@ -530,7 +688,7 @@ export class ExternalMcpManager {
               args: [...provider.args],
               env: providerEnvironment(this.#environment),
               stderr: 'pipe',
-              maxBufferSize: EXTERNAL_MCP_LIMITS.transportBufferBytes,
+              maxBufferSize: externalMcpTransportBufferBytes(provider),
             });
       const client = new Client(
         {
@@ -601,6 +759,12 @@ export class ExternalMcpManager {
               : 'local exact-name override',
           );
           const fixedToolName = tool.name;
+          const richEligible =
+            riskTier === 0 &&
+            provider.richContent?.images.enabled === true &&
+            tool.annotations?.readOnlyHint === true &&
+            tool.annotations?.destructiveHint !== true &&
+            tool.annotations?.openWorldHint !== true;
           this.#registry.register(descriptor, async (input) => {
             try {
               if (!providerCallAvailable) throw new Error('provider-degraded');
@@ -615,7 +779,7 @@ export class ExternalMcpManager {
                 EXTERNAL_MCP_LIMITS.callTimeoutMs,
                 'provider-call-timeout',
               );
-              return { output };
+              return normalizeRichResult(output, provider, richEligible);
             } catch (error) {
               providerCallAvailable = false;
               status.state = 'degraded';
@@ -771,6 +935,37 @@ export async function removeExternalMcpToolRiskOverride(
   const overrides = { ...(provider.toolRiskOverrides ?? {}) };
   delete overrides[toolName];
   const updated = providerWithOverrides(provider, overrides);
+  await store.write({
+    version: EXTERNAL_MCP_SCHEMA_VERSION,
+    providers: providers.map((item) => (item.id === id ? updated : item)),
+  });
+  return updated;
+}
+
+export async function setExternalMcpRichImagePolicy(
+  store: ExternalMcpStoreLike,
+  id: string,
+  maxDecodedBytes: number | undefined,
+): Promise<ExternalMcpProvider> {
+  const { providers, provider } = await configuredProvider(store, id);
+  const { richContent: _previous, ...base } = provider;
+  void _previous;
+  const candidate = {
+    ...base,
+    ...(maxDecodedBytes === undefined
+      ? {}
+      : {
+          richContent: {
+            images: {
+              enabled: true,
+              maxDecodedBytes,
+              maxBlocks: 1,
+              mimeTypes: [...RICH_IMAGE_MIME_TYPES],
+            },
+          },
+        }),
+  };
+  const updated = parseExternalMcpProvider(candidate);
   await store.write({
     version: EXTERNAL_MCP_SCHEMA_VERSION,
     providers: providers.map((item) => (item.id === id ? updated : item)),
