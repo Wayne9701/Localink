@@ -291,7 +291,7 @@ test(
       }
       assert.ok(client !== undefined, stderr);
       const tools = await client.listTools();
-      assert.equal(tools.tools.length, 27);
+      assert.equal(tools.tools.length, 31);
       const health = await client.callTool({
         name: 'localink.health_status',
         arguments: {},

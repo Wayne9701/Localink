@@ -7,6 +7,7 @@ export const PUBLIC_FILE_LIMITS = {
   readManyPaths: 20,
   inspectManyPaths: 50,
   searchMatches: 50,
+  batchTransferItems: 20,
 } as const;
 export const PUBLIC_PROCESS_LIMITS = {
   args: 128,
@@ -43,6 +44,13 @@ const relativePath = z
   .string()
   .max(4096)
   .refine((value) => !value.includes('\0'));
+const transferItem = z.strictObject({
+  operation: z.enum(['copy', 'move']),
+  sourceWorkspaceId: workspaceId,
+  sourceRelativePath: relativePath,
+  destinationWorkspaceId: workspaceId,
+  destinationRelativePath: relativePath,
+});
 const gitPath = relativePath.refine(
   (value) =>
     value.length > 0 &&
@@ -164,6 +172,25 @@ export const toolSchemas = {
     relativePath,
     text: z.string().max(PUBLIC_FILE_LIMITS.hardReadBytes),
   }),
+  'localink.files_mkdir': z.strictObject({ workspaceId, relativePath }),
+  'localink.files_copy': z.strictObject({
+    sourceWorkspaceId: workspaceId,
+    sourceRelativePath: relativePath,
+    destinationWorkspaceId: workspaceId.optional(),
+    destinationRelativePath: relativePath,
+  }),
+  'localink.files_replace_text': z.strictObject({
+    workspaceId,
+    relativePath,
+    text: z.string().max(2 * 1024 * 1024),
+    expectedSha256: z.string().regex(/^[a-f0-9]{64}$/u),
+  }),
+  'localink.files_batch_transfer': z.strictObject({
+    items: z
+      .array(transferItem)
+      .min(1)
+      .max(PUBLIC_FILE_LIMITS.batchTransferItems),
+  }),
   'localink.files_precise_edit': z.strictObject({
     workspaceId,
     relativePath,
@@ -178,6 +205,7 @@ export const toolSchemas = {
   'localink.files_move': z.strictObject({
     workspaceId,
     sourceRelativePath: relativePath,
+    destinationWorkspaceId: workspaceId.optional(),
     destinationRelativePath: relativePath,
   }),
   'localink.files_archive': z.strictObject({ workspaceId, relativePath }),
@@ -289,9 +317,18 @@ export const toolDescriptions: Record<ToolName, string> = {
     'Search workspace-relative paths or text content with bounded matches.',
   'localink.files_create_text':
     'Create a new text file without overwriting an existing path.',
+  'localink.files_mkdir':
+    'Create one directory inside a registered workspace; parent must exist.',
+  'localink.files_copy':
+    'Copy one file between registered workspaces without overwrite and verify SHA-256.',
+  'localink.files_replace_text':
+    'Atomically replace one UTF-8 file only when its SHA-256 matches expectedSha256.',
+  'localink.files_batch_transfer':
+    'Preflight and transfer up to 20 files between registered workspaces; report partial completion.',
   'localink.files_precise_edit':
     'Edit exact expected text with occurrence and optional hash preconditions.',
-  'localink.files_move': 'Move one file within a workspace without overwrite.',
+  'localink.files_move':
+    'Move one file between registered workspaces without overwrite.',
   'localink.files_archive':
     'Archive one file into Localink managed recovery storage.',
   'localink.process_exec':
@@ -341,6 +378,7 @@ const PROCESS = new Set<ToolName>([
 const CONSERVATIVE_DESTRUCTIVE = new Set<ToolName>([
   'localink.capability_confirm',
   'localink.files_move',
+  'localink.files_batch_transfer',
   'localink.files_archive',
   'localink.process_exec',
   'localink.process_start',

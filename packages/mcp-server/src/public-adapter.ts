@@ -122,7 +122,9 @@ export class PublicAdapter {
       const inputLimit =
         name === 'localink.git_apply_patch'
           ? PUBLIC_GIT_LIMITS.patchBytes + 4096
-          : INPUT_LIMIT_BYTES;
+          : name === 'localink.files_replace_text'
+            ? 2 * 1024 * 1024 + 8192
+            : INPUT_LIMIT_BYTES;
       if (Buffer.byteLength(JSON.stringify(args) ?? '') > inputLimit) {
         throw new LocalinkError('SIZE_LIMIT_EXCEEDED', 'Input too large.');
       }
@@ -309,6 +311,48 @@ export class PublicAdapter {
           result.data.text,
         );
       }
+      case 'localink.files_mkdir': {
+        const result = toolSchemas[name].safeParse(args);
+        if (!result.success) invalidInput();
+        return nativeRuntime(this.runtime).files.mkdir(
+          result.data.workspaceId,
+          result.data.relativePath,
+        );
+      }
+      case 'localink.files_copy': {
+        const result = toolSchemas[name].safeParse(args);
+        if (!result.success) invalidInput();
+        const {
+          sourceWorkspaceId,
+          sourceRelativePath,
+          destinationWorkspaceId,
+          destinationRelativePath,
+        } = result.data;
+        return nativeRuntime(this.runtime).files.transfer({
+          operation: 'copy',
+          sourceWorkspaceId,
+          sourceRelativePath,
+          destinationWorkspaceId: destinationWorkspaceId ?? sourceWorkspaceId,
+          destinationRelativePath,
+        });
+      }
+      case 'localink.files_replace_text': {
+        const result = toolSchemas[name].safeParse(args);
+        if (!result.success) invalidInput();
+        return nativeRuntime(this.runtime).files.replaceTextAtomic(
+          result.data.workspaceId,
+          result.data.relativePath,
+          result.data.text,
+          result.data.expectedSha256,
+        );
+      }
+      case 'localink.files_batch_transfer': {
+        const result = toolSchemas[name].safeParse(args);
+        if (!result.success) invalidInput();
+        return nativeRuntime(this.runtime).files.batchTransfer(
+          result.data.items,
+        );
+      }
       case 'localink.files_precise_edit': {
         const result = toolSchemas[name].safeParse(args);
         if (!result.success) invalidInput();
@@ -328,11 +372,14 @@ export class PublicAdapter {
       case 'localink.files_move': {
         const result = toolSchemas[name].safeParse(args);
         if (!result.success) invalidInput();
-        return nativeRuntime(this.runtime).files.move(
-          result.data.workspaceId,
-          result.data.sourceRelativePath,
-          result.data.destinationRelativePath,
-        );
+        return nativeRuntime(this.runtime).files.transfer({
+          operation: 'move',
+          sourceWorkspaceId: result.data.workspaceId,
+          sourceRelativePath: result.data.sourceRelativePath,
+          destinationWorkspaceId:
+            result.data.destinationWorkspaceId ?? result.data.workspaceId,
+          destinationRelativePath: result.data.destinationRelativePath,
+        });
       }
       case 'localink.files_archive': {
         const result = toolSchemas[name].safeParse(args);

@@ -1,6 +1,13 @@
 import assert from 'node:assert/strict';
 import { execFile } from 'node:child_process';
-import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import {
+  access,
+  mkdir,
+  mkdtemp,
+  readFile,
+  rm,
+  writeFile,
+} from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
@@ -79,12 +86,36 @@ async function invoke(
   return envelope(await adapter.call(`localink.${name}`, args));
 }
 
-test('tool registry is exact 27 with centralized conservative annotations and no public env', () => {
-  assert.equal(TOOL_NAMES.length, 27);
-  assert.equal(new Set(TOOL_NAMES).size, 27);
+test('tool registry is exact 31 with centralized conservative annotations and no public env', () => {
+  assert.equal(TOOL_NAMES.length, 31);
+  assert.equal(new Set(TOOL_NAMES).size, 31);
   assert.equal(toolAnnotations['localink.files_read_many'].readOnlyHint, true);
   assert.equal(toolAnnotations['localink.files_archive'].destructiveHint, true);
   assert.equal(toolAnnotations['localink.files_archive'].openWorldHint, false);
+  for (const name of [
+    'files_mkdir',
+    'files_copy',
+    'files_replace_text',
+  ] as const) {
+    assert.deepEqual(toolAnnotations[`localink.${name}`], {
+      readOnlyHint: false,
+      openWorldHint: false,
+      destructiveHint: false,
+    });
+  }
+  assert.deepEqual(toolAnnotations['localink.files_batch_transfer'], {
+    readOnlyHint: false,
+    openWorldHint: false,
+    destructiveHint: true,
+  });
+  assert.equal(
+    toolSchemas['localink.files_replace_text'].safeParse({
+      workspaceId: 'x',
+      relativePath: 'x',
+      text: 'x',
+    }).success,
+    false,
+  );
   assert.equal(toolAnnotations['localink.process_exec'].openWorldHint, true);
   assert.equal(toolAnnotations['localink.process_poll'].readOnlyHint, true);
   assert.deepEqual(toolAnnotations['localink.capability_confirm'], {
@@ -101,6 +132,111 @@ test('tool registry is exact 27 with centralized conservative annotations and no
     false,
   );
   assert.equal(createPublicServer.length >= 1, true);
+});
+
+test('new public Files tools dispatch safely across registered workspaces', async () => {
+  await withNative(
+    async ({ adapter, runtime, root, workspaceId, workspaceRoot }) => {
+      const secondRoot = path.join(root, 'second');
+      await mkdir(secondRoot);
+      const second = await runtime.addWorkspace('second', secondRoot);
+      const made = await invoke(adapter, 'files_mkdir', {
+        workspaceId,
+        relativePath: 'folder',
+      });
+      assert.equal(at(made, 'data', 'created'), true);
+      const created = await invoke(adapter, 'files_create_text', {
+        workspaceId,
+        relativePath: 'folder/source.txt',
+        text: 'before',
+      });
+      const replaced = await invoke(adapter, 'files_replace_text', {
+        workspaceId,
+        relativePath: 'folder/source.txt',
+        text: 'after',
+        expectedSha256: at(created, 'data', 'sha256'),
+      });
+      assert.equal(
+        at(replaced, 'data', 'previousSha256'),
+        at(created, 'data', 'sha256'),
+      );
+      assert.equal(
+        at(
+          await invoke(adapter, 'files_replace_text', {
+            workspaceId,
+            relativePath: 'folder/source.txt',
+            text: 'bad',
+          }),
+          'data',
+          'error',
+          'code',
+        ),
+        'INVALID_ARGUMENT',
+      );
+      const copied = await invoke(adapter, 'files_copy', {
+        sourceWorkspaceId: workspaceId,
+        sourceRelativePath: 'folder/source.txt',
+        destinationWorkspaceId: second.id,
+        destinationRelativePath: 'copied.txt',
+      });
+      assert.equal(at(copied, 'data', 'destinationWorkspaceId'), second.id);
+      assert.equal(JSON.stringify(copied).includes(root), false);
+      const moved = await invoke(adapter, 'files_move', {
+        workspaceId,
+        sourceRelativePath: 'folder/source.txt',
+        destinationWorkspaceId: second.id,
+        destinationRelativePath: 'moved.txt',
+      });
+      assert.equal(at(moved, 'data', 'destinationWorkspaceId'), second.id);
+      assert.equal(
+        await readFile(path.join(secondRoot, 'moved.txt'), 'utf8'),
+        'after',
+      );
+      await assert.rejects(
+        access(path.join(workspaceRoot, 'folder/source.txt')),
+      );
+      await writeFile(path.join(workspaceRoot, 'batch-a'), 'a');
+      await writeFile(path.join(workspaceRoot, 'batch-b'), 'b');
+      const batch = await invoke(adapter, 'files_batch_transfer', {
+        items: [
+          {
+            operation: 'copy',
+            sourceWorkspaceId: workspaceId,
+            sourceRelativePath: 'batch-a',
+            destinationWorkspaceId: second.id,
+            destinationRelativePath: 'batch-a',
+          },
+          {
+            operation: 'move',
+            sourceWorkspaceId: workspaceId,
+            sourceRelativePath: 'batch-b',
+            destinationWorkspaceId: second.id,
+            destinationRelativePath: 'batch-b',
+          },
+        ],
+      });
+      assert.equal(at(batch, 'data', 'status'), 'completed');
+      assert.equal(at(batch, 'data', 'completed'), 2);
+      assert.equal(JSON.stringify(batch).includes(root), false);
+      assert.equal(
+        at(
+          await invoke(adapter, 'files_batch_transfer', {
+            items: Array(21).fill({
+              operation: 'copy',
+              sourceWorkspaceId: workspaceId,
+              sourceRelativePath: 'batch-a',
+              destinationWorkspaceId: second.id,
+              destinationRelativePath: 'extra',
+            }),
+          }),
+          'data',
+          'error',
+          'code',
+        ),
+        'INVALID_ARGUMENT',
+      );
+    },
+  );
 });
 
 test('running public workspace, Files, Git, and Process tools refresh external workspace config', async () => {
@@ -543,7 +679,7 @@ test('runtime close terminates managed children deterministically', async () => 
   }
 });
 
-test('official SDK stdio and HTTP expose and call the same exact 27 product tools', async (t) => {
+test('official SDK stdio and HTTP expose and call the same exact 31 product tools', async (t) => {
   const root = await mkdtemp(path.join(tmpdir(), 'localink-product-native-'));
   const stateRoot = path.join(root, 'state');
   const workspaceRoot = path.join(root, 'workspace');
@@ -584,6 +720,11 @@ test('official SDK stdio and HTTP expose and call the same exact 27 product tool
     unknown
   >[];
   assert.equal(at(stdioItems[0], 'value', 'text'), 'transport-ok');
+  const stdioMkdir = await call(stdio.client, 'files_mkdir', {
+    workspaceId: workspace.id,
+    relativePath: 'stdio-folder',
+  });
+  assert.equal(at(stdioMkdir, 'data', 'created'), true);
   const skillSearch = await call(stdio.client, 'skill_search', {
     query: 'Transport Skill',
   });
@@ -666,4 +807,10 @@ test('official SDK stdio and HTTP expose and call the same exact 27 product tool
   });
   const httpItems = at(httpRead, 'data', 'items') as Record<string, unknown>[];
   assert.equal(at(httpItems[0], 'value', 'text'), 'transport-ok');
+  const httpCopy = await call(http.client, 'files_copy', {
+    sourceWorkspaceId: workspace.id,
+    sourceRelativePath: 'transport.txt',
+    destinationRelativePath: 'http-copy.txt',
+  });
+  assert.equal(at(httpCopy, 'data', 'destination'), 'http-copy.txt');
 });

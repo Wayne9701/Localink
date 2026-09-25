@@ -4,7 +4,7 @@ Localink is a general-purpose, local-first AI tool runtime that gives **ChatGPT 
 
 ## Current status
 
-The Localink MVP passed a real ChatGPT Web → Tunnel → Localink end-to-end session on 2026-09-23. The product MCP surface is **exactly 27 tools** for health, capability and Skill discovery/invocation/confirmation, Workspace, Files, Process, and bounded Git operations. Process execution is disabled by default and can only be enabled or disabled by the local administrator CLI.
+The Localink MVP passed a real ChatGPT Web → Tunnel → Localink end-to-end session on 2026-09-23. This checkout defines **exactly 31 product MCP tools** for health, capability and Skill discovery/invocation/confirmation, Workspace, Files, Process, and bounded Git operations. The four new Files tools are source-only until a separately approved release; the installed Production surface remains at 27 tools. Process execution is disabled by default and can only be enabled or disabled by the local administrator CLI.
 
 The M6 release flow has passed stable-prefix install, update, and offline rollback acceptance. Releases contain the compiled runtime and fixed production dependencies; mutable state, config, secrets, and logs stay outside the release payload. M7 adds on-demand cross-process refresh for Workspace, Process policy, Shared Skill sources, and External MCP provider configuration. A running Core sees valid changes made by a separate CLI process without a service restart.
 

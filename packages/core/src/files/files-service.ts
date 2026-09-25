@@ -3,6 +3,7 @@ import { createReadStream } from 'node:fs';
 import { constants } from 'node:fs';
 import {
   copyFile,
+  link,
   mkdir,
   open,
   readFile,
@@ -157,13 +158,61 @@ export interface SearchOptions {
   maxMatches?: number;
 }
 
+export interface TransferItem {
+  operation: 'copy' | 'move';
+  sourceWorkspaceId: string;
+  sourceRelativePath: string;
+  destinationWorkspaceId: string;
+  destinationRelativePath: string;
+}
+
+export interface TransferReceipt extends FileTransferReceipt {
+  operation: 'copy' | 'move';
+  sourceWorkspaceId: string;
+  destinationWorkspaceId: string;
+}
+
+export interface BatchTransferReceipt {
+  status: 'completed' | 'partial';
+  completed: number;
+  total: number;
+  items: (
+    | { index: number; status: 'completed'; receipt: TransferReceipt }
+    | {
+        index: number;
+        status: 'failed';
+        errorCode: string;
+      }
+    | { index: number; status: 'not_executed' }
+  )[];
+}
+
+export interface TransferIo {
+  verifyHash?: (absolutePath: string) => Promise<string>;
+  linkFile?: typeof link;
+}
+
+interface TransferPlan {
+  item: TransferItem;
+  source: string;
+  destination: string;
+  byteLength: number;
+  sha256: string;
+}
+
 export class FilesService {
   readonly #workspaces: WorkspaceRegistry;
   readonly #statePaths: StatePaths;
+  readonly #transferIo: TransferIo;
 
-  constructor(workspaces: WorkspaceRegistry, statePaths: StatePaths) {
+  constructor(
+    workspaces: WorkspaceRegistry,
+    statePaths: StatePaths,
+    transferIo: TransferIo = {},
+  ) {
     this.#workspaces = workspaces;
     this.#statePaths = statePaths;
+    this.#transferIo = transferIo;
   }
 
   async list(
@@ -356,6 +405,33 @@ export class FilesService {
     }
   }
 
+  async mkdir(
+    workspaceId: string,
+    relativePath: string,
+  ): Promise<{
+    relativePath: string;
+    created: true;
+    modifiedAt: string;
+  }> {
+    const destination = await this.#resolveWriteDestination(
+      workspaceId,
+      relativePath,
+    );
+    if (destination.exists) {
+      throw new LocalinkError('ALREADY_EXISTS', 'Destination already exists.');
+    }
+    try {
+      await mkdir(destination.absolutePath);
+      return {
+        relativePath: destination.relativePath,
+        created: true,
+        modifiedAt: (await stat(destination.absolutePath)).mtime.toISOString(),
+      };
+    } catch (error) {
+      throw wrapIoError('Unable to create directory.', error);
+    }
+  }
+
   async replaceTextAtomic(
     workspaceId: string,
     relativePath: string,
@@ -363,6 +439,12 @@ export class FilesService {
     expectedSha256?: string,
   ): Promise<FileWriteReceipt> {
     const content = Buffer.from(text, 'utf8');
+    if (content.toString('utf8') !== text) {
+      throw new LocalinkError(
+        'BINARY_NOT_SUPPORTED',
+        'Replacement text must be valid UTF-8.',
+      );
+    }
     this.#assertWriteSize(content);
     const destination = await this.#resolveWriteDestination(
       workspaceId,
@@ -373,7 +455,22 @@ export class FilesService {
         relativePath,
       });
     }
-    const previousSha256 = await hashFile(destination.absolutePath);
+    const currentStat = await stat(destination.absolutePath);
+    if (!currentStat.isFile()) {
+      throw new LocalinkError(
+        'INVALID_ARGUMENT',
+        'Replacement target must be a file.',
+      );
+    }
+    if (currentStat.size > FILE_LIMITS.hardTextBytes) {
+      throw new LocalinkError(
+        'SIZE_LIMIT_EXCEEDED',
+        'Existing text file exceeds the hard size limit.',
+      );
+    }
+    const current = await readFile(destination.absolutePath);
+    ensureText(current, relativePath);
+    const previousSha256 = createHash('sha256').update(current).digest('hex');
     if (expectedSha256 !== undefined && expectedSha256 !== previousSha256) {
       throw new LocalinkError(
         'STALE_PRECONDITION',
@@ -458,45 +555,13 @@ export class FilesService {
     sourceRelativePath: string,
     destinationRelativePath: string,
   ): Promise<FileTransferReceipt> {
-    const source = await this.#workspaces.resolve(
-      workspaceId,
+    return this.transfer({
+      operation: 'copy',
+      sourceWorkspaceId: workspaceId,
       sourceRelativePath,
-    );
-    if (!source.exists) {
-      throw new LocalinkError('NOT_FOUND', 'Copy source does not exist.');
-    }
-    const destination = await this.#resolveWriteDestination(
-      workspaceId,
+      destinationWorkspaceId: workspaceId,
       destinationRelativePath,
-    );
-    if (destination.exists) {
-      throw new LocalinkError(
-        'ALREADY_EXISTS',
-        'Copy destination already exists.',
-      );
-    }
-    try {
-      const sourceStat = await stat(source.absolutePath);
-      if (!sourceStat.isFile()) {
-        throw new LocalinkError(
-          'INVALID_ARGUMENT',
-          'Phase 1A-1 copy supports files only.',
-        );
-      }
-      await copyFile(
-        source.absolutePath,
-        destination.absolutePath,
-        constants.COPYFILE_EXCL,
-      );
-      return {
-        source: sourceRelativePath,
-        destination: destinationRelativePath,
-        byteLength: sourceStat.size,
-        sha256: await hashFile(destination.absolutePath),
-      };
-    } catch (error) {
-      throw wrapIoError('Unable to copy file.', error);
-    }
+    });
   }
 
   async move(
@@ -504,47 +569,178 @@ export class FilesService {
     sourceRelativePath: string,
     destinationRelativePath: string,
   ): Promise<FileTransferReceipt> {
-    const source = await this.#workspaces.resolve(
-      workspaceId,
+    return this.transfer({
+      operation: 'move',
+      sourceWorkspaceId: workspaceId,
       sourceRelativePath,
-    );
-    if (!source.exists) {
-      throw new LocalinkError('NOT_FOUND', 'Move source does not exist.');
-    }
-    const destination = await this.#resolveWriteDestination(
-      workspaceId,
+      destinationWorkspaceId: workspaceId,
       destinationRelativePath,
-    );
-    if (destination.exists) {
+    });
+  }
+
+  async transfer(item: TransferItem): Promise<TransferReceipt> {
+    const plan = await this.#preflightTransfer(item);
+    return this.#executeTransfer(plan);
+  }
+
+  async batchTransfer(
+    items: readonly TransferItem[],
+  ): Promise<BatchTransferReceipt> {
+    if (items.length < 1 || items.length > FILE_LIMITS.hardBatchItems) {
       throw new LocalinkError(
-        'ALREADY_EXISTS',
-        'Move destination already exists.',
+        'INVALID_ARGUMENT',
+        'Batch size is outside the hard bound.',
       );
     }
-    try {
-      const sourceStat = await stat(source.absolutePath);
-      if (!sourceStat.isFile()) {
+    const plans: TransferPlan[] = [];
+    const sources = new Set<string>();
+    const destinations = new Set<string>();
+    for (const item of items) {
+      const plan = await this.#preflightTransfer(item);
+      if (destinations.has(plan.destination)) {
         throw new LocalinkError(
           'INVALID_ARGUMENT',
-          'Phase 1A-1 move supports files only.',
+          'Batch destinations conflict.',
         );
       }
-      const digest = await hashFile(source.absolutePath);
-      await renamePath(source.absolutePath, destination.absolutePath);
-      return {
-        source: sourceRelativePath,
-        destination: destinationRelativePath,
-        byteLength: sourceStat.size,
-        sha256: digest,
-      };
-    } catch (error) {
-      if (nodeErrorCode(error) === 'EXDEV') {
+      destinations.add(plan.destination);
+      sources.add(plan.source);
+      plans.push(plan);
+    }
+    if (
+      plans.some((plan) => sources.has(plan.destination)) ||
+      plans.some(
+        (plan) =>
+          plan.item.operation === 'move' &&
+          plans.filter((other) => other.source === plan.source).length > 1,
+      )
+    ) {
+      throw new LocalinkError(
+        'INVALID_ARGUMENT',
+        'Batch sources and destinations conflict.',
+      );
+    }
+    const results: BatchTransferReceipt['items'] = [];
+    for (const [index, plan] of plans.entries()) {
+      try {
+        // Re-resolve before each mutation; earlier items or external changes may invalidate the preflight.
+        const current = await this.#preflightTransfer(plan.item);
+        if (current.sha256 !== plan.sha256) {
+          throw new LocalinkError(
+            'STALE_PRECONDITION',
+            'Source changed after batch preflight.',
+          );
+        }
+        results.push({
+          index,
+          status: 'completed',
+          receipt: await this.#executeTransfer(current),
+        });
+      } catch (error) {
+        results.push({
+          index,
+          status: 'failed',
+          errorCode: error instanceof LocalinkError ? error.code : 'IO_ERROR',
+        });
+        for (let remaining = index + 1; remaining < plans.length; remaining++) {
+          results.push({ index: remaining, status: 'not_executed' });
+        }
+        return {
+          status: 'partial',
+          completed: index,
+          total: plans.length,
+          items: results,
+        };
+      }
+    }
+    return {
+      status: 'completed',
+      completed: plans.length,
+      total: plans.length,
+      items: results,
+    };
+  }
+
+  async #preflightTransfer(item: TransferItem): Promise<TransferPlan> {
+    if (item.operation !== 'copy' && item.operation !== 'move') {
+      throw new LocalinkError(
+        'INVALID_ARGUMENT',
+        'Transfer operation is invalid.',
+      );
+    }
+    const source = await this.#workspaces.resolve(
+      item.sourceWorkspaceId,
+      item.sourceRelativePath,
+    );
+    if (!source.exists)
+      throw new LocalinkError('NOT_FOUND', 'Transfer source does not exist.');
+    const destination = await this.#resolveWriteDestination(
+      item.destinationWorkspaceId,
+      item.destinationRelativePath,
+    );
+    if (destination.exists)
+      throw new LocalinkError(
+        'ALREADY_EXISTS',
+        'Transfer destination already exists.',
+      );
+    const sourceStat = await stat(source.absolutePath);
+    if (!sourceStat.isFile())
+      throw new LocalinkError(
+        'INVALID_ARGUMENT',
+        'Transfer source must be a file.',
+      );
+    return {
+      item,
+      source: source.absolutePath,
+      destination: destination.absolutePath,
+      byteLength: sourceStat.size,
+      sha256: await hashFile(source.absolutePath),
+    };
+  }
+
+  async #executeTransfer(plan: TransferPlan): Promise<TransferReceipt> {
+    const { item, source, destination, byteLength, sha256 } = plan;
+    let created = false;
+    try {
+      if (item.operation === 'move') {
+        try {
+          await (this.#transferIo.linkFile ?? link)(source, destination);
+          created = true;
+        } catch (error) {
+          if (nodeErrorCode(error) !== 'EXDEV') throw error;
+          await copyFile(source, destination, constants.COPYFILE_EXCL);
+          created = true;
+        }
+      } else {
+        await copyFile(source, destination, constants.COPYFILE_EXCL);
+        created = true;
+      }
+      const actual = await (this.#transferIo.verifyHash ?? hashFile)(
+        destination,
+      );
+      if (
+        actual !== sha256 ||
+        (await stat(destination)).size !== byteLength ||
+        (await hashFile(source)) !== sha256
+      ) {
         throw new LocalinkError(
           'IO_ERROR',
-          'Cross-device move is not supported by the normal move operation.',
+          'Transfer hash verification failed; source was preserved.',
         );
       }
-      throw wrapIoError('Unable to move file.', error);
+      if (item.operation === 'move') await unlink(source);
+      return {
+        operation: item.operation,
+        sourceWorkspaceId: item.sourceWorkspaceId,
+        source: item.sourceRelativePath,
+        destinationWorkspaceId: item.destinationWorkspaceId,
+        destination: item.destinationRelativePath,
+        byteLength,
+        sha256,
+      };
+    } catch (error) {
+      if (created) await unlink(destination).catch(() => undefined);
+      throw wrapIoError('Unable to transfer file.', error);
     }
   }
 
@@ -734,10 +930,6 @@ export class FilesService {
   }
 
   async #resolveWriteDestination(workspaceId: string, relativePath: string) {
-    const destination = await this.#workspaces.resolve(
-      workspaceId,
-      relativePath,
-    );
     const parentRelative = path.dirname(relativePath);
     const parent = await this.#workspaces.resolve(
       workspaceId,
@@ -750,7 +942,7 @@ export class FilesService {
         { relativePath },
       );
     }
-    return destination;
+    return this.#workspaces.resolve(workspaceId, relativePath);
   }
 
   #writeReceipt(relativePath: string, content: Buffer): FileWriteReceipt {

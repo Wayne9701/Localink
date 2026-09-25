@@ -75,9 +75,9 @@ async function invoke(
   return envelope(await adapter.call(`localink.${name}`, args));
 }
 
-test('registry is exact 27 and Git schemas are strict, bounded, and non-open-world', () => {
-  assert.equal(TOOL_NAMES.length, 27);
-  assert.equal(new Set(TOOL_NAMES).size, 27);
+test('registry is exact 31 and Git schemas are strict, bounded, and non-open-world', () => {
+  assert.equal(TOOL_NAMES.length, 31);
+  assert.equal(new Set(TOOL_NAMES).size, 31);
   for (const name of [
     'localink.git_inspect',
     'localink.git_status',

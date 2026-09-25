@@ -47,34 +47,45 @@ server/adapter over one process-scoped runtime. Runtime state persists across
 requests; caller context does not. There is no persistent MCP session and no
 `Mcp-Session-Id` dependency.
 
-## Public tools: exactly 27
+## Public tools: exactly 31 in this source checkout
 
-| Tool                                                       | Input / purpose                                                                           |
-| ---------------------------------------------------------- | ----------------------------------------------------------------------------------------- |
-| `localink.health_status`                                   | `{}`; real runtime readiness and bounded registry counts                                  |
-| `localink.capability_search`                               | Optional `query` (256 characters), `limit` (1–50, default 20)                             |
-| `localink.capability_describe`                             | `capabilityId`; projected V1 descriptor                                                   |
-| `localink.capability_invoke`                               | `capabilityId`, JSON `input`; always invokes through Core                                 |
-| `localink.capability_confirm`                              | Single-use ticket plus the exact Tier 2 `capabilityId` and JSON `input`                   |
-| `localink.skill_search`                                    | Same bounded query/limit; Registry assets only                                            |
-| `localink.skill_read`                                      | `skillId`, optional `maxBytes` (1–16384, default 8192); untrusted asset boundary          |
-| `localink.workspace_list` / `workspace_inspect`            | Public-safe metadata; never absolute roots                                                |
-| `localink.files_list`                                      | Bounded workspace-relative directory list                                                 |
-| `localink.files_read_many`                                 | Ordered 1–20 text reads with isolated item errors; 64 KiB default / 256 KiB hard per file |
-| `localink.files_inspect_many`                              | Ordered 1–50 metadata reads; optional hash bounded to 256 KiB files                       |
-| `localink.files_search`                                    | Path or content mode; at most 50 matches                                                  |
-| `localink.files_create_text`                               | No-overwrite create with hash receipt                                                     |
-| `localink.files_precise_edit`                              | Exact occurrence and optional SHA-256 preconditions                                       |
-| `localink.files_move` / `files_archive`                    | No-overwrite move and redacted recoverable archive receipt                                |
-| `localink.process_exec` / `process_start`                  | Local-policy-gated host execution; `shell: false`; no public env input                    |
-| `localink.process_poll` / `process_input` / `process_stop` | Managed process lifecycle                                                                 |
-| `localink.git_inspect`                                     | Bounded repository inspection within an authorized workspace                              |
-| `localink.git_status` / `git_diff` / `git_log`             | Structured, bounded Git reads                                                             |
-| `localink.git_apply_patch`                                 | Preconditions and bounded patch application with rollback on failure                      |
+| Tool                                                       | Input / purpose                                                                                  |
+| ---------------------------------------------------------- | ------------------------------------------------------------------------------------------------ |
+| `localink.health_status`                                   | `{}`; real runtime readiness and bounded registry counts                                         |
+| `localink.capability_search`                               | Optional `query` (256 characters), `limit` (1–50, default 20)                                    |
+| `localink.capability_describe`                             | `capabilityId`; projected V1 descriptor                                                          |
+| `localink.capability_invoke`                               | `capabilityId`, JSON `input`; always invokes through Core                                        |
+| `localink.capability_confirm`                              | Single-use ticket plus the exact Tier 2 `capabilityId` and JSON `input`                          |
+| `localink.skill_search`                                    | Same bounded query/limit; Registry assets only                                                   |
+| `localink.skill_read`                                      | `skillId`, optional `maxBytes` (1–16384, default 8192); untrusted asset boundary                 |
+| `localink.workspace_list` / `workspace_inspect`            | Public-safe metadata; never absolute roots                                                       |
+| `localink.files_list`                                      | Bounded workspace-relative directory list                                                        |
+| `localink.files_read_many`                                 | Ordered 1–20 text reads with isolated item errors; 64 KiB default / 256 KiB hard per file        |
+| `localink.files_inspect_many`                              | Ordered 1–50 metadata reads; optional hash bounded to 256 KiB files                              |
+| `localink.files_search`                                    | Path or content mode; at most 50 matches                                                         |
+| `localink.files_create_text`                               | No-overwrite create with hash receipt                                                            |
+| `localink.files_mkdir`                                     | Create one directory with an existing parent; no recursive parents                               |
+| `localink.files_copy`                                      | File-only, no-overwrite copy within or between registered Workspaces, with SHA-256 verification  |
+| `localink.files_replace_text`                              | Guarded atomic UTF-8 full-file replacement; `expectedSha256` is required                         |
+| `localink.files_batch_transfer`                            | Up to 20 explicit copy/move items; full preflight, per-item receipts and explicit partial status |
+| `localink.files_precise_edit`                              | Exact occurrence and optional SHA-256 preconditions                                              |
+| `localink.files_move` / `files_archive`                    | No-overwrite move (optional destination Workspace) and redacted recoverable archive receipt      |
+| `localink.process_exec` / `process_start`                  | Local-policy-gated host execution; `shell: false`; no public env input                           |
+| `localink.process_poll` / `process_input` / `process_stop` | Managed process lifecycle                                                                        |
+| `localink.git_inspect`                                     | Bounded repository inspection within an authorized workspace                                     |
+| `localink.git_status` / `git_diff` / `git_log`             | Structured, bounded Git reads                                                                    |
+| `localink.git_apply_patch`                                 | Preconditions and bounded patch application with rollback on failure                             |
 
 Real runtime capability and Skill registries load explicitly configured Shared
 MCP and Shared Skill sources. The fixture runtime and synthetic invocation
 context remain explicit test-only entrypoints, never product defaults.
+
+Cross-Workspace transfer resolves both ends through existing registered Workspace
+roots. Remote callers cannot register or widen roots. Batch preflight rejects
+known conflicts before mutation; execution stops on the first runtime failure,
+preserves completed earlier items, and marks later items `not_executed`.
+Directory-recursive copy, raw delete, and remote Workspace registration are
+unsupported. The installed Production MCP remains unchanged until a separate release.
 
 Production callers cannot choose `policyProfile=open`. Normal invocation uses
 balanced policy: tiers 0 and 1 execute, Tier 2 returns a confirmation ticket
