@@ -69,7 +69,8 @@ export async function startHttpServer(options: HttpOptions) {
         );
     });
   });
-  server.requestTimeout = 15_000;
+  // Agent waits are capped at 15 seconds; leave room for MCP framing and cleanup.
+  server.requestTimeout = 20_000;
   server.headersTimeout = 10_000;
   try {
     await new Promise<void>((resolve, reject) => {

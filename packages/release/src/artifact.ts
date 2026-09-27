@@ -27,6 +27,7 @@ import {
 const LOCAL_WORKSPACES = [
   'packages/sdk',
   'packages/core',
+  'packages/codex-agent',
   'packages/service',
   'packages/runtime',
   'packages/mcp-server',

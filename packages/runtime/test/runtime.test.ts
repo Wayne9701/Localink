@@ -1,5 +1,12 @@
 import assert from 'node:assert/strict';
-import { mkdir, mkdtemp, realpath, rm, writeFile } from 'node:fs/promises';
+import {
+  access,
+  mkdir,
+  mkdtemp,
+  realpath,
+  rm,
+  writeFile,
+} from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
@@ -57,6 +64,7 @@ test('fresh runtime persists stable canonical workspace identity across restart 
           providers: [],
         },
       },
+      agent: { state: 'disabled' },
       service: { state: 'unconfigured', stale: true },
     });
     const added = await first.addWorkspace('primary', workspaceInput);
@@ -90,6 +98,133 @@ test('separate state roots remain isolated', async () => {
     assert.equal(left.workspaces.list().length, 1);
     assert.equal(right.workspaces.list().length, 0);
     await Promise.all([left.close(), right.close()]);
+  });
+});
+
+test('Agent runtime defaults to disabled without writing config or starting Codex', async () => {
+  await withTemp(async (root) => {
+    const stateRoot = path.join(root, 'state');
+    const runtime = await createLocalinkRuntime({ stateRoot });
+    try {
+      assert.deepEqual(runtime.agents?.status(), { state: 'disabled' });
+      assert.deepEqual((await runtime.health()).agent, { state: 'disabled' });
+      await assert.rejects(
+        access(path.join(stateRoot, 'config', 'codex-agent.json')),
+        /ENOENT/u,
+      );
+    } finally {
+      await runtime.close();
+    }
+  });
+});
+
+test('post-install Agent config refresh enables the manager while preserving core readiness', async () => {
+  await withTemp(async (root) => {
+    const stateRoot = path.join(root, 'state');
+    const configPath = path.join(stateRoot, 'config', 'codex-agent.json');
+    const runtime = await createLocalinkRuntime({ stateRoot });
+    try {
+      const disabledManager = runtime.agents;
+      await mkdir(path.dirname(configPath), { recursive: true });
+      await writeFile(
+        configPath,
+        JSON.stringify({
+          version: 1,
+          enabled: true,
+          codexExecutable: path.join(root, 'missing-codex'),
+          permissionPreset: 'auto',
+          sectionName: 'Localink Agents',
+        }),
+        { mode: 0o600 },
+      );
+      await runtime.refreshAgents();
+      const enabledManager = runtime.agents;
+      assert.notEqual(enabledManager, disabledManager);
+      assert.deepEqual(enabledManager?.status(), { state: 'ready' });
+      assert.equal((await runtime.health()).state.ready, true);
+
+      await writeFile(
+        configPath,
+        JSON.stringify({
+          version: 1,
+          enabled: false,
+          permissionPreset: 'auto',
+          sectionName: 'Localink Agents',
+        }),
+      );
+      await runtime.refreshAgents();
+      assert.equal(runtime.agents, enabledManager);
+      assert.deepEqual((await runtime.health()).agent, {
+        state: 'degraded',
+        reasonCode: 'AGENT_CONFIG_RESTART_REQUIRED',
+      });
+
+      let closeCount = 0;
+      const originalClose = enabledManager!.close.bind(enabledManager);
+      enabledManager!.close = async () => {
+        closeCount++;
+        await originalClose();
+      };
+      await runtime.close();
+      assert.equal(closeCount, 1);
+    } finally {
+      await runtime.close();
+    }
+  });
+});
+
+test('invalid Agent config and inventory degrade only the optional module', async () => {
+  await withTemp(async (root) => {
+    const stateRoot = path.join(root, 'state');
+    const configPath = path.join(stateRoot, 'config', 'codex-agent.json');
+    await mkdir(path.dirname(configPath), { recursive: true });
+    await writeFile(
+      configPath,
+      JSON.stringify({
+        version: 1,
+        enabled: true,
+        codexExecutable: '/usr/bin/false',
+        permissionPreset: 'auto',
+        sectionName: 'Localink Agents',
+        authToken: 'forbidden',
+      }),
+      { mode: 0o600 },
+    );
+    const runtime = await createLocalinkRuntime({ stateRoot });
+    try {
+      assert.equal(runtime.agents, undefined);
+      assert.deepEqual((await runtime.health()).agent, {
+        state: 'degraded',
+        reasonCode: 'AGENT_CONFIG_INVALID',
+      });
+      assert.equal((await runtime.health()).state.ready, true);
+
+      await writeFile(
+        configPath,
+        JSON.stringify({
+          version: 1,
+          enabled: true,
+          codexExecutable: '/usr/bin/false',
+          permissionPreset: 'auto',
+          sectionName: 'Localink Agents',
+        }),
+      );
+      const inventoryPath = path.join(
+        stateRoot,
+        'state',
+        'codex-agent-inventory.json',
+      );
+      await mkdir(path.dirname(inventoryPath), { recursive: true });
+      await writeFile(inventoryPath, 'invalid-json', { mode: 0o600 });
+      await runtime.refreshAgents();
+      assert.deepEqual((await runtime.health()).agent, {
+        state: 'degraded',
+        reasonCode: 'AGENT_INVENTORY_INVALID',
+      });
+      assert.equal((await runtime.health()).state.ready, true);
+    } finally {
+      await runtime.close();
+    }
   });
 });
 

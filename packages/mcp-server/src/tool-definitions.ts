@@ -29,6 +29,16 @@ export const PUBLIC_GIT_LIMITS = {
   patchBytes: 256 * 1024,
   paths: 20,
 } as const;
+export const PUBLIC_AGENT_LIMITS = {
+  titleCharacters: 160,
+  promptCharacters: 16 * 1024,
+  messageCharacters: 16 * 1024,
+  rationaleCharacters: 1024,
+  defaultWaitMs: 8_000,
+  hardWaitMs: 15_000,
+  defaultListItems: 20,
+  hardListItems: 50,
+} as const;
 
 const id = z
   .string()
@@ -62,6 +72,27 @@ const gitBase = {
   workspaceId,
   repoPath: relativePath.optional(),
 };
+const agentRef = z
+  .string()
+  .min(1)
+  .max(128)
+  .refine((value) => !value.includes('\0'));
+const approvalRequestId = z
+  .string()
+  .min(1)
+  .max(128)
+  .refine((value) => !value.includes('\0'));
+const agentModel = z.string().min(1).max(128);
+const reasoningEffort = z.enum([
+  'none',
+  'minimal',
+  'low',
+  'medium',
+  'high',
+  'xhigh',
+  'max',
+  'ultra',
+]);
 const search = z.strictObject({
   query: z.string().max(256).optional(),
   limit: z.number().int().min(1).max(50).optional(),
@@ -280,6 +311,73 @@ export const toolSchemas = {
       ),
     expectedHead: z.string().regex(/^[a-f0-9]{40,64}$/u),
   }),
+  'localink.agent_start': z.strictObject({
+    workspaceId,
+    relativeCwd: relativePath.optional(),
+    taskTitle: z
+      .string()
+      .trim()
+      .min(1)
+      .max(PUBLIC_AGENT_LIMITS.titleCharacters),
+    prompt: z.string().min(1).max(PUBLIC_AGENT_LIMITS.promptCharacters),
+    supervisionMode: z.enum(['auto', 'inline', 'detached']).optional(),
+    model: agentModel.optional(),
+    reasoningEffort: reasoningEffort.optional(),
+    invocationRationale: z
+      .string()
+      .trim()
+      .min(1)
+      .max(PUBLIC_AGENT_LIMITS.rationaleCharacters)
+      .optional(),
+  }),
+  'localink.agent_list': z.strictObject({
+    status: z
+      .enum([
+        'starting',
+        'running',
+        'awaiting_approval',
+        'awaiting_interaction',
+        'completed',
+        'failed',
+        'cancelled',
+        'unknown',
+      ])
+      .optional(),
+    workspaceId: workspaceId.optional(),
+    limit: z
+      .number()
+      .int()
+      .min(1)
+      .max(PUBLIC_AGENT_LIMITS.hardListItems)
+      .optional(),
+  }),
+  'localink.agent_show': z.strictObject({ agentRef }),
+  'localink.agent_wait': z.strictObject({
+    agentRef,
+    afterSeq: z.number().int().nonnegative().optional(),
+    timeoutMs: z
+      .number()
+      .int()
+      .min(1)
+      .max(PUBLIC_AGENT_LIMITS.hardWaitMs)
+      .optional(),
+  }),
+  'localink.agent_send': z.strictObject({
+    agentRef,
+    message: z.string().min(1).max(PUBLIC_AGENT_LIMITS.messageCharacters),
+    model: agentModel.optional(),
+    reasoningEffort: reasoningEffort.optional(),
+    invocationRationale: z
+      .string()
+      .trim()
+      .min(1)
+      .max(PUBLIC_AGENT_LIMITS.rationaleCharacters)
+      .optional(),
+  }),
+  'localink.agent_approve': z.strictObject({ agentRef, approvalRequestId }),
+  'localink.agent_reject': z.strictObject({ agentRef, approvalRequestId }),
+  'localink.agent_cancel': z.strictObject({ agentRef }),
+  'localink.agent_archive': z.strictObject({ agentRef }),
 } as const;
 
 export const fixtureToolSchemas = {
@@ -348,6 +446,23 @@ export const toolDescriptions: Record<ToolName, string> = {
     'Read bounded structured current-HEAD Git history without email or commit body.',
   'localink.git_apply_patch':
     'Apply one checked, workspace-bound text patch with an exact HEAD precondition and verification receipt.',
+  'localink.agent_start':
+    'Start one durable Localink-owned Codex Agent task in a registered Workspace.',
+  'localink.agent_list':
+    'List bounded active, attention-needed, and recent Localink-owned Agent tasks.',
+  'localink.agent_show':
+    'Refresh one Localink-owned Agent task through official Codex state.',
+  'localink.agent_wait':
+    'Wait once for bounded Agent progress without starting a new turn.',
+  'localink.agent_send':
+    'Send one metered follow-up turn to an eligible Localink-owned Agent task.',
+  'localink.agent_approve':
+    'Approve only an exact current manual Codex approval request.',
+  'localink.agent_reject':
+    'Reject only an exact current manual Codex approval request.',
+  'localink.agent_cancel': 'Cancel one active Localink-owned Agent task.',
+  'localink.agent_archive':
+    'Explicitly archive one terminal Localink-owned Agent task.',
 };
 
 const READ_ONLY = new Set<ToolName>([
@@ -367,6 +482,9 @@ const READ_ONLY = new Set<ToolName>([
   'localink.git_status',
   'localink.git_diff',
   'localink.git_log',
+  'localink.agent_list',
+  'localink.agent_show',
+  'localink.agent_wait',
 ]);
 const PROCESS = new Set<ToolName>([
   'localink.process_exec',
@@ -384,10 +502,19 @@ const CONSERVATIVE_DESTRUCTIVE = new Set<ToolName>([
   'localink.process_start',
   'localink.process_input',
   'localink.process_stop',
+  'localink.agent_start',
+  'localink.agent_send',
+  'localink.agent_approve',
+  'localink.agent_reject',
+  'localink.agent_cancel',
+  'localink.agent_archive',
 ]);
 const OPEN_WORLD = new Set<ToolName>([
   ...PROCESS,
   'localink.capability_confirm',
+  'localink.agent_start',
+  'localink.agent_send',
+  'localink.agent_approve',
 ]);
 export const toolAnnotations: Record<
   ToolName,

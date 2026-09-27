@@ -8,6 +8,9 @@
       "path": "./packages/core"
     },
     {
+      "path": "./packages/codex-agent"
+    },
+    {
       "path": "./packages/runtime"
     },
     {

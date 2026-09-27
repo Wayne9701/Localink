@@ -9,6 +9,12 @@ import {
   createStatePaths,
 } from '@localink/core';
 import {
+  AgentError,
+  AgentManager,
+  type AgentRuntimeConfig,
+} from '@localink/codex-agent';
+import path from 'node:path';
+import {
   CONTRACT_VERSION_V1,
   LOCALINK_VERSION,
   LocalinkError,
@@ -80,6 +86,52 @@ export interface ExternalMcpStore {
   write(value: ExternalMcpConfig): Promise<ExternalMcpConfig>;
 }
 
+export interface AgentConfigStore {
+  read(): Promise<AgentRuntimeConfig | undefined>;
+  write(value: AgentRuntimeConfig): Promise<AgentRuntimeConfig>;
+}
+
+const DEFAULT_AGENT_CONFIG: AgentRuntimeConfig = {
+  version: 1,
+  enabled: false,
+  permissionPreset: 'auto',
+  sectionName: 'Localink Agents',
+};
+
+function validateAgentConfig(value: unknown): AgentRuntimeConfig {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+    throw new LocalinkError(
+      'CONFIG_INVALID',
+      'Agent config must be an object.',
+    );
+  }
+  const config = value as Partial<AgentRuntimeConfig>;
+  if (
+    Object.keys(config).some(
+      (key) =>
+        ![
+          'version',
+          'enabled',
+          'codexExecutable',
+          'permissionPreset',
+          'sectionName',
+        ].includes(key),
+    ) ||
+    config.version !== 1 ||
+    typeof config.enabled !== 'boolean' ||
+    config.permissionPreset !== 'auto' ||
+    config.sectionName !== 'Localink Agents' ||
+    (config.codexExecutable !== undefined &&
+      (typeof config.codexExecutable !== 'string' ||
+        !path.isAbsolute(config.codexExecutable) ||
+        config.codexExecutable.includes('\0'))) ||
+    (config.enabled && config.codexExecutable === undefined)
+  ) {
+    throw new LocalinkError('CONFIG_INVALID', 'Agent config is invalid.');
+  }
+  return config as AgentRuntimeConfig;
+}
+
 export interface LocalinkRuntimeOptions {
   readonly stateRoot?: string;
   readonly environment?: NodeJS.ProcessEnv;
@@ -87,6 +139,7 @@ export interface LocalinkRuntimeOptions {
   readonly processPolicyStore?: ProcessPolicyStore;
   readonly skillSourceStore?: SkillSourceStore;
   readonly externalMcpStore?: ExternalMcpStore;
+  readonly agentConfigStore?: AgentConfigStore;
 }
 
 export interface LocalinkRuntimeHealth {
@@ -111,6 +164,10 @@ export interface LocalinkRuntimeHealth {
       readonly degraded: number;
     };
     readonly externalMcp: ReturnType<ExternalMcpManager['health']>;
+  };
+  readonly agent: {
+    readonly state: 'disabled' | 'ready' | 'degraded';
+    readonly reasonCode?: string;
   };
   readonly service:
     | PublicServiceSnapshot
@@ -142,6 +199,7 @@ export class LocalinkRuntime {
   readonly #processPolicyStore: ProcessPolicyStore;
   readonly #skillSourceStore: SkillSourceStore;
   readonly #externalMcpStore: ExternalMcpStore;
+  readonly #agentConfigStore: AgentConfigStore;
   readonly #environment: NodeJS.ProcessEnv;
   #capabilities: CapabilityRegistry;
   #skills: SkillRegistry;
@@ -150,6 +208,10 @@ export class LocalinkRuntime {
   #processPolicySnapshotKey: string;
   #skillSourceSnapshotKey = '';
   #externalMcpSnapshotKey = '';
+  #agentConfigSnapshotKey = '';
+  #agentActiveEnabled = false;
+  #agents: AgentManager | undefined;
+  #agentStatus: LocalinkRuntimeHealth['agent'] = { state: 'disabled' };
   #skillSourceSummary: SkillSourceLoadSummary = {
     configuredSources: 0,
     loadedSkills: 0,
@@ -168,6 +230,10 @@ export class LocalinkRuntime {
     return this.#skills;
   }
 
+  get agents(): AgentManager | undefined {
+    return this.#agents;
+  }
+
   private constructor(
     statePaths: StatePaths,
     workspaces: WorkspaceRegistry,
@@ -177,6 +243,7 @@ export class LocalinkRuntime {
     processPolicy: ProcessPolicy,
     skillSourceStore: SkillSourceStore,
     externalMcpStore: ExternalMcpStore,
+    agentConfigStore: AgentConfigStore,
     environment: NodeJS.ProcessEnv,
   ) {
     this.statePaths = statePaths;
@@ -191,6 +258,7 @@ export class LocalinkRuntime {
     this.#processPolicyStore = processPolicyStore;
     this.#skillSourceStore = skillSourceStore;
     this.#externalMcpStore = externalMcpStore;
+    this.#agentConfigStore = agentConfigStore;
     this.#processPolicy = processPolicy;
     this.#processPolicySnapshotKey = JSON.stringify(processPolicy);
     this.#environment = environment;
@@ -220,6 +288,9 @@ export class LocalinkRuntime {
     const externalMcpStore =
       options.externalMcpStore ??
       new ConfigStore(statePaths, 'external-mcp', validateExternalMcpConfig);
+    const agentConfigStore =
+      options.agentConfigStore ??
+      new ConfigStore(statePaths, 'codex-agent', validateAgentConfig);
     const workspaces = new WorkspaceRegistry();
     const config = await workspaceStore.read();
     await workspaces.replaceAllValidated(config?.workspaces ?? []);
@@ -236,9 +307,11 @@ export class LocalinkRuntime {
       processPolicy,
       skillSourceStore,
       externalMcpStore,
+      agentConfigStore,
       options.environment ?? process.env,
     );
     await runtime.#initializeSharedAssets();
+    await runtime.refreshAgents();
     return runtime;
   }
 
@@ -275,6 +348,7 @@ export class LocalinkRuntime {
       await this.refreshProcessPolicy();
       await this.refreshSkillSources();
       await this.refreshExternalMcp();
+      await this.refreshAgents();
     }
     const service =
       (await readServiceSnapshot(this.statePaths.root)) ??
@@ -302,6 +376,7 @@ export class LocalinkRuntime {
         },
         externalMcp: this.#externalMcp.health(),
       },
+      agent: this.#agentStatus,
       service,
     };
   }
@@ -320,6 +395,10 @@ export class LocalinkRuntime {
 
   async refreshExternalMcp(): Promise<void> {
     await this.#mutate(() => this.#refreshExternalMcpIfChanged());
+  }
+
+  async refreshAgents(): Promise<void> {
+    await this.#mutate(() => this.#refreshAgentsIfChanged());
   }
 
   async skillSources(): Promise<SkillSource[]> {
@@ -438,7 +517,11 @@ export class LocalinkRuntime {
     await this.#mutationTail;
     if (this.#closed) return;
     this.#closed = true;
-    await Promise.all([this.#externalMcp.close(), this.processes.close()]);
+    await Promise.all([
+      this.#externalMcp.close(),
+      this.processes.close(),
+      this.#agents?.close(),
+    ]);
   }
 
   async #initializeSharedAssets(): Promise<void> {
@@ -521,6 +604,65 @@ export class LocalinkRuntime {
     this.#externalMcp = manager;
     this.#externalMcpSnapshotKey = key;
     await previous.close();
+  }
+
+  async #refreshAgentsIfChanged(): Promise<void> {
+    let config: AgentRuntimeConfig;
+    try {
+      config = (await this.#agentConfigStore.read()) ?? DEFAULT_AGENT_CONFIG;
+    } catch (error) {
+      this.#agentStatus = {
+        state: 'degraded',
+        reasonCode:
+          error instanceof LocalinkError && error.code === 'CONFIG_INVALID'
+            ? 'AGENT_CONFIG_INVALID'
+            : 'AGENT_CONFIG_UNAVAILABLE',
+      };
+      return;
+    }
+    const key = JSON.stringify(config);
+    if (key === this.#agentConfigSnapshotKey && this.#agents !== undefined) {
+      this.#agentStatus = this.#agents.status();
+      return;
+    }
+    if (this.#agents !== undefined && this.#agentActiveEnabled) {
+      this.#agentStatus = {
+        state: 'degraded',
+        reasonCode: 'AGENT_CONFIG_RESTART_REQUIRED',
+      };
+      return;
+    }
+    try {
+      const manager = await AgentManager.create({
+        stateRoot: this.statePaths.root,
+        environment: this.#environment,
+        config,
+        resolveWorkspace: async (workspaceId, relativeCwd) => {
+          await this.refreshWorkspaces();
+          const workspace = this.workspaces.inspect(workspaceId);
+          return {
+            cwd: await this.workspaces.resolveCwd(workspaceId, relativeCwd),
+            workspaceRoot: workspace.root,
+            workspaceName: workspace.name,
+          };
+        },
+      });
+      const previous = this.#agents;
+      this.#agents = manager;
+      this.#agentStatus = manager.status();
+      this.#agentConfigSnapshotKey = key;
+      this.#agentActiveEnabled = config.enabled;
+      await previous?.close().catch(() => undefined);
+    } catch (error) {
+      this.#agentStatus = {
+        state: 'degraded',
+        reasonCode:
+          error instanceof AgentError &&
+          error.code === 'AGENT_INVENTORY_INVALID'
+            ? 'AGENT_INVENTORY_INVALID'
+            : 'AGENT_INIT_FAILED',
+      };
+    }
   }
 
   async #persist(workspaces: WorkspaceRecord[]): Promise<void> {

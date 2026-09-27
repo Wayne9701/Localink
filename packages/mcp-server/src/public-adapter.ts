@@ -16,6 +16,7 @@ import type { PublicRuntime } from './runtime.js';
 import {
   fixtureToolSchemas,
   INPUT_LIMIT_BYTES,
+  PUBLIC_AGENT_LIMITS,
   PUBLIC_FILE_LIMITS,
   PUBLIC_GIT_LIMITS,
   PUBLIC_PROCESS_LIMITS,
@@ -33,12 +34,96 @@ function nativeRuntime(runtime: PublicRuntime) {
   return runtime.native;
 }
 
+function agentRuntime(runtime: PublicRuntime) {
+  if (runtime.agents === undefined) {
+    throw new LocalinkError(
+      'CAPABILITY_UNAVAILABLE',
+      'Codex Agent tools are not configured in this runtime.',
+    );
+  }
+  return runtime.agents;
+}
+
+const agentErrorMessages = {
+  AGENT_WRITER_CONFLICT: 'Another writable Agent owns this repository.',
+  AGENT_NOT_FOUND: 'Localink Agent task was not found.',
+  AGENT_NOT_IDLE: 'Localink Agent task is not eligible for a new turn.',
+  AGENT_NOT_TERMINAL: 'Localink Agent task is not terminal.',
+  AGENT_APPROVAL_STALE: 'The Agent approval request is no longer current.',
+  AGENT_INTERACTION_UNSUPPORTED:
+    'This Agent interaction requires native handling.',
+  AGENT_UNAVAILABLE: 'Localink Agent runtime is unavailable.',
+  AGENT_DISABLED: 'Localink Agent runtime is disabled.',
+  AGENT_STATE_UNKNOWN: 'Localink Agent state could not be confirmed.',
+  PERMISSION_PROFILE_MISMATCH:
+    'Effective Codex permissions differ from the requested preset.',
+} as const;
+
+function publicAgentError(error: unknown):
+  | ReturnType<typeof publicError>
+  | {
+      layer: 'localink';
+      code: keyof typeof agentErrorMessages;
+      message: string;
+      existingAgentRef?: string;
+      title?: string;
+      status?: string;
+    } {
+  if (error === null || typeof error !== 'object' || !('code' in error))
+    return publicError(error);
+  const code = error.code;
+  if (typeof code !== 'string' || !Object.hasOwn(agentErrorMessages, code))
+    return publicError(error);
+  const knownCode = code as keyof typeof agentErrorMessages;
+  const result: {
+    layer: 'localink';
+    code: keyof typeof agentErrorMessages;
+    message: string;
+    existingAgentRef?: string;
+    title?: string;
+    status?: string;
+  } = {
+    layer: 'localink',
+    code: knownCode,
+    message: agentErrorMessages[knownCode],
+  };
+  if (knownCode === 'AGENT_WRITER_CONFLICT' && 'details' in error) {
+    const details = error.details;
+    if (details !== null && typeof details === 'object') {
+      if (
+        'existingAgentRef' in details &&
+        typeof details.existingAgentRef === 'string' &&
+        /^[A-Za-z0-9_-]{1,128}$/u.test(details.existingAgentRef)
+      )
+        result.existingAgentRef = details.existingAgentRef;
+      if (
+        'title' in details &&
+        typeof details.title === 'string' &&
+        details.title.length <= PUBLIC_AGENT_LIMITS.titleCharacters &&
+        [...details.title].every((character) => {
+          const codePoint = character.codePointAt(0) ?? 0;
+          return codePoint > 31 && codePoint !== 127;
+        })
+      )
+        result.title = details.title;
+      if (
+        'status' in details &&
+        typeof details.status === 'string' &&
+        /^[a-z_]{1,40}$/u.test(details.status)
+      )
+        result.status = details.status;
+    }
+  }
+  return result;
+}
+
 function usesWorkspace(name: string): boolean {
   return (
     name === 'localink.workspace_list' ||
     name === 'localink.workspace_inspect' ||
     name.startsWith('localink.files_') ||
     name.startsWith('localink.git_') ||
+    name === 'localink.agent_start' ||
     name === 'localink.process_exec' ||
     name === 'localink.process_start'
   );
@@ -121,6 +206,8 @@ export class PublicAdapter {
         await this.runtime.refreshSkillSources?.();
       if (name.startsWith('localink.capability_'))
         await this.runtime.refreshExternalMcp?.();
+      if (name.startsWith('localink.agent_'))
+        await this.runtime.refreshAgents?.();
       const inputLimit =
         name === 'localink.git_apply_patch'
           ? PUBLIC_GIT_LIMITS.patchBytes + 4096
@@ -151,7 +238,11 @@ export class PublicAdapter {
       return boundedResult(result, false, this.resultLimit);
     } catch (error) {
       return boundedResult(
-        { error: publicError(error) },
+        {
+          error: name.startsWith('localink.agent_')
+            ? publicAgentError(error)
+            : publicError(error),
+        },
         true,
         this.resultLimit,
       );
@@ -534,6 +625,60 @@ export class PublicAdapter {
             ? {}
             : { repoPath: result.data.repoPath }),
         });
+      }
+      case 'localink.agent_start': {
+        const result = toolSchemas[name].safeParse(args);
+        if (!result.success) invalidInput();
+        return agentRuntime(this.runtime).start({
+          ...result.data,
+          supervisionMode: result.data.supervisionMode ?? 'auto',
+        });
+      }
+      case 'localink.agent_list': {
+        const result = toolSchemas[name].safeParse(args);
+        if (!result.success) invalidInput();
+        return agentRuntime(this.runtime).list({
+          ...result.data,
+          limit: result.data.limit ?? PUBLIC_AGENT_LIMITS.defaultListItems,
+        });
+      }
+      case 'localink.agent_show': {
+        const result = toolSchemas[name].safeParse(args);
+        if (!result.success) invalidInput();
+        return agentRuntime(this.runtime).show(result.data);
+      }
+      case 'localink.agent_wait': {
+        const result = toolSchemas[name].safeParse(args);
+        if (!result.success) invalidInput();
+        return agentRuntime(this.runtime).wait({
+          ...result.data,
+          timeoutMs: result.data.timeoutMs ?? PUBLIC_AGENT_LIMITS.defaultWaitMs,
+        });
+      }
+      case 'localink.agent_send': {
+        const result = toolSchemas[name].safeParse(args);
+        if (!result.success) invalidInput();
+        return agentRuntime(this.runtime).send(result.data);
+      }
+      case 'localink.agent_approve': {
+        const result = toolSchemas[name].safeParse(args);
+        if (!result.success) invalidInput();
+        return agentRuntime(this.runtime).approve(result.data);
+      }
+      case 'localink.agent_reject': {
+        const result = toolSchemas[name].safeParse(args);
+        if (!result.success) invalidInput();
+        return agentRuntime(this.runtime).reject(result.data);
+      }
+      case 'localink.agent_cancel': {
+        const result = toolSchemas[name].safeParse(args);
+        if (!result.success) invalidInput();
+        return agentRuntime(this.runtime).cancel(result.data);
+      }
+      case 'localink.agent_archive': {
+        const result = toolSchemas[name].safeParse(args);
+        if (!result.success) invalidInput();
+        return agentRuntime(this.runtime).archive(result.data);
       }
     }
   }

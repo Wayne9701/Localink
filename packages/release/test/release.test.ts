@@ -128,6 +128,13 @@ test('builder creates a complete production payload without compiler or dev depe
     assert.equal(manifest.product, 'localink');
     assert.equal(manifest.dependencyMode, 'packaged-production');
     assert.ok(manifest.files.length > 20);
+    assert.ok(
+      manifest.files.some(
+        (entry) =>
+          entry.path ===
+          'payload/node_modules/@localink/codex-agent/dist/src/agent-manager.js',
+      ),
+    );
     await assert.rejects(
       lstat(path.join(artifact, 'payload', 'node_modules', 'typescript')),
       /ENOENT/u,

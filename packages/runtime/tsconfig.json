@@ -9,6 +9,7 @@
   "references": [
     { "path": "../sdk" },
     { "path": "../core" },
+    { "path": "../codex-agent" },
     { "path": "../service" }
   ]
 }
