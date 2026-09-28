@@ -400,6 +400,7 @@ export class LocalinkRuntime {
   }
 
   async refreshAgents(): Promise<void> {
+    await this.refreshWorkspaces();
     await this.#mutate(() => this.#refreshAgentsIfChanged());
   }
 

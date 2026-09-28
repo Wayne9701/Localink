@@ -316,6 +316,40 @@ test('running runtime refreshes external workspace add/remove and preserves late
   });
 });
 
+test('Workspace remove and Agent refresh revoke tasks through the live runtime integration', async () => {
+  await withTemp(async (root) => {
+    const stateRoot = path.join(root, 'state');
+    const firstRoot = path.join(root, 'first');
+    const secondRoot = path.join(root, 'second');
+    await Promise.all(
+      [firstRoot, secondRoot].map((directory) => mkdir(directory)),
+    );
+    const running = await createLocalinkRuntime({ stateRoot });
+    let external: Awaited<ReturnType<typeof createLocalinkRuntime>> | undefined;
+    try {
+      const first = await running.addWorkspace('first', firstRoot);
+      const second = await running.addWorkspace('second', secondRoot);
+      external = await createLocalinkRuntime({ stateRoot });
+      const manager = running.agents;
+      assert.ok(manager);
+      const revoked: string[] = [];
+      manager.revokeWorkspace = async (workspaceId: string) => {
+        revoked.push(workspaceId);
+      };
+
+      await running.removeWorkspace(first.id);
+      assert.deepEqual(revoked, [first.id]);
+
+      await external.removeWorkspace(second.id);
+      await running.refreshAgents();
+      assert.deepEqual(revoked, [first.id, second.id]);
+      assert.deepEqual(running.workspaces.list(), []);
+    } finally {
+      await Promise.all([running.close(), external?.close()]);
+    }
+  });
+});
+
 test('running runtime refreshes external process policy and retains last valid policy on malformed config', async () => {
   await withTemp(async (root) => {
     const stateRoot = path.join(root, 'state');

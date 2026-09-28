@@ -55,6 +55,7 @@ const agentErrorMessages = {
   AGENT_UNAVAILABLE: 'Localink Agent runtime is unavailable.',
   AGENT_DISABLED: 'Localink Agent runtime is disabled.',
   AGENT_STATE_UNKNOWN: 'Localink Agent state could not be confirmed.',
+  WORKSPACE_AUTH_REVOKED: 'The Agent Workspace authorization has been revoked.',
   PERMISSION_PROFILE_MISMATCH:
     'Effective Codex permissions differ from the requested preset.',
 } as const;

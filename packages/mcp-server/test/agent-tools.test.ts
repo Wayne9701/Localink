@@ -264,3 +264,43 @@ test('Agent optional runtime fails visibly; writer conflict exposes only safe id
   assert.equal(at(result, 'data', 'error', 'status'), 'running');
   assert.equal(JSON.stringify(result).includes(secret), false);
 });
+
+test('Agent adapter preserves the public Workspace revocation error', async () => {
+  const fixture = await createFixtureRuntime();
+  const revoked = Object.assign(new Error('private resolver detail'), {
+    code: 'WORKSPACE_AUTH_REVOKED',
+  });
+  const agents: AgentController = {
+    start: () => Promise.reject(revoked),
+    list: () => Promise.resolve({}),
+    show: () => Promise.resolve({}),
+    wait: () => Promise.resolve({}),
+    send: () => Promise.reject(revoked),
+    approve: () => Promise.reject(revoked),
+    reject: () => Promise.resolve({}),
+    cancel: () => Promise.resolve({}),
+    archive: () => Promise.resolve({}),
+  };
+  const adapter = new PublicAdapter({ ...fixture, agents });
+  for (const [name, input] of [
+    [
+      'localink.agent_start',
+      { workspaceId: 'removed', taskTitle: 'Revoked', prompt: 'Do it.' },
+    ],
+    [
+      'localink.agent_send',
+      { agentRef: 'agent-1', message: 'Forbidden resume' },
+    ],
+    [
+      'localink.agent_approve',
+      { agentRef: 'agent-1', approvalRequestId: 'approval-1' },
+    ],
+  ] as const) {
+    const result = envelope(await adapter.call(name, input));
+    assert.equal(at(result, 'data', 'error', 'code'), 'WORKSPACE_AUTH_REVOKED');
+    assert.equal(
+      JSON.stringify(result).includes('private resolver detail'),
+      false,
+    );
+  }
+});

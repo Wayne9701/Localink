@@ -584,6 +584,11 @@ export class AgentManager implements AgentController {
   ): Promise<void> {
     if (this.#sessions.get(ref) !== client) return;
     const task = this.#require(ref);
+    if (task.workspaceAuthorizationStatus === 'revoked') {
+      this.#handlesFor(ref).forEach((id) => this.#handles.delete(id));
+      await this.#releaseSession(ref, client);
+      return;
+    }
     await this.#change(ref, {
       status: task.terminal ? task.status : 'unknown',
       taskAppServerState: 'crashed',
@@ -902,6 +907,12 @@ export class AgentManager implements AgentController {
 
   async #authorizeTask(ref: string): Promise<AgentTask> {
     const task = this.#require(ref);
+    if (task.workspaceAuthorizationStatus === 'revoked') {
+      throw new AgentError(
+        'WORKSPACE_AUTH_REVOKED',
+        'Workspace authorization is no longer valid.',
+      );
+    }
     try {
       const current = await this.#resolveAuthorized(
         task.workspaceId,

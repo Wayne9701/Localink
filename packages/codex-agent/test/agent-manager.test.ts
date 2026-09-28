@@ -56,6 +56,7 @@ class FakeServer implements AppServerPort {
   permissionMismatch = false;
   sectionFailure = false;
   turnStartUncertain = false;
+  crashOnInterrupt = false;
 
   constructor(
     readonly state: FakeOfficialState,
@@ -172,6 +173,9 @@ class FakeServer implements AppServerPort {
         (candidate) => candidate.id === params.turnId,
       );
       if (turn) turn.status = 'interrupted';
+      if (this.crashOnInterrupt) {
+        this.callbacks.onCrash('exit code=null signal=SIGTERM');
+      }
       return {};
     }
     if (method === 'thread/list') {
@@ -609,17 +613,46 @@ test('active Workspace revocation interrupts and tears down the owned process', 
         prompt: 'Stay active',
       }),
     );
+    const server = state.official.latest(String(started.agentRef));
+    server.crashOnInterrupt = true;
     await state.manager.revokeWorkspace('a');
     const revoked = receipt(
       await state.manager.show({ agentRef: String(started.agentRef) }),
     );
-    const server = state.official.latest(String(started.agentRef));
     assert.equal(revoked.workspaceAuthorizationStatus, 'revoked');
     assert.equal(revoked.status, 'cancelled');
+    assert.equal(revoked.latestError, 'WORKSPACE_AUTH_REVOKED');
     assert.equal(revoked.officialSessionReleased, true);
     assert.equal(revoked.repoWriterReleased, true);
+    assert.equal(revoked.taskAppServerState, 'stopped');
+    assert.equal(
+      (revoked.lifecycleDiagnostics as string[]).some((entry) =>
+        entry.startsWith('app_server_crash:'),
+      ),
+      false,
+    );
     assert.ok(server.calls.some((call) => call.method === 'turn/interrupt'));
     assert.ok(server.closes >= 1);
+    await assert.rejects(
+      state.manager.send({
+        agentRef: String(started.agentRef),
+        message: 'Forbidden resume after explicit revocation',
+      }),
+      (error: unknown) =>
+        typeof error === 'object' &&
+        error !== null &&
+        'code' in error &&
+        error.code === 'WORKSPACE_AUTH_REVOKED',
+    );
+    const listed = receipt(await state.manager.list({ workspaceId: 'a' }));
+    assert.equal((listed.items as Receipt[])[0]?.agentRef, started.agentRef);
+    const waited = receipt(
+      await state.manager.wait({
+        agentRef: String(started.agentRef),
+        timeoutMs: 0,
+      }),
+    );
+    assert.equal(waited.workspaceAuthorizationStatus, 'revoked');
   } finally {
     await state.cleanup();
   }
