@@ -50,6 +50,12 @@ export interface AgentController {
     agentRef: string;
     approvalRequestId: string;
   }): Promise<unknown>;
+  interact(input: {
+    agentRef: string;
+    interactionRequestId: string;
+    action: 'accept' | 'decline' | 'cancel';
+    content?: Record<string, unknown> | undefined;
+  }): Promise<unknown>;
   cancel(input: { agentRef: string }): Promise<unknown>;
   archive(input: { agentRef: string }): Promise<unknown>;
 }

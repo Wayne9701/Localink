@@ -80,6 +80,7 @@ requests; caller context does not. There is no persistent MCP session and no
 | `localink.agent_wait`                                      | Wait once for progress (8 s default, 15 s hard maximum) without starting a new turn                        |
 | `localink.agent_send`                                      | Send one metered follow-up to an eligible idle task                                                        |
 | `localink.agent_approve` / `agent_reject`                  | Handle an exact current residual manual approval by opaque request ID                                      |
+| `localink.agent_interact`                                  | Resolve one exact pending Codex MCP elicitation without replacing its server, URL, or schema               |
 | `localink.agent_cancel` / `agent_archive`                  | Cancel an active task or explicitly archive a terminal task                                                |
 
 Real runtime capability and Skill registries load explicitly configured Shared

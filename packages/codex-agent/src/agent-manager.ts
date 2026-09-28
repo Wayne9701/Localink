@@ -4,18 +4,21 @@ import path from 'node:path';
 import { realpath } from 'node:fs/promises';
 import { promisify } from 'node:util';
 import { AgentInventory } from './agent-inventory.js';
+import { boundedSchema, validateMcpFormContent } from './mcp-elicitation.js';
 import {
   AppServerRpcError,
   ManagedAppServerClient,
 } from './app-server-client.js';
 import {
   CAPABILITY_PROFILE,
-  projectWorkspaceDevCapabilities,
+  LEGACY_CAPABILITY_PROFILE,
+  projectCodexNativeCapabilities,
 } from './capability-profile.js';
 import {
   AgentError,
   type AgentApprovalInput,
   type AgentController,
+  type AgentInteractionInput,
   type AgentListInput,
   type AgentManagerOptions,
   type AgentRefInput,
@@ -62,6 +65,16 @@ interface ApprovalHandle {
   readonly params: Record<string, unknown>;
   readonly threadId: string;
   readonly turnId: string;
+}
+
+interface InteractionHandle {
+  readonly requestId: string | number;
+  readonly params: Record<string, unknown>;
+  readonly threadId: string;
+  readonly turnId?: string | undefined;
+  readonly serverName: string;
+  readonly mode: string;
+  readonly requestedSchema?: Record<string, unknown> | undefined;
 }
 
 interface OfficialThreadMetadata {
@@ -253,7 +266,14 @@ function normalizePersisted(task: AgentTask): AgentTask {
       task.desktopHistoryReady ?? (task.terminal && released && !task.archived),
     workspaceAuthorizationStatus:
       task.workspaceAuthorizationStatus ?? 'unknown',
-    capabilityProfile: CAPABILITY_PROFILE,
+    capabilityProfile:
+      task.capabilityProfile === CAPABILITY_PROFILE ||
+      task.capabilityProfile === LEGACY_CAPABILITY_PROFILE
+        ? task.capabilityProfile
+        : LEGACY_CAPABILITY_PROFILE,
+    pendingInteraction: task.pendingInteraction
+      ? { ...task.pendingInteraction, actionable: false }
+      : undefined,
   };
 }
 
@@ -265,6 +285,7 @@ export class AgentManager implements AgentController {
   readonly #sessionStarts = new Map<string, Promise<AppServerPort>>();
   readonly #releaseStarts = new Map<string, Promise<AgentTask>>();
   readonly #handles = new Map<string, ApprovalHandle>();
+  readonly #interactions = new Map<string, InteractionHandle>();
   readonly #waiters = new Map<string, Set<() => void>>();
   #sectionId: string | undefined;
   #sectionPromise: Promise<string> | undefined;
@@ -490,7 +511,7 @@ export class AgentManager implements AgentController {
     try {
       const projection = this.#options.capabilityProjector
         ? await this.#options.capabilityProjector()
-        : await projectWorkspaceDevCapabilities(
+        : await projectCodexNativeCapabilities(
             this.#options.config.codexExecutable,
             this.#options.environment,
           );
@@ -585,7 +606,7 @@ export class AgentManager implements AgentController {
     if (this.#sessions.get(ref) !== client) return;
     const task = this.#require(ref);
     if (task.workspaceAuthorizationStatus === 'revoked') {
-      this.#handlesFor(ref).forEach((id) => this.#handles.delete(id));
+      this.#clearTaskHandles(ref);
       await this.#releaseSession(ref, client);
       return;
     }
@@ -602,7 +623,7 @@ export class AgentManager implements AgentController {
         `app_server_crash:${bounded(reason, 120)}`,
       ),
     });
-    this.#handlesFor(ref).forEach((id) => this.#handles.delete(id));
+    this.#clearTaskHandles(ref);
     await this.#releaseSession(ref, client);
   }
 
@@ -612,6 +633,19 @@ export class AgentManager implements AgentController {
     return [...this.#handles]
       .filter(([, handle]) => handle.threadId === task.threadId)
       .map(([id]) => id);
+  }
+
+  #interactionsFor(ref: string): string[] {
+    const task = this.#tasks.get(ref);
+    if (!task?.threadId) return [];
+    return [...this.#interactions]
+      .filter(([, handle]) => handle.threadId === task.threadId)
+      .map(([id]) => id);
+  }
+
+  #clearTaskHandles(ref: string): void {
+    this.#handlesFor(ref).forEach((id) => this.#handles.delete(id));
+    this.#interactionsFor(ref).forEach((id) => this.#interactions.delete(id));
   }
 
   async #releaseSession(
@@ -639,7 +673,7 @@ export class AgentManager implements AgentController {
       try {
         await client.close();
         if (this.#sessions.get(ref) === client) this.#sessions.delete(ref);
-        this.#handlesFor(ref).forEach((id) => this.#handles.delete(id));
+        this.#clearTaskHandles(ref);
         return await this.#change(ref, {
           taskAppServerState: 'stopped',
           taskAppServerPid: undefined,
@@ -647,6 +681,7 @@ export class AgentManager implements AgentController {
           officialThreadLoadState: 'notLoaded',
           repoWriterReleased: true,
           pendingApproval: undefined,
+          pendingInteraction: undefined,
           lifecycleDiagnostics: diagnostics(
             this.#require(ref),
             'official_session_released',
@@ -1593,6 +1628,101 @@ export class AgentManager implements AgentController {
     return this.#approval(input, 'decline');
   }
 
+  async interact(input: AgentInteractionInput): Promise<unknown> {
+    let task = this.#require(input.agentRef);
+    if (input.action === 'accept')
+      task = await this.#authorizeTask(task.agentRef);
+    if (
+      task.terminal ||
+      task.archived ||
+      !task.pendingInteraction?.actionable
+    ) {
+      throw new AgentError(
+        'AGENT_INTERACTION_STALE',
+        'Interaction is no longer actionable.',
+      );
+    }
+    if (
+      task.pendingInteraction.interactionRequestId !==
+      input.interactionRequestId
+    ) {
+      throw new AgentError(
+        'AGENT_INTERACTION_STALE',
+        'Interaction request ID mismatch.',
+      );
+    }
+    const handle = this.#interactions.get(input.interactionRequestId);
+    const client = this.#sessions.get(task.agentRef);
+    if (
+      !handle ||
+      !client ||
+      handle.threadId !== task.threadId ||
+      (handle.turnId !== undefined && handle.turnId !== task.turnId)
+    ) {
+      throw new AgentError(
+        'AGENT_INTERACTION_STALE',
+        'Interaction handle was lost.',
+      );
+    }
+
+    let content: Record<string, unknown> | undefined;
+    if (input.action === 'accept') {
+      if (
+        handle.mode === 'form' ||
+        handle.mode === 'openai/form' ||
+        handle.mode === 'openaiForm'
+      ) {
+        if (!input.content || !handle.requestedSchema) {
+          throw new AgentError(
+            'AGENT_INTERACTION_CONTENT_INVALID',
+            'Accepted MCP form interactions require validated content.',
+          );
+        }
+        validateMcpFormContent(handle.requestedSchema, input.content);
+        content = input.content;
+      } else if (handle.mode === 'openai/userVerification') {
+        if (!input.content) {
+          throw new AgentError(
+            'AGENT_INTERACTION_CONTENT_INVALID',
+            'Accepted user verification requires proof content.',
+          );
+        }
+        content = input.content;
+      } else if (handle.mode === 'url') {
+        if (input.content !== undefined) {
+          throw new AgentError(
+            'AGENT_INTERACTION_CONTENT_INVALID',
+            'URL elicitation acceptance does not accept replacement content.',
+          );
+        }
+      } else {
+        throw new AgentError(
+          'AGENT_INTERACTION_SCHEMA_UNSUPPORTED',
+          'Unsupported MCP elicitation mode.',
+        );
+      }
+    } else if (input.content !== undefined) {
+      throw new AgentError(
+        'AGENT_INTERACTION_CONTENT_INVALID',
+        'Decline/cancel interactions must not include content.',
+      );
+    }
+
+    this.#interactions.delete(input.interactionRequestId);
+    client.respond(handle.requestId, {
+      action: input.action,
+      content: content ?? null,
+      _meta: null,
+    });
+    return publicTask(
+      await this.#change(task.agentRef, {
+        pendingInteraction: undefined,
+        status: 'running',
+      }),
+      true,
+    );
+  }
+
   async cancel(input: AgentRefInput): Promise<unknown> {
     const task = this.#require(input.agentRef);
     const client = this.#sessions.get(task.agentRef);
@@ -1747,29 +1877,67 @@ export class AgentManager implements AgentController {
   ): Promise<void> {
     const task = this.#tasks.get(ref);
     const data = object(params);
-    if (method === 'mcpServer/elicitation/request') {
-      client?.respondError(
-        id,
-        -32601,
-        'MCP elicitation is disabled by profile.',
-      );
-      if (task && !task.terminal) {
-        await this.#change(ref, {
-          status: 'awaiting_interaction',
-          pendingInteraction: {
-            kind: 'mcp_elicitation',
-            summary: 'Unexpected MCP elicitation was declined.',
-          },
-          lifecycleIntegrity: 'uncertain',
-          latestError: 'CAPABILITY_PROFILE_VIOLATION',
-        });
-      }
-      return;
-    }
     if (!client || !task || task.terminal || data.threadId !== task.threadId) {
       client?.respondError(id, -32601, 'Unknown or terminal Agent thread.');
       return;
     }
+
+    if (method === 'mcpServer/elicitation/request') {
+      const requestTurnId = string(data.turnId);
+      if (requestTurnId && requestTurnId !== task.turnId) {
+        client.respondError(id, -32601, 'Stale Localink Agent turn.');
+        return;
+      }
+      if (task.pendingInteraction?.actionable) {
+        client.respondError(
+          id,
+          -32000,
+          'Another Agent interaction is already pending.',
+        );
+        return;
+      }
+      const serverName = string(data.serverName) ?? 'unknown';
+      const rawMode = string(data.mode) ?? 'unknown';
+      const mode =
+        rawMode === 'form' ||
+        rawMode === 'url' ||
+        rawMode === 'openai/userVerification' ||
+        rawMode === 'openai/form' ||
+        rawMode === 'openaiForm'
+          ? rawMode
+          : 'unknown';
+      const interactionRequestId = `interaction_${randomUUID().replaceAll('-', '')}`;
+      const requestedSchema = boundedSchema(data.requestedSchema);
+      this.#interactions.set(interactionRequestId, {
+        requestId: id,
+        params: data,
+        threadId: task.threadId ?? '',
+        ...(requestTurnId ? { turnId: requestTurnId } : {}),
+        serverName,
+        mode,
+        ...(requestedSchema ? { requestedSchema } : {}),
+      });
+      await this.#change(ref, {
+        status: 'awaiting_interaction',
+        pendingInteraction: {
+          interactionRequestId,
+          kind: 'mcp_elicitation',
+          serverName: bounded(serverName, 128),
+          mode,
+          summary: `MCP elicitation requested by ${bounded(serverName, 128)}.`,
+          ...(typeof data.message === 'string'
+            ? { message: bounded(data.message, 1024) }
+            : {}),
+          ...(typeof data.url === 'string'
+            ? { url: bounded(data.url, 4096) }
+            : {}),
+          ...(requestedSchema ? { requestedSchema } : {}),
+          actionable: true,
+        },
+      });
+      return;
+    }
+
     if (string(data.turnId) !== task.turnId) {
       client.respondError(id, -32601, 'Stale Localink Agent turn.');
       return;
@@ -1787,9 +1955,12 @@ export class AgentManager implements AgentController {
       await this.#change(ref, {
         status: 'awaiting_interaction',
         pendingInteraction: {
+          interactionRequestId: `interaction_${randomUUID().replaceAll('-', '')}`,
           kind: 'unknown',
+          mode: 'unknown',
           summary:
             'Unsupported App Server interaction requires native handling.',
+          actionable: false,
         },
       });
       return;

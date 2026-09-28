@@ -82,6 +82,20 @@ const approvalRequestId = z
   .min(1)
   .max(128)
   .refine((value) => !value.includes('\0'));
+const interactionRequestId = z
+  .string()
+  .min(1)
+  .max(128)
+  .refine((value) => !value.includes('\0'));
+const interactionPrimitive = z.union([
+  z.string().max(4096),
+  z.number().finite(),
+  z.boolean(),
+  z.array(z.string().max(4096)).max(50),
+]);
+const interactionContent = z
+  .record(z.string().min(1).max(128), interactionPrimitive)
+  .refine((value) => Object.keys(value).length <= 64);
 const agentModel = z.string().min(1).max(128);
 const reasoningEffort = z.enum([
   'none',
@@ -376,6 +390,12 @@ export const toolSchemas = {
   }),
   'localink.agent_approve': z.strictObject({ agentRef, approvalRequestId }),
   'localink.agent_reject': z.strictObject({ agentRef, approvalRequestId }),
+  'localink.agent_interact': z.strictObject({
+    agentRef,
+    interactionRequestId,
+    action: z.enum(['accept', 'decline', 'cancel']),
+    content: interactionContent.optional(),
+  }),
   'localink.agent_cancel': z.strictObject({ agentRef }),
   'localink.agent_archive': z.strictObject({ agentRef }),
 } as const;
@@ -460,6 +480,8 @@ export const toolDescriptions: Record<ToolName, string> = {
     'Approve only an exact current manual Codex approval request.',
   'localink.agent_reject':
     'Reject only an exact current manual Codex approval request.',
+  'localink.agent_interact':
+    'Resolve one exact current Codex MCP elicitation without selecting a different server, URL, or schema.',
   'localink.agent_cancel': 'Cancel one active Localink-owned Agent task.',
   'localink.agent_archive':
     'Explicitly archive one terminal Localink-owned Agent task.',
@@ -506,6 +528,7 @@ const CONSERVATIVE_DESTRUCTIVE = new Set<ToolName>([
   'localink.agent_send',
   'localink.agent_approve',
   'localink.agent_reject',
+  'localink.agent_interact',
   'localink.agent_cancel',
   'localink.agent_archive',
 ]);
@@ -515,6 +538,7 @@ const OPEN_WORLD = new Set<ToolName>([
   'localink.agent_start',
   'localink.agent_send',
   'localink.agent_approve',
+  'localink.agent_interact',
 ]);
 export const toolAnnotations: Record<
   ToolName,

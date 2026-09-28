@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdtemp, mkdir, rm } from 'node:fs/promises';
+import { mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
@@ -233,6 +233,45 @@ class FakeServer implements AppServerPort {
       command: 'true',
     });
   }
+
+  requestFormElicitation(): void {
+    const thread = [...this.state.threads.values()].find((candidate) =>
+      candidate.turns.some((turn) => turn.status === 'inProgress'),
+    );
+    const turn = thread?.turns.at(-1);
+    if (!thread || !turn) throw new Error('No active turn');
+    this.callbacks.onRequest(23, 'mcpServer/elicitation/request', {
+      threadId: thread.id,
+      turnId: turn.id,
+      serverName: 'bigquery',
+      mode: 'form',
+      message: 'Choose a bounded option.',
+      requestedSchema: {
+        type: 'object',
+        properties: {
+          choice: { type: 'string', enum: ['one', 'two'] },
+        },
+        required: ['choice'],
+      },
+    });
+  }
+
+  requestUrlElicitation(): void {
+    const thread = [...this.state.threads.values()].find((candidate) =>
+      candidate.turns.some((turn) => turn.status === 'inProgress'),
+    );
+    const turn = thread?.turns.at(-1);
+    if (!thread || !turn) throw new Error('No active turn');
+    this.callbacks.onRequest(24, 'mcpServer/elicitation/request', {
+      threadId: thread.id,
+      turnId: turn.id,
+      serverName: 'singular',
+      mode: 'url',
+      message: 'Open the exact authorization URL.',
+      url: 'https://example.invalid/exact',
+      elicitationId: 'url-1',
+    });
+  }
 }
 
 interface Fixture {
@@ -284,14 +323,7 @@ async function fixture(): Promise<Fixture> {
     capabilityProjector: async () => {
       official.projectionCalls++;
       return {
-        launchArgs: [
-          '-c',
-          'features.plugins=false',
-          '-c',
-          'features.computer_use=false',
-          '-c',
-          'mcp_servers.engineering-bridge.enabled=false',
-        ],
+        launchArgs: ['-c', 'mcp_servers.engineering-bridge.enabled=false'],
       };
     },
     clientFactory: (callbacks, launch) => {
@@ -466,7 +498,7 @@ test('teardown failure keeps the same-repo writer lock and blocks archive', asyn
   }
 });
 
-test('workspace-dev-v1 keeps the external MCP deny-all gate and excludes Engineering Bridge', async () => {
+test('codex-native-v1 inherits Codex capabilities and excludes only Engineering Bridge', async () => {
   const state = await fixture();
   try {
     const started = receipt(
@@ -477,10 +509,134 @@ test('workspace-dev-v1 keeps the external MCP deny-all gate and excludes Enginee
       }),
     );
     const args = state.official.latest(String(started.agentRef)).launchArgs;
-    assert.ok(args.includes('features.plugins=false'));
-    assert.ok(args.includes('features.computer_use=false'));
+    assert.equal(args.includes('features.plugins=false'), false);
+    assert.equal(args.includes('features.computer_use=false'), false);
     assert.ok(args.includes('mcp_servers.engineering-bridge.enabled=false'));
-    assert.equal(started.capabilityProfile, 'workspace-dev-v1');
+    assert.equal(started.capabilityProfile, 'codex-native-v1');
+  } finally {
+    await state.cleanup();
+  }
+});
+
+test('MCP form elicitation becomes one exact validated Agent interaction', async () => {
+  const state = await fixture();
+  try {
+    const started = receipt(
+      await state.manager.start({
+        workspaceId: 'a',
+        taskTitle: 'Form elicitation',
+        prompt: 'Use one MCP.',
+      }),
+    );
+    const server = state.official.latest(String(started.agentRef));
+    server.requestFormElicitation();
+    const waiting = await eventually(
+      () =>
+        state.manager.show({
+          agentRef: String(started.agentRef),
+        }) as Promise<Receipt>,
+      (value) => typeof value.pendingInteraction === 'object',
+    );
+    const interaction = waiting.pendingInteraction as Receipt;
+    assert.equal(waiting.status, 'awaiting_interaction');
+    assert.equal(interaction.kind, 'mcp_elicitation');
+    assert.equal(interaction.serverName, 'bigquery');
+    assert.equal(interaction.mode, 'form');
+    assert.equal(interaction.actionable, true);
+    const interactionRequestId = String(interaction.interactionRequestId);
+
+    await assert.rejects(
+      state.manager.interact({
+        agentRef: String(started.agentRef),
+        interactionRequestId,
+        action: 'accept',
+        content: { choice: 'three' },
+      }),
+      (error: unknown) =>
+        typeof error === 'object' &&
+        error !== null &&
+        'code' in error &&
+        error.code === 'AGENT_INTERACTION_CONTENT_INVALID',
+    );
+
+    const resumed = receipt(
+      await state.manager.interact({
+        agentRef: String(started.agentRef),
+        interactionRequestId,
+        action: 'accept',
+        content: { choice: 'one' },
+      }),
+    );
+    assert.equal(resumed.status, 'running');
+    assert.equal(resumed.pendingInteraction, undefined);
+    assert.deepEqual(server.responses.at(-1), {
+      id: 23,
+      value: { action: 'accept', content: { choice: 'one' }, _meta: null },
+    });
+    await assert.rejects(
+      state.manager.interact({
+        agentRef: String(started.agentRef),
+        interactionRequestId,
+        action: 'decline',
+      }),
+      (error: unknown) =>
+        typeof error === 'object' &&
+        error !== null &&
+        'code' in error &&
+        error.code === 'AGENT_INTERACTION_STALE',
+    );
+  } finally {
+    await state.cleanup();
+  }
+});
+
+test('MCP URL elicitation preserves the exact server URL and accepts no replacement content', async () => {
+  const state = await fixture();
+  try {
+    const started = receipt(
+      await state.manager.start({
+        workspaceId: 'a',
+        taskTitle: 'URL elicitation',
+        prompt: 'Use one MCP.',
+      }),
+    );
+    const server = state.official.latest(String(started.agentRef));
+    server.requestUrlElicitation();
+    const waiting = await eventually(
+      () =>
+        state.manager.show({
+          agentRef: String(started.agentRef),
+        }) as Promise<Receipt>,
+      (value) => typeof value.pendingInteraction === 'object',
+    );
+    const interaction = waiting.pendingInteraction as Receipt;
+    assert.equal(interaction.serverName, 'singular');
+    assert.equal(interaction.mode, 'url');
+    assert.equal(interaction.url, 'https://example.invalid/exact');
+    const interactionRequestId = String(interaction.interactionRequestId);
+
+    await assert.rejects(
+      state.manager.interact({
+        agentRef: String(started.agentRef),
+        interactionRequestId,
+        action: 'accept',
+        content: { url: 'https://attacker.invalid' },
+      }),
+      (error: unknown) =>
+        typeof error === 'object' &&
+        error !== null &&
+        'code' in error &&
+        error.code === 'AGENT_INTERACTION_CONTENT_INVALID',
+    );
+    await state.manager.interact({
+      agentRef: String(started.agentRef),
+      interactionRequestId,
+      action: 'accept',
+    });
+    assert.deepEqual(server.responses.at(-1), {
+      id: 24,
+      value: { action: 'accept', content: null, _meta: null },
+    });
   } finally {
     await state.cleanup();
   }
@@ -532,7 +688,7 @@ test('ten sequential terminal tasks deterministically tear down without session 
   }
 });
 
-test('revoked Workspace blocks send and approval but reject remains cleanup-safe', async () => {
+test('revoked Workspace blocks send and approval while reject remains cleanup-safe', async () => {
   const state = await fixture();
   try {
     const completed = receipt(
@@ -598,6 +754,54 @@ test('revoked Workspace blocks send and approval but reject remains cleanup-safe
       agentRef: String(active.agentRef),
       approvalRequestId: String(approval.approvalRequestId),
     });
+  } finally {
+    await state.cleanup();
+  }
+});
+
+test('revoked Workspace blocks MCP interaction accept while decline remains cleanup-safe', async () => {
+  const state = await fixture();
+  try {
+    const interactive = receipt(
+      await state.manager.start({
+        workspaceId: 'a',
+        taskTitle: 'Interaction target',
+        prompt: 'Request MCP input',
+      }),
+    );
+    const server = state.official.latest(String(interactive.agentRef));
+    server.requestFormElicitation();
+    const waiting = await eventually(
+      () =>
+        state.manager.show({
+          agentRef: String(interactive.agentRef),
+        }) as Promise<Receipt>,
+      (value) => typeof value.pendingInteraction === 'object',
+    );
+    const interaction = waiting.pendingInteraction as Receipt;
+    state.roots.delete('a');
+    state.generations.delete('a');
+    await assert.rejects(
+      state.manager.interact({
+        agentRef: String(interactive.agentRef),
+        interactionRequestId: String(interaction.interactionRequestId),
+        action: 'accept',
+        content: { choice: 'one' },
+      }),
+      (error: unknown) =>
+        typeof error === 'object' &&
+        error !== null &&
+        'code' in error &&
+        error.code === 'WORKSPACE_AUTH_REVOKED',
+    );
+    const declined = receipt(
+      await state.manager.interact({
+        agentRef: String(interactive.agentRef),
+        interactionRequestId: String(interaction.interactionRequestId),
+        action: 'decline',
+      }),
+    );
+    assert.equal(declined.status, 'running');
   } finally {
     await state.cleanup();
   }
@@ -717,6 +921,106 @@ test('restart normalizes persisted fake-running work without duplicating the tas
     assert.equal(shown.repoWriterReleased, true);
     const listed = receipt(await recovered.list({}));
     assert.equal((listed.items as unknown[]).length, 1);
+  } finally {
+    await recovered?.close();
+    await state.manager.close();
+    await rm(state.root, { recursive: true, force: true });
+  }
+});
+
+test('restart makes persisted MCP interaction non-actionable instead of replayable', async () => {
+  const state = await fixture();
+  let recovered: AgentManager | undefined;
+  try {
+    const started = receipt(
+      await state.manager.start({
+        workspaceId: 'a',
+        taskTitle: 'Persisted interaction',
+        prompt: 'Request input.',
+      }),
+    );
+    state.official.latest(String(started.agentRef)).requestFormElicitation();
+    const beforeRestart = await eventually(
+      () =>
+        state.manager.show({
+          agentRef: String(started.agentRef),
+        }) as Promise<Receipt>,
+      (value) => typeof value.pendingInteraction === 'object',
+    );
+    const interactionRequestId = String(
+      (beforeRestart.pendingInteraction as Receipt).interactionRequestId,
+    );
+    recovered = await AgentManager.create(state.options);
+    const shown = receipt(
+      await recovered.show({ agentRef: String(started.agentRef) }),
+    );
+    if (shown.pendingInteraction) {
+      const recoveredInteraction = shown.pendingInteraction as Receipt;
+      assert.equal(recoveredInteraction.actionable, false);
+      assert.equal(
+        recoveredInteraction.interactionRequestId,
+        interactionRequestId,
+      );
+    }
+    await assert.rejects(
+      recovered.interact({
+        agentRef: String(started.agentRef),
+        interactionRequestId,
+        action: 'decline',
+      }),
+      (error: unknown) =>
+        typeof error === 'object' &&
+        error !== null &&
+        'code' in error &&
+        error.code === 'AGENT_INTERACTION_STALE',
+    );
+  } finally {
+    await recovered?.close();
+    await state.cleanup();
+  }
+});
+
+test('legacy workspace-dev-v1 inventory remains readable after codex-native-v1 upgrade', async () => {
+  const state = await fixture();
+  let recovered: AgentManager | undefined;
+  try {
+    const started = receipt(
+      await state.manager.start({
+        workspaceId: 'a',
+        taskTitle: 'Legacy profile',
+        prompt: 'Complete.',
+      }),
+    );
+    state.official.latest(String(started.agentRef)).complete();
+    await eventually(
+      () =>
+        state.manager.show({
+          agentRef: String(started.agentRef),
+        }) as Promise<Receipt>,
+      (value) => value.officialSessionReleased === true,
+    );
+    await state.manager.close();
+    const inventoryPath = path.join(
+      state.root,
+      'state',
+      'codex-agent-inventory.json',
+    );
+    const document = JSON.parse(await readFile(inventoryPath, 'utf8')) as {
+      tasks: Array<Record<string, unknown>>;
+    };
+    assert.equal(document.tasks.length, 1);
+    document.tasks[0] = {
+      ...document.tasks[0],
+      capabilityProfile: 'workspace-dev-v1',
+    };
+    await writeFile(inventoryPath, `${JSON.stringify(document, null, 2)}\n`, {
+      mode: 0o600,
+    });
+    recovered = await AgentManager.create(state.options);
+    const shown = receipt(
+      await recovered.show({ agentRef: String(started.agentRef) }),
+    );
+    assert.equal(shown.capabilityProfile, 'workspace-dev-v1');
   } finally {
     await recovered?.close();
     await state.manager.close();

@@ -50,6 +50,11 @@ const agentErrorMessages = {
   AGENT_NOT_IDLE: 'Localink Agent task is not eligible for a new turn.',
   AGENT_NOT_TERMINAL: 'Localink Agent task is not terminal.',
   AGENT_APPROVAL_STALE: 'The Agent approval request is no longer current.',
+  AGENT_INTERACTION_STALE: 'The Agent interaction is no longer current.',
+  AGENT_INTERACTION_CONTENT_INVALID:
+    'The Agent interaction content does not satisfy the exact pending request.',
+  AGENT_INTERACTION_SCHEMA_UNSUPPORTED:
+    'The pending Agent interaction schema is not supported safely.',
   AGENT_INTERACTION_UNSUPPORTED:
     'This Agent interaction requires native handling.',
   AGENT_UNAVAILABLE: 'Localink Agent runtime is unavailable.',
@@ -670,6 +675,11 @@ export class PublicAdapter {
         const result = toolSchemas[name].safeParse(args);
         if (!result.success) invalidInput();
         return agentRuntime(this.runtime).reject(result.data);
+      }
+      case 'localink.agent_interact': {
+        const result = toolSchemas[name].safeParse(args);
+        if (!result.success) invalidInput();
+        return agentRuntime(this.runtime).interact(result.data);
       }
       case 'localink.agent_cancel': {
         const result = toolSchemas[name].safeParse(args);

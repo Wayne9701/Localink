@@ -234,7 +234,7 @@ test('image eligibility requires opt-in, native readOnly and Tier0 despite exact
 });
 
 test(
-  'rich stdio transport carries >1 MiB; default transport stays bounded; public surface remains 40',
+  'rich stdio transport carries >1 MiB; default transport stays bounded; public surface remains 41',
   { timeout: 30_000 },
   async () => {
     await withProvider(async (stateRoot) => {
@@ -260,7 +260,7 @@ test(
           tools.tools.map((tool) => tool.name),
           TOOL_NAMES,
         );
-        assert.equal(tools.tools.length, 40);
+        assert.equal(tools.tools.length, 41);
         const runtime = await createLocalinkRuntime({ stateRoot });
         const descriptor = runtime.capabilities
           .list()

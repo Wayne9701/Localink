@@ -109,7 +109,7 @@ export interface AgentTask {
   readonly archived: boolean;
   readonly desktopHistoryReady: boolean;
   readonly workspaceAuthorizationStatus: 'authorized' | 'revoked' | 'unknown';
-  readonly capabilityProfile: 'workspace-dev-v1';
+  readonly capabilityProfile: 'workspace-dev-v1' | 'codex-native-v1';
   readonly pendingApproval?:
     | {
         readonly approvalRequestId: string;
@@ -120,8 +120,22 @@ export interface AgentTask {
     | undefined;
   readonly pendingInteraction?:
     | {
+        readonly interactionRequestId: string;
         readonly kind: 'mcp_elicitation' | 'unknown';
+        readonly serverName?: string | undefined;
+        readonly mode?:
+          | 'form'
+          | 'url'
+          | 'openai/userVerification'
+          | 'openai/form'
+          | 'openaiForm'
+          | 'unknown'
+          | undefined;
         readonly summary: string;
+        readonly message?: string | undefined;
+        readonly url?: string | undefined;
+        readonly requestedSchema?: Record<string, unknown> | undefined;
+        readonly actionable: boolean;
       }
     | undefined;
   readonly lastAutoReview?:
@@ -184,6 +198,12 @@ export interface AgentApprovalInput extends AgentRefInput {
   readonly approvalRequestId: string;
 }
 
+export interface AgentInteractionInput extends AgentRefInput {
+  readonly interactionRequestId: string;
+  readonly action: 'accept' | 'decline' | 'cancel';
+  readonly content?: Record<string, unknown> | undefined;
+}
+
 export interface AgentController {
   start(input: AgentStartInput): Promise<unknown>;
   list(input: AgentListInput): Promise<unknown>;
@@ -192,6 +212,7 @@ export interface AgentController {
   send(input: AgentSendInput): Promise<unknown>;
   approve(input: AgentApprovalInput): Promise<unknown>;
   reject(input: AgentApprovalInput): Promise<unknown>;
+  interact(input: AgentInteractionInput): Promise<unknown>;
   cancel(input: AgentRefInput): Promise<unknown>;
   archive(input: AgentRefInput): Promise<unknown>;
   revokeWorkspace?(workspaceId: string): Promise<void>;

@@ -19,13 +19,14 @@ const AGENT_TOOLS = [
   'localink.agent_send',
   'localink.agent_approve',
   'localink.agent_reject',
+  'localink.agent_interact',
   'localink.agent_cancel',
   'localink.agent_archive',
 ] as const;
 
-test('Agent public surface is exact 40 with bounded strict schemas and conservative hints', () => {
-  assert.equal(TOOL_NAMES.length, 40);
-  assert.equal(new Set(TOOL_NAMES).size, 40);
+test('Agent public surface is exact 41 with bounded strict schemas and conservative hints', () => {
+  assert.equal(TOOL_NAMES.length, 41);
+  assert.equal(new Set(TOOL_NAMES).size, 41);
   assert.deepEqual(
     TOOL_NAMES.filter((name) => name.startsWith('localink.agent_')),
     AGENT_TOOLS,
@@ -124,6 +125,14 @@ test('Agent public surface is exact 40 with bounded strict schemas and conservat
         'localink.agent_reject',
         { agentRef: 'agent-1', approvalRequestId: 'opaque' },
       ],
+      [
+        'localink.agent_interact',
+        {
+          agentRef: 'agent-1',
+          interactionRequestId: 'interaction-1',
+          action: 'decline',
+        },
+      ],
       ['localink.agent_cancel', { agentRef: 'agent-1' }],
       ['localink.agent_archive', { agentRef: 'agent-1' }],
     ];
@@ -149,7 +158,7 @@ test('Agent public surface is exact 40 with bounded strict schemas and conservat
   );
 });
 
-test('Agent adapter dispatches all nine tools, defaults supervision and bounds each wait', async () => {
+test('Agent adapter dispatches all ten tools, defaults supervision and bounds each wait', async () => {
   const calls: Array<{ method: string; input: unknown }> = [];
   const record = (method: string, input: unknown) => {
     calls.push({ method, input });
@@ -163,6 +172,7 @@ test('Agent adapter dispatches all nine tools, defaults supervision and bounds e
     send: (input) => record('send', input),
     approve: (input) => record('approve', input),
     reject: (input) => record('reject', input),
+    interact: (input) => record('interact', input),
     cancel: (input) => record('cancel', input),
     archive: (input) => record('archive', input),
   };
@@ -186,6 +196,14 @@ test('Agent adapter dispatches all nine tools, defaults supervision and bounds e
     ['agent_send', { agentRef: 'agent-1', message: 'Continue.' }],
     ['agent_approve', { agentRef: 'agent-1', approvalRequestId: 'approval-1' }],
     ['agent_reject', { agentRef: 'agent-1', approvalRequestId: 'approval-2' }],
+    [
+      'agent_interact',
+      {
+        agentRef: 'agent-1',
+        interactionRequestId: 'interaction-1',
+        action: 'decline',
+      },
+    ],
     ['agent_cancel', { agentRef: 'agent-1' }],
     ['agent_archive', { agentRef: 'agent-1' }],
   ];
@@ -245,6 +263,7 @@ test('Agent optional runtime fails visibly; writer conflict exposes only safe id
     send: () => Promise.resolve({}),
     approve: () => Promise.resolve({}),
     reject: () => Promise.resolve({}),
+    interact: () => Promise.resolve({}),
     cancel: () => Promise.resolve({}),
     archive: () => Promise.resolve({}),
   };
@@ -278,6 +297,7 @@ test('Agent adapter preserves the public Workspace revocation error', async () =
     send: () => Promise.reject(revoked),
     approve: () => Promise.reject(revoked),
     reject: () => Promise.resolve({}),
+    interact: () => Promise.reject(revoked),
     cancel: () => Promise.resolve({}),
     archive: () => Promise.resolve({}),
   };
@@ -294,6 +314,15 @@ test('Agent adapter preserves the public Workspace revocation error', async () =
     [
       'localink.agent_approve',
       { agentRef: 'agent-1', approvalRequestId: 'approval-1' },
+    ],
+    [
+      'localink.agent_interact',
+      {
+        agentRef: 'agent-1',
+        interactionRequestId: 'interaction-1',
+        action: 'accept',
+        content: {},
+      },
     ],
   ] as const) {
     const result = envelope(await adapter.call(name, input));
