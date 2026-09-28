@@ -22,6 +22,7 @@ export interface ResolvedAgentWorkspace {
   readonly cwd: string;
   readonly workspaceRoot: string;
   readonly workspaceName: string;
+  readonly authorizationGeneration: string;
 }
 
 export interface AgentManagerOptions {
@@ -32,7 +33,13 @@ export interface AgentManagerOptions {
     workspaceId: string,
     relativeCwd?: string,
   ) => Promise<ResolvedAgentWorkspace>;
-  readonly clientFactory?: (callbacks: AppServerCallbacks) => AppServerPort;
+  readonly clientFactory?: (
+    callbacks: AppServerCallbacks,
+    launch: { readonly agentRef: string; readonly args: readonly string[] },
+  ) => AppServerPort;
+  readonly capabilityProjector?: () => Promise<{
+    readonly launchArgs: readonly string[];
+  }>;
 }
 
 export interface AppServerCallbacks {
@@ -54,6 +61,7 @@ export interface AppServerPort {
   ): Promise<unknown>;
   respond(id: string | number, result: unknown): void;
   respondError(id: string | number, code: number, message: string): void;
+  processId(): number | undefined;
   close(): Promise<void>;
 }
 
@@ -65,6 +73,9 @@ export interface AgentTask {
   readonly workspaceId: string;
   readonly workspaceName: string;
   readonly relativeCwd: string;
+  readonly canonicalWorkspaceRoot: string;
+  readonly canonicalCwd: string;
+  readonly workspaceAuthorizationGeneration: string;
   readonly canonicalRepoRoot: string;
   readonly repo: string;
   readonly supervisionMode: SupervisionMode;
@@ -79,9 +90,26 @@ export interface AgentTask {
       }
     | undefined;
   readonly status: AgentStatus;
+  readonly taskStatus: AgentStatus;
+  readonly turnStatus?: string | undefined;
   readonly terminal: boolean;
+  /** @deprecated Derived alias for repoWriterReleased. */
   readonly writerReleased: boolean;
+  readonly repoWriterReleased: boolean;
+  readonly taskAppServerState:
+    | 'starting'
+    | 'running'
+    | 'tearing_down'
+    | 'release_pending'
+    | 'stopped'
+    | 'crashed';
+  readonly taskAppServerPid?: number | undefined;
+  readonly officialSessionReleased: boolean;
+  readonly officialThreadLoadState: 'loaded' | 'notLoaded' | 'unknown';
   readonly archived: boolean;
+  readonly desktopHistoryReady: boolean;
+  readonly workspaceAuthorizationStatus: 'authorized' | 'revoked' | 'unknown';
+  readonly capabilityProfile: 'workspace-dev-v1';
   readonly pendingApproval?:
     | {
         readonly approvalRequestId: string;
@@ -110,6 +138,7 @@ export interface AgentTask {
   readonly terminalAt?: string | undefined;
   readonly finalResult?: string | undefined;
   readonly latestError?: string | undefined;
+  readonly lifecycleDiagnostics?: readonly string[] | undefined;
   readonly desktopMirror: {
     readonly status: 'pending' | 'confirmed' | 'degraded' | 'unsupported';
     readonly name?: string;
@@ -165,6 +194,7 @@ export interface AgentController {
   reject(input: AgentApprovalInput): Promise<unknown>;
   cancel(input: AgentRefInput): Promise<unknown>;
   archive(input: AgentRefInput): Promise<unknown>;
+  revokeWorkspace?(workspaceId: string): Promise<void>;
 }
 
 export class AgentError extends Error {

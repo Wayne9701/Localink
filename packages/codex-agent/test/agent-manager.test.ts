@@ -1,57 +1,80 @@
 import assert from 'node:assert/strict';
-import { mkdtemp, rm, stat } from 'node:fs/promises';
+import { mkdtemp, mkdir, rm } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import { AgentManager } from '../src/agent-manager.js';
-import { AppServerRpcError } from '../src/app-server-client.js';
 import type {
   AgentManagerOptions,
   AppServerCallbacks,
   AppServerPort,
 } from '../src/types.js';
 
+interface FakeTurn {
+  id: string;
+  status: 'inProgress' | 'completed' | 'failed' | 'interrupted';
+  items: Array<{ type: string; text: string }>;
+}
+
 interface FakeThread {
   id: string;
   cwd: string;
   name?: string;
-  section?: { id: string; name: string } | undefined;
-  status: { type: 'idle' | 'active' };
-  turns: Array<{
-    id: string;
-    status: 'inProgress' | 'completed' | 'failed' | 'interrupted';
-    items: Array<{ type: string; text: string }>;
-  }>;
+  section?: { id: string; name: string };
+  turns: FakeTurn[];
+}
+
+class FakeOfficialState {
+  readonly threads = new Map<string, FakeThread>();
+  readonly archived = new Set<string>();
+  readonly sections: Array<{ id: string; name: string }> = [];
+  readonly servers: FakeServer[] = [];
+  nextThread = 0;
+  nextTurn = 0;
+  projectionCalls = 0;
+
+  latest(ref: string): FakeServer {
+    const server = [...this.servers]
+      .reverse()
+      .find((candidate) => candidate.agentRef === ref);
+    if (!server) throw new Error(`No server for ${ref}`);
+    return server;
+  }
+
+  taskServers(): FakeServer[] {
+    return this.servers.filter((server) => server.agentRef !== 'metadata');
+  }
 }
 
 class FakeServer implements AppServerPort {
-  readonly threads = new Map<string, FakeThread>();
   readonly calls: Array<{ method: string; params: Record<string, unknown> }> =
     [];
   readonly responses: Array<{ id: string | number; value: unknown }> = [];
-  readonly sections: Array<{ id: string; name: string }> = [];
-  callbacks?: AppServerCallbacks;
   starts = 0;
-  closed = 0;
-  archives = 0;
+  closes = 0;
+  failClose = false;
   permissionMismatch = false;
   sectionFailure = false;
-  noExperimentalPermissions = false;
   turnStartUncertain = false;
-  nextThread = 0;
-  nextTurn = 0;
 
-  bind(callbacks: AppServerCallbacks): this {
-    this.callbacks = callbacks;
-    return this;
-  }
+  constructor(
+    readonly state: FakeOfficialState,
+    readonly agentRef: string,
+    readonly callbacks: AppServerCallbacks,
+    readonly launchArgs: readonly string[],
+  ) {}
 
   async start(): Promise<void> {
     this.starts++;
   }
 
+  processId(): number | undefined {
+    return undefined;
+  }
+
   async close(): Promise<void> {
-    this.closed++;
+    this.closes++;
+    if (this.failClose) throw new Error('fixture teardown failure');
   }
 
   respond(id: string | number, value: unknown): void {
@@ -77,14 +100,10 @@ class FakeServer implements AppServerPort {
       };
     }
     if (method === 'thread/start') {
-      if (this.noExperimentalPermissions && 'permissions' in params) {
-        throw new AppServerRpcError(-32602, 'permissions unavailable');
-      }
-      const id = `thread-${++this.nextThread}`;
-      this.threads.set(id, {
+      const id = `thread-${++this.state.nextThread}`;
+      this.state.threads.set(id, {
         id,
         cwd: String(params.cwd),
-        status: { type: 'idle' },
         turns: [],
       });
       return {
@@ -97,31 +116,38 @@ class FakeServer implements AppServerPort {
         sandbox: { type: 'workspaceWrite' },
       };
     }
-    if (method === 'threadSection/list') return { data: this.sections };
+    if (method === 'threadSection/list') return { data: this.state.sections };
     if (method === 'threadSection/create') {
-      if (this.sectionFailure) throw new Error('Section unavailable');
+      if (this.sectionFailure) throw new Error('section unavailable');
       const section = { id: 'section-1', name: String(params.name) };
-      this.sections.push(section);
+      this.state.sections.push(section);
       return { section };
     }
     if (method === 'thread/name/set') {
-      const thread = this.thread(String(params.threadId));
-      thread.name = String(params.name);
+      this.thread(String(params.threadId)).name = String(params.name);
       return {};
     }
     if (method === 'thread/section/move') {
-      const thread = this.thread(String(params.threadId));
-      thread.section = this.sections.find(
+      const section = this.state.sections.find(
         (section) => section.id === params.sectionId,
       );
+      if (section) this.thread(String(params.threadId)).section = section;
       return {};
     }
     if (method === 'thread/read') {
-      return { thread: this.thread(String(params.threadId)) };
+      const thread = this.thread(String(params.threadId));
+      const active = thread.turns.at(-1)?.status === 'inProgress';
+      return {
+        thread: {
+          ...thread,
+          status: { type: active ? 'active' : 'idle' },
+        },
+      };
     }
     if (method === 'thread/resume') {
+      const thread = this.thread(String(params.threadId));
       return {
-        thread: this.thread(String(params.threadId)),
+        thread: { ...thread, status: { type: 'idle' } },
         activePermissionProfile: { id: ':workspace' },
         approvalPolicy: 'on-request',
         approvalsReviewer: 'auto_review',
@@ -131,68 +157,105 @@ class FakeServer implements AppServerPort {
       return { data: this.thread(String(params.threadId)).turns };
     }
     if (method === 'turn/start') {
-      if (this.turnStartUncertain) {
-        throw new Error('The turn/start response was lost.');
-      }
+      if (this.turnStartUncertain) throw new Error('lost turn/start response');
       const thread = this.thread(String(params.threadId));
-      const turn = {
-        id: `turn-${++this.nextTurn}`,
-        status: 'inProgress' as const,
-        items: [] as Array<{ type: string; text: string }>,
+      const turn: FakeTurn = {
+        id: `turn-${++this.state.nextTurn}`,
+        status: 'inProgress',
+        items: [],
       };
       thread.turns.push(turn);
-      thread.status = { type: 'active' };
       return { turn };
     }
     if (method === 'turn/interrupt') {
-      const thread = this.thread(String(params.threadId));
-      const turn = thread.turns.find((item) => item.id === params.turnId);
+      const turn = this.thread(String(params.threadId)).turns.find(
+        (candidate) => candidate.id === params.turnId,
+      );
       if (turn) turn.status = 'interrupted';
-      thread.status = { type: 'idle' };
       return {};
     }
+    if (method === 'thread/list') {
+      const archived = params.archived === true;
+      const data = [...this.state.threads.values()]
+        .filter((thread) => this.state.archived.has(thread.id) === archived)
+        .map((thread) => ({
+          id: thread.id,
+          cwd: thread.cwd,
+          name: thread.name,
+          section: thread.section,
+          status: { type: 'notLoaded' },
+          updatedAt: '2026-09-28T00:00:00.000Z',
+        }));
+      return { data, nextCursor: null };
+    }
     if (method === 'thread/archive') {
-      this.archives++;
+      this.state.archived.add(String(params.threadId));
       return {};
     }
     throw new Error(`Unexpected fake method: ${method}`);
   }
 
   thread(id: string): FakeThread {
-    const thread = this.threads.get(id);
+    const thread = this.state.threads.get(id);
     if (!thread) throw new Error(`Unknown fake thread: ${id}`);
     return thread;
   }
 
-  complete(threadId: string, text = 'FIXED_RESULT'): void {
-    const thread = this.thread(threadId);
+  complete(text = 'FIXED_RESULT'): void {
+    const thread = [...this.state.threads.values()].find((candidate) =>
+      candidate.turns.some((turn) => turn.status === 'inProgress'),
+    );
+    if (!thread) throw new Error('No active turn');
     const turn = thread.turns.at(-1);
-    if (!turn) throw new Error('No fake turn');
+    if (!turn) throw new Error('No turn');
     turn.status = 'completed';
     turn.items = [{ type: 'agentMessage', text }];
-    thread.status = { type: 'idle' };
-    this.callbacks?.onNotification('turn/completed', {
-      threadId,
+    this.callbacks.onNotification('turn/completed', {
+      threadId: thread.id,
       turn: { ...turn },
+    });
+  }
+
+  requestApproval(): void {
+    const thread = [...this.state.threads.values()].find((candidate) =>
+      candidate.turns.some((turn) => turn.status === 'inProgress'),
+    );
+    const turn = thread?.turns.at(-1);
+    if (!thread || !turn) throw new Error('No active turn');
+    this.callbacks.onRequest(17, 'item/commandExecution/requestApproval', {
+      threadId: thread.id,
+      turnId: turn.id,
+      itemId: 'item-1',
+      command: 'true',
     });
   }
 }
 
-async function fixture(server = new FakeServer()): Promise<{
+interface Fixture {
   manager: AgentManager;
-  server: FakeServer;
-  root: string;
-  repoA: string;
-  repoB: string;
   options: AgentManagerOptions;
-  cleanup: () => Promise<void>;
-}> {
+  official: FakeOfficialState;
+  roots: Map<string, string>;
+  generations: Map<string, string>;
+  root: string;
+  cleanup(): Promise<void>;
+}
+
+async function fixture(): Promise<Fixture> {
   const root = await mkdtemp(path.join(os.tmpdir(), 'localink-agent-test-'));
   const repoA = path.join(root, 'repo-a');
   const repoB = path.join(root, 'repo-b');
-  const { mkdir } = await import('node:fs/promises');
   await mkdir(repoA);
   await mkdir(repoB);
+  const roots = new Map([
+    ['a', repoA],
+    ['b', repoB],
+  ]);
+  const generations = new Map([
+    ['a', 'generation-1'],
+    ['b', 'generation-1'],
+  ]);
+  const official = new FakeOfficialState();
   const options: AgentManagerOptions = {
     stateRoot: root,
     config: {
@@ -202,21 +265,50 @@ async function fixture(server = new FakeServer()): Promise<{
       permissionPreset: 'auto',
       sectionName: 'Localink Agents',
     },
-    resolveWorkspace: async (workspaceId) => ({
-      cwd: workspaceId === 'a' ? repoA : repoB,
-      workspaceRoot: workspaceId === 'a' ? repoA : repoB,
-      workspaceName: workspaceId === 'a' ? 'Workspace A' : 'Workspace B',
-    }),
-    clientFactory: (callbacks) => server.bind(callbacks),
+    resolveWorkspace: async (workspaceId) => {
+      const workspaceRoot = roots.get(workspaceId);
+      const authorizationGeneration = generations.get(workspaceId);
+      if (!workspaceRoot || !authorizationGeneration)
+        throw new Error('revoked');
+      return {
+        cwd: workspaceRoot,
+        workspaceRoot,
+        workspaceName: `Workspace ${workspaceId.toUpperCase()}`,
+        authorizationGeneration,
+      };
+    },
+    capabilityProjector: async () => {
+      official.projectionCalls++;
+      return {
+        launchArgs: [
+          '-c',
+          'features.plugins=false',
+          '-c',
+          'features.computer_use=false',
+          '-c',
+          'mcp_servers.engineering-bridge.enabled=false',
+        ],
+      };
+    },
+    clientFactory: (callbacks, launch) => {
+      const server = new FakeServer(
+        official,
+        launch.agentRef,
+        callbacks,
+        launch.args,
+      );
+      official.servers.push(server);
+      return server;
+    },
   };
   const manager = await AgentManager.create(options);
   return {
     manager,
-    server,
-    root,
-    repoA,
-    repoB,
     options,
+    official,
+    roots,
+    generations,
+    root,
     cleanup: async () => {
       await manager.close();
       await rm(root, { recursive: true, force: true });
@@ -227,376 +319,440 @@ async function fixture(server = new FakeServer()): Promise<{
 type Receipt = Record<string, unknown>;
 const receipt = (value: unknown) => value as Receipt;
 
-test('one managed server owns independent threads, enforces single writer, and releases on terminal without archive', async () => {
+async function eventually(
+  read: () => Promise<Receipt>,
+  predicate: (value: Receipt) => boolean,
+): Promise<Receipt> {
+  for (let attempt = 0; attempt < 100; attempt++) {
+    const value = await read();
+    if (predicate(value)) return value;
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+  throw new Error('condition not reached');
+}
+
+test('each active Agent owns one task App Server and different repos run in parallel', async () => {
   const state = await fixture();
   try {
     const first = receipt(
       await state.manager.start({
         workspaceId: 'a',
-        taskTitle: 'First task',
-        prompt: 'Write a note.',
+        taskTitle: 'First',
+        prompt: 'First prompt',
         supervisionMode: 'detached',
       }),
     );
-    assert.equal(state.server.starts, 1);
-    assert.equal(first.recommendedAction, 'handoff_to_user');
-    assert.deepEqual(first.effectivePermissions, {
-      activePermissionProfile: ':workspace',
-      approvalPolicy: 'on-request',
-      approvalsReviewer: 'auto_review',
-    });
-    assert.deepEqual(first.desktopMirror, {
-      status: 'confirmed',
-      name: 'First task',
-      section: 'Localink Agents',
-    });
     await assert.rejects(
-      () =>
-        state.manager.start({
-          workspaceId: 'a',
-          taskTitle: 'Second task',
-          prompt: 'Write another note.',
-        }),
+      state.manager.start({
+        workspaceId: 'a',
+        taskTitle: 'Conflict',
+        prompt: 'Conflict prompt',
+      }),
       (error: unknown) =>
         typeof error === 'object' &&
         error !== null &&
         'code' in error &&
         error.code === 'AGENT_WRITER_CONFLICT',
     );
-    const other = receipt(
+    const second = receipt(
       await state.manager.start({
         workspaceId: 'b',
-        taskTitle: 'Other repo',
-        prompt: 'Write in B.',
-        supervisionMode: 'inline',
+        taskTitle: 'Second',
+        prompt: 'Second prompt',
       }),
     );
-    assert.equal(state.server.starts, 1);
-    assert.notEqual(other.threadId, first.threadId);
-    assert.equal(other.recommendedAction, 'wait_bounded');
-    const inventory = await stat(
-      path.join(state.root, 'state', 'codex-agent-inventory.json'),
+    assert.notEqual(first.agentRef, second.agentRef);
+    assert.equal(state.official.taskServers().length, 2);
+    assert.equal(state.official.projectionCalls, 2);
+    assert.notEqual(
+      state.official.latest(String(first.agentRef)),
+      state.official.latest(String(second.agentRef)),
     );
-    assert.equal(inventory.mode & 0o077, 0);
-    state.server.complete(String(first.threadId));
-    const done = receipt(
-      await state.manager.show({ agentRef: String(first.agentRef) }),
+    assert.equal(
+      state.official.threads.get(String(first.threadId))?.name,
+      '[Localink] First',
     );
-    assert.equal(done.status, 'completed');
-    assert.equal(done.writerReleased, true);
-    assert.equal(done.archived, false);
-    assert.equal(done.finalResult, 'FIXED_RESULT');
-    assert.equal(state.server.archives, 0);
-    const list = receipt(await state.manager.list({}));
-    assert.equal((list.items as unknown[]).length, 2);
-    await state.manager.start({
-      workspaceId: 'a',
-      taskTitle: 'Third task',
-      prompt: 'Now allowed.',
-    });
-    assert.equal(state.server.sections.length, 1);
+    assert.equal((first.desktopMirror as Receipt).name, '[Localink] First');
   } finally {
     await state.cleanup();
   }
 });
 
-test('permission mismatch fails before turn and section errors degrade without losing a task', async () => {
-  const mismatch = await fixture();
+test('terminal persists before teardown and releases the repo only after process exit', async () => {
+  const state = await fixture();
   try {
-    mismatch.server.permissionMismatch = true;
-    await assert.rejects(
+    const started = receipt(
+      await state.manager.start({
+        workspaceId: 'a',
+        taskTitle: 'Complete',
+        prompt: 'Complete prompt',
+      }),
+    );
+    state.official.latest(String(started.agentRef)).complete('DONE');
+    const done = await eventually(
       () =>
-        mismatch.manager.start({
-          workspaceId: 'a',
-          taskTitle: 'Bad permission',
-          prompt: 'Never run.',
-        }),
+        state.manager.show({
+          agentRef: String(started.agentRef),
+        }) as Promise<Receipt>,
+      (value) => value.officialSessionReleased === true,
+    );
+    assert.equal(done.status, 'completed');
+    assert.equal(done.repoWriterReleased, true);
+    assert.equal(done.taskAppServerState, 'stopped');
+    assert.equal(done.officialThreadLoadState, 'notLoaded');
+    assert.equal(done.archived, false);
+    assert.equal(done.desktopHistoryReady, true);
+    await state.manager.start({
+      workspaceId: 'a',
+      taskTitle: 'Next',
+      prompt: 'Now allowed',
+    });
+  } finally {
+    await state.cleanup();
+  }
+});
+
+test('teardown failure keeps the same-repo writer lock and blocks archive', async () => {
+  const state = await fixture();
+  try {
+    const started = receipt(
+      await state.manager.start({
+        workspaceId: 'a',
+        taskTitle: 'Release pending',
+        prompt: 'Complete prompt',
+      }),
+    );
+    const server = state.official.latest(String(started.agentRef));
+    server.failClose = true;
+    server.complete();
+    const pending = await eventually(
+      () =>
+        state.manager.show({
+          agentRef: String(started.agentRef),
+        }) as Promise<Receipt>,
+      (value) => value.taskAppServerState === 'release_pending',
+    );
+    assert.equal(pending.repoWriterReleased, false);
+    assert.equal(pending.officialSessionReleased, false);
+    await assert.rejects(
+      state.manager.start({
+        workspaceId: 'a',
+        taskTitle: 'Blocked',
+        prompt: 'Must remain blocked',
+      }),
       (error: unknown) =>
         typeof error === 'object' &&
         error !== null &&
         'code' in error &&
-        error.code === 'PERMISSION_PROFILE_MISMATCH',
+        error.code === 'AGENT_WRITER_CONFLICT',
     );
-    assert.equal(
-      mismatch.server.calls.filter((entry) => entry.method === 'turn/start')
-        .length,
-      0,
+    await assert.rejects(
+      state.manager.archive({ agentRef: String(started.agentRef) }),
+      (error: unknown) =>
+        typeof error === 'object' &&
+        error !== null &&
+        'code' in error &&
+        error.code === 'AGENT_NOT_TERMINAL',
     );
-    const list = receipt(await mismatch.manager.list({}));
-    assert.equal((list.items as Receipt[])[0]?.status, 'failed');
-    assert.equal((list.items as Receipt[])[0]?.writerReleased, true);
   } finally {
-    await mismatch.cleanup();
-  }
-  const degraded = await fixture();
-  try {
-    degraded.server.sectionFailure = true;
-    const started = receipt(
-      await degraded.manager.start({
-        workspaceId: 'a',
-        taskTitle: 'Section degraded',
-        prompt: 'Still run.',
-      }),
-    );
-    assert.deepEqual(started.desktopMirror, {
-      status: 'degraded',
-      name: 'Section degraded',
+    state.official.servers.forEach((server) => {
+      server.failClose = false;
     });
-    assert.equal(started.status, 'running');
-  } finally {
-    await degraded.cleanup();
+    await state.cleanup();
   }
 });
 
-test('official legacy workspace fallback is used only for invalid experimental permissions', async () => {
+test('workspace-dev-v1 keeps the external MCP deny-all gate and excludes Engineering Bridge', async () => {
   const state = await fixture();
   try {
-    state.server.noExperimentalPermissions = true;
     const started = receipt(
       await state.manager.start({
         workspaceId: 'a',
-        taskTitle: 'Fallback task',
-        prompt: 'Do one thing.',
+        taskTitle: 'Isolated',
+        prompt: 'Isolated prompt',
       }),
     );
-    assert.equal(started.status, 'running');
-    const starts = state.server.calls.filter(
-      (entry) => entry.method === 'thread/start',
-    );
-    assert.equal(starts.length, 2);
-    assert.equal(starts[0]?.params.permissions, ':workspace');
-    assert.equal(starts[1]?.params.sandbox, 'workspace-write');
-    assert.equal(starts[1]?.params.approvalsReviewer, 'auto_review');
+    const args = state.official.latest(String(started.agentRef)).launchArgs;
+    assert.ok(args.includes('features.plugins=false'));
+    assert.ok(args.includes('features.computer_use=false'));
+    assert.ok(args.includes('mcp_servers.engineering-bridge.enabled=false'));
+    assert.equal(started.capabilityProfile, 'workspace-dev-v1');
   } finally {
     await state.cleanup();
   }
 });
 
-test('bounded wait, residual approval, elicitation, and explicit archive remain distinct', async () => {
+test('ten sequential terminal tasks deterministically tear down without session accumulation', async () => {
+  const state = await fixture();
+  try {
+    const completed: Receipt[] = [];
+    for (let index = 1; index <= 10; index++) {
+      const started = receipt(
+        await state.manager.start({
+          workspaceId: 'a',
+          taskTitle: `Tiny ${index}`,
+          prompt: 'Complete immediately',
+        }),
+      );
+      const server = state.official.latest(String(started.agentRef));
+      server.complete(`DONE_${index}`);
+      completed.push(
+        await eventually(
+          () =>
+            state.manager.show({
+              agentRef: String(started.agentRef),
+            }) as Promise<Receipt>,
+          (value) => value.officialSessionReleased === true,
+        ),
+      );
+      assert.equal(server.starts, 1);
+      assert.equal(server.closes, 1);
+    }
+    assert.equal(state.official.taskServers().length, 10);
+    assert.equal(
+      state.official.taskServers().filter((server) => server.closes === 1)
+        .length,
+      10,
+    );
+    assert.ok(
+      completed.every(
+        (task) =>
+          task.status === 'completed' &&
+          task.taskAppServerState === 'stopped' &&
+          task.officialSessionReleased === true &&
+          task.repoWriterReleased === true,
+      ),
+    );
+  } finally {
+    await state.cleanup();
+  }
+});
+
+test('revoked Workspace blocks send and approval but reject remains cleanup-safe', async () => {
+  const state = await fixture();
+  try {
+    const completed = receipt(
+      await state.manager.start({
+        workspaceId: 'a',
+        taskTitle: 'Resume target',
+        prompt: 'First turn',
+      }),
+    );
+    state.official.latest(String(completed.agentRef)).complete();
+    await eventually(
+      () =>
+        state.manager.show({
+          agentRef: String(completed.agentRef),
+        }) as Promise<Receipt>,
+      (value) => value.officialSessionReleased === true,
+    );
+    state.roots.delete('a');
+    state.generations.delete('a');
+    await assert.rejects(
+      state.manager.send({
+        agentRef: String(completed.agentRef),
+        message: 'Forbidden resume',
+      }),
+      (error: unknown) =>
+        typeof error === 'object' &&
+        error !== null &&
+        'code' in error &&
+        error.code === 'WORKSPACE_AUTH_REVOKED',
+    );
+
+    const active = receipt(
+      await state.manager.start({
+        workspaceId: 'b',
+        taskTitle: 'Approval target',
+        prompt: 'Request approval',
+      }),
+    );
+    const server = state.official.latest(String(active.agentRef));
+    server.requestApproval();
+    const waiting = await eventually(
+      () =>
+        state.manager.show({
+          agentRef: String(active.agentRef),
+        }) as Promise<Receipt>,
+      (value) => typeof value.pendingApproval === 'object',
+    );
+    const approval = waiting.pendingApproval as Receipt;
+    state.roots.delete('b');
+    state.generations.delete('b');
+    await assert.rejects(
+      state.manager.approve({
+        agentRef: String(active.agentRef),
+        approvalRequestId: String(approval.approvalRequestId),
+      }),
+      (error: unknown) =>
+        typeof error === 'object' &&
+        error !== null &&
+        'code' in error &&
+        error.code === 'WORKSPACE_AUTH_REVOKED',
+    );
+    await state.manager.reject({
+      agentRef: String(active.agentRef),
+      approvalRequestId: String(approval.approvalRequestId),
+    });
+  } finally {
+    await state.cleanup();
+  }
+});
+
+test('active Workspace revocation interrupts and tears down the owned process', async () => {
   const state = await fixture();
   try {
     const started = receipt(
       await state.manager.start({
         workspaceId: 'a',
-        taskTitle: 'Attention',
-        prompt: 'Wait for an action.',
-        supervisionMode: 'inline',
+        taskTitle: 'Revoked active',
+        prompt: 'Stay active',
       }),
     );
-    await assert.rejects(() =>
-      state.manager.wait({
-        agentRef: String(started.agentRef),
-        timeoutMs: 15001,
-      }),
-    );
-    assert.equal(
-      receipt(
-        await state.manager.wait({
-          agentRef: String(started.agentRef),
-          timeoutMs: 0,
-        }),
-      ).recommendedAction,
-      'wait_bounded',
-    );
-    state.server.callbacks?.onRequest(
-      17,
-      'item/commandExecution/requestApproval',
-      {
-        threadId: started.threadId,
-        turnId: state.server.thread(String(started.threadId)).turns[0]?.id,
-        itemId: 'item-1',
-        command: 'true',
-      },
-    );
-    let approval: Receipt | undefined;
-    for (let i = 0; i < 20; i++) {
-      approval = receipt(
-        await state.manager.show({ agentRef: String(started.agentRef) }),
-      );
-      if (approval.pendingApproval) break;
-      await new Promise((resolve) => setTimeout(resolve, 5));
-    }
-    assert.equal(approval?.recommendedAction, 'handle_approval');
-    const pending = approval?.pendingApproval as Receipt;
-    await assert.rejects(() =>
-      state.manager.approve({
-        agentRef: String(started.agentRef),
-        approvalRequestId: 'stale',
-      }),
-    );
-    await state.manager.reject({
-      agentRef: String(started.agentRef),
-      approvalRequestId: String(pending.approvalRequestId),
-    });
-    assert.deepEqual(state.server.responses[0], {
-      id: 17,
-      value: { decision: 'decline' },
-    });
-    state.server.callbacks?.onRequest(18, 'mcpServer/elicitation/request', {
-      mode: 'form',
-    });
-    for (let i = 0; i < 20; i++) {
-      const shown = receipt(
-        await state.manager.show({ agentRef: String(started.agentRef) }),
-      );
-      if (shown.pendingInteraction) break;
-      await new Promise((resolve) => setTimeout(resolve, 5));
-    }
-    const shown = receipt(
+    await state.manager.revokeWorkspace('a');
+    const revoked = receipt(
       await state.manager.show({ agentRef: String(started.agentRef) }),
     );
-    assert.equal((shown.pendingInteraction as Receipt).kind, 'mcp_elicitation');
-    assert.equal(shown.pendingApproval, undefined);
-    assert.equal(shown.recommendedAction, 'handoff_to_user');
-    assert.equal((state.server.responses[1]?.value as Receipt).code, -32601);
-    await assert.rejects(() =>
+    const server = state.official.latest(String(started.agentRef));
+    assert.equal(revoked.workspaceAuthorizationStatus, 'revoked');
+    assert.equal(revoked.status, 'cancelled');
+    assert.equal(revoked.officialSessionReleased, true);
+    assert.equal(revoked.repoWriterReleased, true);
+    assert.ok(server.calls.some((call) => call.method === 'turn/interrupt'));
+    assert.ok(server.closes >= 1);
+  } finally {
+    await state.cleanup();
+  }
+});
+
+test('terminal list/show reconcile external archive and unarchive without loading task runtime', async () => {
+  const state = await fixture();
+  try {
+    const started = receipt(
+      await state.manager.start({
+        workspaceId: 'a',
+        taskTitle: 'History',
+        prompt: 'Complete',
+      }),
+    );
+    state.official.latest(String(started.agentRef)).complete();
+    const done = await eventually(
+      () =>
+        state.manager.show({
+          agentRef: String(started.agentRef),
+        }) as Promise<Receipt>,
+      (value) => value.officialSessionReleased === true,
+    );
+    const threadId = String(done.threadId);
+    state.official.archived.add(threadId);
+    const archived = receipt(
+      await state.manager.show({ agentRef: String(started.agentRef) }),
+    );
+    assert.equal(archived.archived, true);
+    state.official.archived.delete(threadId);
+    const unarchived = receipt(
+      await state.manager.show({ agentRef: String(started.agentRef) }),
+    );
+    assert.equal(unarchived.archived, false);
+    assert.equal(unarchived.officialThreadLoadState, 'notLoaded');
+    assert.equal(
+      state.official.taskServers().filter((server) => server.starts > 0).length,
+      1,
+    );
+  } finally {
+    await state.cleanup();
+  }
+});
+
+test('restart normalizes persisted fake-running work without duplicating the task', async () => {
+  const state = await fixture();
+  let recovered: AgentManager | undefined;
+  try {
+    const started = receipt(
+      await state.manager.start({
+        workspaceId: 'a',
+        taskTitle: 'Persisted running',
+        prompt: 'Remain running',
+      }),
+    );
+    recovered = await AgentManager.create(state.options);
+    const shown = receipt(
+      await recovered.show({ agentRef: String(started.agentRef) }),
+    );
+    assert.equal(shown.status, 'unknown');
+    assert.equal(shown.officialSessionReleased, true);
+    assert.equal(shown.repoWriterReleased, true);
+    const listed = receipt(await recovered.list({}));
+    assert.equal((listed.items as unknown[]).length, 1);
+  } finally {
+    await recovered?.close();
+    await state.manager.close();
+    await rm(state.root, { recursive: true, force: true });
+  }
+});
+
+test('wait remains single-observation default-8s and hard-max-15s contract', async () => {
+  const state = await fixture();
+  try {
+    const started = receipt(
+      await state.manager.start({
+        workspaceId: 'a',
+        taskTitle: 'Wait',
+        prompt: 'Wait',
+      }),
+    );
+    await assert.rejects(
+      state.manager.wait({
+        agentRef: String(started.agentRef),
+        timeoutMs: 15_001,
+      }),
+    );
+    const immediate = receipt(
+      await state.manager.wait({
+        agentRef: String(started.agentRef),
+        timeoutMs: 0,
+      }),
+    );
+    assert.equal(immediate.recommendedAction, 'wait_bounded');
+    const waiting = state.manager.wait({ agentRef: String(started.agentRef) });
+    setTimeout(
+      () => state.official.latest(String(started.agentRef)).complete(),
+      10,
+    );
+    const result = receipt(await waiting);
+    assert.equal(result.status, 'completed');
+  } finally {
+    await state.cleanup();
+  }
+});
+
+test('archive is a governance action allowed only after terminal release', async () => {
+  const state = await fixture();
+  try {
+    const started = receipt(
+      await state.manager.start({
+        workspaceId: 'a',
+        taskTitle: 'Archive',
+        prompt: 'Complete',
+      }),
+    );
+    await assert.rejects(
       state.manager.archive({ agentRef: String(started.agentRef) }),
     );
-    state.server.complete(String(started.threadId));
-    await state.manager.show({ agentRef: String(started.agentRef) });
+    state.official.latest(String(started.agentRef)).complete();
+    await eventually(
+      () =>
+        state.manager.show({
+          agentRef: String(started.agentRef),
+        }) as Promise<Receipt>,
+      (value) => value.officialSessionReleased === true,
+    );
     const archived = receipt(
       await state.manager.archive({ agentRef: String(started.agentRef) }),
     );
     assert.equal(archived.archived, true);
-    assert.equal(state.server.archives, 1);
+    assert.equal(archived.officialSessionReleased, true);
   } finally {
-    await state.cleanup();
-  }
-});
-
-test('an uncertain turn/start keeps the repository writer reserved', async () => {
-  const state = await fixture();
-  try {
-    state.server.turnStartUncertain = true;
-    await assert.rejects(() =>
-      state.manager.start({
-        workspaceId: 'a',
-        taskTitle: 'Uncertain start',
-        prompt: 'Write a note.',
-      }),
-    );
-    const inbox = receipt(await state.manager.list({}));
-    const task = (inbox.items as Receipt[])[0];
-    assert.equal(task?.status, 'unknown');
-    assert.equal(task?.terminal, false);
-    assert.equal(task?.writerReleased, false);
-    await assert.rejects(
-      () =>
-        state.manager.start({
-          workspaceId: 'a',
-          taskTitle: 'Conflicting start',
-          prompt: 'Write another note.',
-        }),
-      (error: unknown) =>
-        typeof error === 'object' &&
-        error !== null &&
-        'code' in error &&
-        error.code === 'AGENT_WRITER_CONFLICT',
-    );
-  } finally {
-    await state.cleanup();
-  }
-});
-
-test('send resumes an owned idle thread with readback permissions and retains its model', async () => {
-  const state = await fixture();
-  try {
-    const started = receipt(
-      await state.manager.start({
-        workspaceId: 'a',
-        taskTitle: 'Follow-up task',
-        prompt: 'First turn.',
-      }),
-    );
-    state.server.complete(String(started.threadId), 'FIRST_DONE');
-    await state.manager.show({ agentRef: String(started.agentRef) });
-    const sent = receipt(
-      await state.manager.send({
-        agentRef: String(started.agentRef),
-        message: 'Second turn.',
-      }),
-    );
-    assert.equal(sent.threadId, started.threadId);
-    assert.equal(sent.status, 'running');
-    assert.equal(sent.writerReleased, false);
-    const resume = state.server.calls.find(
-      (entry) => entry.method === 'thread/resume',
-    );
-    assert.deepEqual(resume?.params, {
-      threadId: started.threadId,
-      permissions: ':workspace',
-      approvalPolicy: 'on-request',
-      approvalsReviewer: 'auto_review',
-      excludeTurns: true,
-    });
-    const turns = state.server.calls.filter(
-      (entry) => entry.method === 'turn/start',
-    );
-    assert.equal(turns.length, 2);
-    assert.equal(turns[1]?.params.model, turns[0]?.params.model);
-  } finally {
-    await state.cleanup();
-  }
-});
-
-test('crash hydrates owned work only, lost approvals stay nonactionable, and inbox survives restart', async () => {
-  const state = await fixture();
-  let replacement: AgentManager | undefined;
-  try {
-    state.server.threads.set('ordinary-user-thread', {
-      id: 'ordinary-user-thread',
-      cwd: state.repoA,
-      status: { type: 'idle' },
-      turns: [],
-    });
-    const started = receipt(
-      await state.manager.start({
-        workspaceId: 'a',
-        taskTitle: 'Recover me',
-        prompt: 'Keep working.',
-      }),
-    );
-    state.server.callbacks?.onRequest(91, 'item/fileChange/requestApproval', {
-      threadId: started.threadId,
-      turnId: state.server.thread(String(started.threadId)).turns[0]?.id,
-      itemId: 'item-approval',
-    });
-    for (let i = 0; i < 20; i++) {
-      const shown = receipt(
-        await state.manager.show({ agentRef: String(started.agentRef) }),
-      );
-      if (shown.pendingApproval) break;
-      await new Promise((resolve) => setTimeout(resolve, 5));
-    }
-    state.server.callbacks?.onCrash('fake crash');
-    const recovered = receipt(
-      await state.manager.show({ agentRef: String(started.agentRef) }),
-    );
-    assert.equal(state.server.starts, 2);
-    assert.equal(recovered.status, 'unknown');
-    assert.equal((recovered.pendingApproval as Receipt).actionable, false);
-    assert.equal(recovered.writerReleased, false);
-    await assert.rejects(() =>
-      state.manager.approve({
-        agentRef: String(started.agentRef),
-        approvalRequestId: String(
-          (recovered.pendingApproval as Receipt).approvalRequestId,
-        ),
-      }),
-    );
-    const inbox = receipt(await state.manager.list({}));
-    assert.equal((inbox.items as Receipt[]).length, 1);
-    assert.equal((inbox.items as Receipt[])[0]?.agentRef, started.agentRef);
-
-    state.server.complete(String(started.threadId));
-    await state.manager.show({ agentRef: String(started.agentRef) });
-    await state.manager.close();
-    replacement = await AgentManager.create(state.options);
-    const persisted = receipt(await replacement.list({}));
-    assert.equal((persisted.items as Receipt[])[0]?.status, 'completed');
-    assert.equal((persisted.items as Receipt[])[0]?.archived, false);
-  } finally {
-    await replacement?.close();
     await state.cleanup();
   }
 });

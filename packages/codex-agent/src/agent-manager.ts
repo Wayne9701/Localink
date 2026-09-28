@@ -9,6 +9,10 @@ import {
   ManagedAppServerClient,
 } from './app-server-client.js';
 import {
+  CAPABILITY_PROFILE,
+  projectWorkspaceDevCapabilities,
+} from './capability-profile.js';
+import {
   AgentError,
   type AgentApprovalInput,
   type AgentController,
@@ -20,7 +24,9 @@ import {
   type AgentStatus,
   type AgentTask,
   type AgentWaitInput,
+  type AppServerCallbacks,
   type AppServerPort,
+  type ResolvedAgentWorkspace,
 } from './types.js';
 
 const execFileAsync = promisify(execFile);
@@ -29,7 +35,9 @@ const MAX_PROMPT = 16 * 1024;
 const MAX_RESULT = 4096;
 const MAX_WAIT_MS = 15_000;
 const DEFAULT_WAIT_MS = 8_000;
-const MAX_RESTARTS = 2;
+const METADATA_TIMEOUT_MS = 5_000;
+const MAX_RECONCILE_PAGES = 10;
+const THREAD_NAME_PREFIX = '[Localink] ';
 const ACTIVE = new Set<AgentStatus>([
   'starting',
   'running',
@@ -54,6 +62,11 @@ interface ApprovalHandle {
   readonly params: Record<string, unknown>;
   readonly threadId: string;
   readonly turnId: string;
+}
+
+interface OfficialThreadMetadata {
+  readonly thread: Record<string, unknown>;
+  readonly archived: boolean;
 }
 
 function object(value: unknown): Record<string, unknown> {
@@ -100,13 +113,21 @@ function finalMessage(value: unknown): string | undefined {
     : undefined;
 }
 
+function diagnostics(task: AgentTask, next: string): readonly string[] {
+  return [...(task.lifecycleDiagnostics ?? []), next].slice(-10);
+}
+
+function threadDisplayName(taskTitle: string): string {
+  return `${THREAD_NAME_PREFIX}${taskTitle}`;
+}
+
 function action(task: AgentTask): string {
+  if (task.taskAppServerState === 'release_pending') return 'release_pending';
+  if (task.workspaceAuthorizationStatus === 'revoked') return 'cleanup_only';
   if (task.pendingApproval?.actionable) return 'handle_approval';
   if (task.pendingInteraction) return 'handoff_to_user';
   if (task.terminal) return 'verify_terminal';
   if (task.status === 'unknown') return 'diagnose_uncertain';
-  if (task.status === 'failed') return 'diagnose_error';
-  if (task.status === 'completed') return 'idle_ready_for_followup';
   if (task.supervisionMode === 'detached') return 'handoff_to_user';
   return 'wait_bounded';
 }
@@ -119,6 +140,8 @@ function publicTask(task: AgentTask, includeThreadId = false) {
     workspace: task.workspaceName,
     repo: task.repo,
     status: task.status,
+    taskStatus: task.taskStatus,
+    ...(task.turnStatus ? { turnStatus: task.turnStatus } : {}),
     attention: task.pendingApproval
       ? 'manual_approval'
       : task.pendingInteraction
@@ -128,13 +151,24 @@ function publicTask(task: AgentTask, includeThreadId = false) {
     recommendedAction: action(task),
     terminal: task.terminal,
     writerReleased: task.writerReleased,
+    writerReleasedDeprecated: true,
+    repoWriterReleased: task.repoWriterReleased,
+    taskAppServerState: task.taskAppServerState,
+    officialSessionReleased: task.officialSessionReleased,
+    officialThreadLoadState: task.officialThreadLoadState,
     archived: task.archived,
+    desktopHistoryReady: task.desktopHistoryReady,
+    workspaceAuthorizationStatus: task.workspaceAuthorizationStatus,
+    capabilityProfile: task.capabilityProfile,
     startedAt: task.startedAt,
     updatedAt: task.updatedAt,
     ...(task.lastProgressAt ? { lastProgressAt: task.lastProgressAt } : {}),
     ...(task.terminalAt ? { terminalAt: task.terminalAt } : {}),
     ...(task.finalResult ? { finalResult: task.finalResult } : {}),
     ...(task.latestError ? { latestError: task.latestError } : {}),
+    ...(task.lifecycleDiagnostics
+      ? { lifecycleDiagnostics: task.lifecycleDiagnostics }
+      : {}),
     ...(task.pendingApproval ? { pendingApproval: task.pendingApproval } : {}),
     ...(task.pendingInteraction
       ? { pendingInteraction: task.pendingInteraction }
@@ -171,18 +205,70 @@ async function repoKey(cwd: string, workspaceRoot: string): Promise<string> {
   }
 }
 
+async function canonicalWorkspace(workspace: ResolvedAgentWorkspace): Promise<
+  ResolvedAgentWorkspace & {
+    canonicalRoot: string;
+    canonicalCwd: string;
+    repo: string;
+  }
+> {
+  const canonicalRoot = await realpath(workspace.workspaceRoot);
+  const canonicalCwd = await realpath(workspace.cwd);
+  const relative = path.relative(canonicalRoot, canonicalCwd);
+  if (relative.startsWith('..') || path.isAbsolute(relative)) {
+    throw new AgentError(
+      'WORKSPACE_AUTH_REVOKED',
+      'Resolved Agent cwd is outside the authorized Workspace.',
+    );
+  }
+  return {
+    ...workspace,
+    canonicalRoot,
+    canonicalCwd,
+    repo: await repoKey(canonicalCwd, canonicalRoot),
+  };
+}
+
+function normalizePersisted(task: AgentTask): AgentTask {
+  const released = task.officialSessionReleased ?? task.terminal;
+  const repoReleased =
+    task.repoWriterReleased ?? task.writerReleased ?? released;
+  const status = task.status;
+  return {
+    ...task,
+    canonicalWorkspaceRoot:
+      task.canonicalWorkspaceRoot ?? task.canonicalRepoRoot,
+    canonicalCwd: task.canonicalCwd ?? task.canonicalRepoRoot,
+    workspaceAuthorizationGeneration:
+      task.workspaceAuthorizationGeneration ?? 'legacy',
+    taskStatus: task.taskStatus ?? status,
+    repoWriterReleased: repoReleased,
+    writerReleased: repoReleased,
+    taskAppServerState:
+      task.taskAppServerState ?? (released ? 'stopped' : 'release_pending'),
+    officialSessionReleased: released,
+    officialThreadLoadState:
+      task.officialThreadLoadState ?? (released ? 'notLoaded' : 'unknown'),
+    desktopHistoryReady:
+      task.desktopHistoryReady ?? (task.terminal && released && !task.archived),
+    workspaceAuthorizationStatus:
+      task.workspaceAuthorizationStatus ?? 'unknown',
+    capabilityProfile: CAPABILITY_PROFILE,
+  };
+}
+
 export class AgentManager implements AgentController {
   readonly #options: AgentManagerOptions;
   readonly #inventory: AgentInventory;
   readonly #tasks = new Map<string, AgentTask>();
+  readonly #sessions = new Map<string, AppServerPort>();
+  readonly #sessionStarts = new Map<string, Promise<AppServerPort>>();
+  readonly #releaseStarts = new Map<string, Promise<AgentTask>>();
   readonly #handles = new Map<string, ApprovalHandle>();
   readonly #waiters = new Map<string, Set<() => void>>();
-  #client: AppServerPort | undefined;
-  #clientStart: Promise<AppServerPort> | undefined;
   #sectionId: string | undefined;
   #sectionPromise: Promise<string> | undefined;
   #models: readonly ModelCatalogEntry[] | undefined;
-  #restartCount = 0;
   #closed = false;
   #degradedReason: string | undefined;
   #tail: Promise<void> = Promise.resolve();
@@ -194,9 +280,12 @@ export class AgentManager implements AgentController {
 
   static async create(options: AgentManagerOptions): Promise<AgentManager> {
     const manager = new AgentManager(options);
-    for (const task of await manager.#inventory.read()) {
+    const persisted = await manager.#inventory.read();
+    for (const raw of persisted) {
+      const task = normalizePersisted(raw);
       manager.#tasks.set(task.agentRef, task);
     }
+    if (persisted.length > 0) await manager.#recoverPersisted();
     if (options.config.enabled && !options.config.codexExecutable) {
       manager.#degradedReason = 'CODEX_EXECUTABLE_MISSING';
     }
@@ -218,9 +307,18 @@ export class AgentManager implements AgentController {
       for (const callback of callbacks) callback();
     }
     this.#waiters.clear();
-    const client = this.#client;
-    this.#client = undefined;
-    if (client) await client.close();
+    for (const [ref, client] of [...this.#sessions]) {
+      const task = this.#tasks.get(ref);
+      if (task && !task.terminal) {
+        await this.#change(ref, {
+          status: 'unknown',
+          lifecycleIntegrity: 'uncertain',
+          latestError: 'MANAGER_SHUTDOWN_INTERRUPTED',
+          lifecycleDiagnostics: diagnostics(task, 'manager_shutdown'),
+        });
+      }
+      await this.#releaseSession(ref, client).catch(() => undefined);
+    }
   }
 
   async #mutate<T>(operation: () => Promise<T>): Promise<T> {
@@ -239,6 +337,10 @@ export class AgentManager implements AgentController {
     return task;
   }
 
+  async #persistAll(): Promise<void> {
+    await this.#inventory.write([...this.#tasks.values()]);
+  }
+
   async #change(
     ref: string,
     changes: Partial<AgentTask>,
@@ -246,16 +348,30 @@ export class AgentManager implements AgentController {
   ): Promise<AgentTask> {
     return this.#mutate(async () => {
       const previous = this.#require(ref);
+      const status = changes.status ?? previous.status;
+      const released =
+        changes.officialSessionReleased ?? previous.officialSessionReleased;
+      const archived = changes.archived ?? previous.archived;
+      const terminal = changes.terminal ?? previous.terminal;
+      const repoWriterReleased =
+        changes.repoWriterReleased ??
+        changes.writerReleased ??
+        previous.repoWriterReleased;
       const next: AgentTask = {
         ...previous,
         ...changes,
+        status,
+        taskStatus: status,
+        repoWriterReleased,
+        writerReleased: repoWriterReleased,
+        desktopHistoryReady: terminal && released && !archived,
         updatedAt: now(),
         nextSeq: previous.nextSeq + 1,
         ...(progress ? { lastProgressAt: now() } : {}),
       };
       this.#tasks.set(ref, next);
       try {
-        await this.#inventory.write([...this.#tasks.values()]);
+        await this.#persistAll();
       } catch (error) {
         this.#tasks.set(ref, previous);
         throw error;
@@ -265,124 +381,292 @@ export class AgentManager implements AgentController {
     });
   }
 
-  async #ensureClient(): Promise<AppServerPort> {
-    if (this.#closed)
-      throw new AgentError('AGENT_UNAVAILABLE', 'Manager is closed.');
-    if (!this.#options.config.enabled)
-      throw new AgentError('AGENT_DISABLED', 'Agent runtime is disabled.');
-    if (!this.#options.config.codexExecutable)
+  async #recoverPersisted(): Promise<void> {
+    for (const task of [...this.#tasks.values()]) {
+      let released = true;
+      if (task.taskAppServerPid !== undefined) {
+        released = await this.#terminateProcessGroup(
+          task.taskAppServerPid,
+        ).then(
+          () => true,
+          () => false,
+        );
+      }
+      if (!task.terminal) {
+        this.#tasks.set(task.agentRef, {
+          ...task,
+          status: 'unknown',
+          taskStatus: 'unknown',
+          repoWriterReleased: released,
+          writerReleased: released,
+          taskAppServerState: released ? 'stopped' : 'release_pending',
+          ...(released ? { taskAppServerPid: undefined } : {}),
+          officialSessionReleased: released,
+          officialThreadLoadState: released ? 'notLoaded' : 'unknown',
+          workspaceAuthorizationStatus: 'unknown',
+          lifecycleIntegrity: 'uncertain',
+          latestError: released
+            ? 'RECOVERY_SESSION_NOT_REATTACHED'
+            : 'TASK_APP_SERVER_RELEASE_PENDING',
+          lifecycleDiagnostics: diagnostics(
+            task,
+            released
+              ? 'persisted_session_released_on_startup'
+              : 'persisted_process_tree_exit_unconfirmed',
+          ),
+          updatedAt: now(),
+          nextSeq: task.nextSeq + 1,
+        });
+      } else if (!task.officialSessionReleased || !released) {
+        this.#tasks.set(task.agentRef, {
+          ...task,
+          repoWriterReleased: released,
+          writerReleased: released,
+          taskAppServerState: released ? 'stopped' : 'release_pending',
+          ...(released ? { taskAppServerPid: undefined } : {}),
+          officialSessionReleased: released,
+          officialThreadLoadState: released ? 'notLoaded' : 'unknown',
+          desktopHistoryReady: released && !task.archived,
+          latestError: released
+            ? task.latestError
+            : 'TASK_APP_SERVER_RELEASE_PENDING',
+          lifecycleDiagnostics: diagnostics(
+            task,
+            released
+              ? 'terminal_session_recovered'
+              : 'terminal_process_tree_exit_unconfirmed',
+          ),
+          updatedAt: now(),
+          nextSeq: task.nextSeq + 1,
+        });
+      }
+    }
+    await this.#persistAll();
+  }
+
+  async #terminateProcessGroup(pid: number): Promise<void> {
+    if (!Number.isSafeInteger(pid) || pid < 2 || process.platform === 'win32') {
+      return;
+    }
+    try {
+      process.kill(-pid, 'SIGTERM');
+    } catch (error) {
+      if (object(error).code === 'ESRCH') return;
+      throw error;
+    }
+    for (let attempt = 0; attempt < 20; attempt++) {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      try {
+        process.kill(-pid, 0);
+      } catch (error) {
+        if (object(error).code === 'ESRCH') return;
+        throw error;
+      }
+    }
+    try {
+      process.kill(-pid, 'SIGKILL');
+    } catch (error) {
+      if (object(error).code !== 'ESRCH') throw error;
+    }
+    for (let attempt = 0; attempt < 20; attempt++) {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      try {
+        process.kill(-pid, 0);
+      } catch (error) {
+        if (object(error).code === 'ESRCH') return;
+        throw error;
+      }
+    }
+    throw new Error('Persisted App Server process group did not exit');
+  }
+
+  async #launchArgs(): Promise<readonly string[]> {
+    if (!this.#options.config.codexExecutable) {
       throw new AgentError(
         'AGENT_UNAVAILABLE',
         'Codex executable is unavailable.',
       );
-    if (this.#client) return this.#client;
-    if (this.#clientStart) return this.#clientStart;
-    if (this.#restartCount >= MAX_RESTARTS)
-      throw new AgentError(
-        'AGENT_UNAVAILABLE',
-        'App Server restart limit reached.',
-      );
+    }
+    try {
+      const projection = this.#options.capabilityProjector
+        ? await this.#options.capabilityProjector()
+        : await projectWorkspaceDevCapabilities(
+            this.#options.config.codexExecutable,
+            this.#options.environment,
+          );
+      return projection.launchArgs;
+    } catch (error) {
+      this.#degradedReason = 'CAPABILITY_ISOLATION_UNAVAILABLE';
+      throw error;
+    }
+  }
+
+  #callbacks(ref: string, client: () => AppServerPort | undefined) {
+    return {
+      onNotification: (method: string, params: unknown) => {
+        void this.#notification(ref, method, params).catch(() => undefined);
+      },
+      onRequest: (id: string | number, method: string, params: unknown) => {
+        void this.#request(ref, client(), id, method, params).catch(() => {
+          try {
+            client()?.respondError(
+              id,
+              -32603,
+              'Localink could not record the interaction.',
+            );
+          } catch {
+            // A released process has no request to answer.
+          }
+        });
+      },
+      onCrash: (reason: string) => {
+        const active = client();
+        if (!active) return;
+        void this.#handleCrash(ref, active, reason).catch(() => undefined);
+      },
+    } satisfies AppServerCallbacks;
+  }
+
+  async #createSession(ref: string): Promise<AppServerPort> {
+    if (this.#closed)
+      throw new AgentError('AGENT_UNAVAILABLE', 'Manager is closed.');
+    if (!this.#options.config.enabled)
+      throw new AgentError('AGENT_DISABLED', 'Agent runtime is disabled.');
+    const existing = this.#sessions.get(ref);
+    if (existing) return existing;
+    const starting = this.#sessionStarts.get(ref);
+    if (starting) return starting;
     const start = (async () => {
-      const callbacks = {
-        onNotification: (method: string, params: unknown) => {
-          void this.#notification(method, params).catch(() => undefined);
-        },
-        onRequest: (id: string | number, method: string, params: unknown) => {
-          void this.#request(id, method, params).catch(() => {
-            try {
-              this.#client?.respondError(
-                id,
-                -32603,
-                'Localink could not record the interaction.',
-              );
-            } catch {
-              // A crashed server has no request to answer.
-            }
-            void this.#markActiveUnknown().catch(() => undefined);
-          });
-        },
-        onCrash: () => {
-          this.#client = undefined;
-          this.#models = undefined;
-          this.#sectionId = undefined;
-          this.#sectionPromise = undefined;
-          this.#restartCount++;
-          this.#degradedReason = 'APP_SERVER_CRASH';
-          void this.#markActiveUnknown().catch(() => undefined);
-        },
-      };
+      const args = await this.#launchArgs();
+      const holder: { client?: AppServerPort } = {};
+      const callbacks = this.#callbacks(ref, () => holder.client);
       const client =
-        this.#options.clientFactory?.(callbacks) ??
+        this.#options.clientFactory?.(callbacks, { agentRef: ref, args }) ??
         new ManagedAppServerClient({
           executable: this.#options.config.codexExecutable ?? '',
+          launchArgs: args,
           ...(this.#options.environment
             ? { environment: this.#options.environment }
             : {}),
           ...callbacks,
         });
+      holder.client = client;
       await client.start();
-      this.#client = client;
+      this.#sessions.set(ref, client);
+      await this.#change(ref, {
+        taskAppServerState: 'running',
+        taskAppServerPid: client.processId(),
+        officialSessionReleased: false,
+        officialThreadLoadState: 'loaded',
+      });
       this.#degradedReason = undefined;
-      await this.#tail;
-      await this.#hydrate(client);
       return client;
     })();
-    this.#clientStart = start;
+    this.#sessionStarts.set(ref, start);
     try {
       return await start;
-    } catch {
-      const client = this.#client as AppServerPort | undefined;
-      this.#client = undefined;
-      if (client) await client.close().catch(() => undefined);
-      this.#restartCount++;
-      this.#degradedReason = 'APP_SERVER_START_FAILED';
-      throw new AgentError('AGENT_UNAVAILABLE', 'App Server could not start.');
+    } catch (error) {
+      this.#degradedReason =
+        error instanceof AgentError &&
+        error.code === 'CAPABILITY_ISOLATION_UNAVAILABLE'
+          ? 'CAPABILITY_ISOLATION_UNAVAILABLE'
+          : 'APP_SERVER_START_FAILED';
+      throw error;
     } finally {
-      this.#clientStart = undefined;
+      this.#sessionStarts.delete(ref);
     }
   }
 
-  async #markActiveUnknown(): Promise<void> {
-    for (const task of this.#tasks.values()) {
-      if (task.archived || task.terminal) continue;
-      await this.#change(task.agentRef, {
-        status: 'unknown',
-        lifecycleIntegrity: 'uncertain',
-        pendingApproval: task.pendingApproval
-          ? { ...task.pendingApproval, actionable: false }
-          : undefined,
-        latestError: 'APP_SERVER_CRASH',
-      });
-    }
-    this.#handles.clear();
+  async #handleCrash(
+    ref: string,
+    client: AppServerPort,
+    reason: string,
+  ): Promise<void> {
+    if (this.#sessions.get(ref) !== client) return;
+    const task = this.#require(ref);
+    await this.#change(ref, {
+      status: task.terminal ? task.status : 'unknown',
+      taskAppServerState: 'crashed',
+      lifecycleIntegrity: 'uncertain',
+      latestError: 'TASK_APP_SERVER_CRASH',
+      pendingApproval: task.pendingApproval
+        ? { ...task.pendingApproval, actionable: false }
+        : undefined,
+      lifecycleDiagnostics: diagnostics(
+        task,
+        `app_server_crash:${bounded(reason, 120)}`,
+      ),
+    });
+    this.#handlesFor(ref).forEach((id) => this.#handles.delete(id));
+    await this.#releaseSession(ref, client);
   }
 
-  async #hydrate(client: AppServerPort): Promise<void> {
-    for (const task of this.#tasks.values()) {
-      if (task.archived || task.terminal) continue;
-      if (task.writerReleased) {
-        await this.#change(task.agentRef, {
-          status: 'unknown',
-          lifecycleIntegrity: 'uncertain',
-          latestError: 'LIFECYCLE_INTEGRITY_UNCERTAIN',
+  #handlesFor(ref: string): string[] {
+    const task = this.#tasks.get(ref);
+    if (!task?.threadId) return [];
+    return [...this.#handles]
+      .filter(([, handle]) => handle.threadId === task.threadId)
+      .map(([id]) => id);
+  }
+
+  async #releaseSession(
+    ref: string,
+    expected?: AppServerPort,
+  ): Promise<AgentTask> {
+    const pending = this.#releaseStarts.get(ref);
+    if (pending) return pending;
+    const release = (async () => {
+      const client = expected ?? this.#sessions.get(ref);
+      if (!client) {
+        return await this.#change(ref, {
+          taskAppServerState: 'stopped',
+          taskAppServerPid: undefined,
+          officialSessionReleased: true,
+          officialThreadLoadState: 'notLoaded',
+          repoWriterReleased: true,
         });
-        continue;
       }
-      if (task.pendingApproval) {
-        await this.#change(task.agentRef, {
-          pendingApproval: { ...task.pendingApproval, actionable: false },
-          status: 'unknown',
-          lifecycleIntegrity: 'uncertain',
-          latestError: 'APPROVAL_HANDLE_LOST',
-        });
-      }
-      await this.#refresh(task.agentRef, client).catch(async () => {
-        await this.#change(task.agentRef, {
-          status: 'unknown',
-          lifecycleIntegrity: 'uncertain',
-          latestError: 'OFFICIAL_READBACK_UNAVAILABLE',
-        });
+      await this.#change(ref, {
+        taskAppServerState: 'tearing_down',
+        officialSessionReleased: false,
+        repoWriterReleased: false,
       });
+      try {
+        await client.close();
+        if (this.#sessions.get(ref) === client) this.#sessions.delete(ref);
+        this.#handlesFor(ref).forEach((id) => this.#handles.delete(id));
+        return await this.#change(ref, {
+          taskAppServerState: 'stopped',
+          taskAppServerPid: undefined,
+          officialSessionReleased: true,
+          officialThreadLoadState: 'notLoaded',
+          repoWriterReleased: true,
+          pendingApproval: undefined,
+          lifecycleDiagnostics: diagnostics(
+            this.#require(ref),
+            'official_session_released',
+          ),
+        });
+      } catch {
+        return await this.#change(ref, {
+          taskAppServerState: 'release_pending',
+          officialSessionReleased: false,
+          officialThreadLoadState: 'unknown',
+          repoWriterReleased: false,
+          latestError: 'TASK_APP_SERVER_RELEASE_PENDING',
+          lifecycleIntegrity: 'uncertain',
+          lifecycleDiagnostics: diagnostics(
+            this.#require(ref),
+            'owned_process_tree_exit_unconfirmed',
+          ),
+        });
+      }
+    })();
+    this.#releaseStarts.set(ref, release);
+    try {
+      return await release;
+    } finally {
+      this.#releaseStarts.delete(ref);
     }
   }
 
@@ -469,9 +753,10 @@ export class AgentManager implements AgentController {
           .find((section) => section.name === this.#options.config.sectionName);
         if (found) {
           const id = string(found.id);
-          if (!id) break;
-          this.#sectionId = id;
-          return id;
+          if (id) {
+            this.#sectionId = id;
+            return id;
+          }
         }
         cursor = string(result.nextCursor);
         if (!cursor) break;
@@ -500,38 +785,27 @@ export class AgentManager implements AgentController {
   async #mirror(ref: string, client: AppServerPort): Promise<void> {
     const task = this.#require(ref);
     if (!task.threadId) return;
+    const displayName = threadDisplayName(task.taskTitle);
     try {
       await client.request('thread/name/set', {
         threadId: task.threadId,
-        name: task.taskTitle,
+        name: displayName,
       });
       const sectionId = await this.#ensureSection(client);
       await client.request('thread/section/move', {
         threadId: task.threadId,
         sectionId,
       });
-      const read = object(
-        await client.request('thread/read', { threadId: task.threadId }),
-      );
-      const thread = object(read.thread);
-      const section = object(thread.section);
-      if (
-        thread.name !== task.taskTitle ||
-        section.id !== sectionId ||
-        section.name !== this.#options.config.sectionName
-      ) {
-        throw new Error('Section readback mismatch.');
-      }
       await this.#change(ref, {
         desktopMirror: {
           status: 'confirmed',
-          name: task.taskTitle,
+          name: displayName,
           section: this.#options.config.sectionName,
         },
       });
     } catch {
       await this.#change(ref, {
-        desktopMirror: { status: 'degraded', name: task.taskTitle },
+        desktopMirror: { status: 'degraded', name: displayName },
       });
     }
   }
@@ -604,6 +878,74 @@ export class AgentManager implements AgentController {
     return { threadId, effective };
   }
 
+  async #resolveAuthorized(
+    workspaceId: string,
+    relativeCwd?: string,
+  ): Promise<Awaited<ReturnType<typeof canonicalWorkspace>>> {
+    try {
+      return await canonicalWorkspace(
+        await this.#options.resolveWorkspace(workspaceId, relativeCwd),
+      );
+    } catch (error) {
+      if (
+        error instanceof AgentError &&
+        error.code === 'WORKSPACE_AUTH_REVOKED'
+      ) {
+        throw error;
+      }
+      throw new AgentError(
+        'WORKSPACE_AUTH_REVOKED',
+        'Workspace authorization is no longer valid.',
+      );
+    }
+  }
+
+  async #authorizeTask(ref: string): Promise<AgentTask> {
+    const task = this.#require(ref);
+    try {
+      const current = await this.#resolveAuthorized(
+        task.workspaceId,
+        task.relativeCwd || undefined,
+      );
+      if (
+        current.canonicalRoot !== task.canonicalWorkspaceRoot ||
+        current.canonicalCwd !== task.canonicalCwd ||
+        current.repo !== task.canonicalRepoRoot
+      ) {
+        throw new AgentError(
+          'WORKSPACE_AUTH_REVOKED',
+          'Workspace identity changed after Agent creation.',
+        );
+      }
+      if (
+        task.workspaceAuthorizationStatus !== 'authorized' ||
+        task.workspaceAuthorizationGeneration !==
+          current.authorizationGeneration
+      ) {
+        return await this.#change(ref, {
+          workspaceAuthorizationStatus: 'authorized',
+          workspaceAuthorizationGeneration: current.authorizationGeneration,
+        });
+      }
+      return task;
+    } catch (error) {
+      await this.#change(ref, {
+        workspaceAuthorizationStatus: 'revoked',
+        latestError: 'WORKSPACE_AUTH_REVOKED',
+        lifecycleDiagnostics: diagnostics(
+          task,
+          'workspace_authorization_revoked',
+        ),
+      });
+      throw error instanceof AgentError
+        ? error
+        : new AgentError(
+            'WORKSPACE_AUTH_REVOKED',
+            'Workspace authorization is no longer valid.',
+          );
+    }
+  }
+
   async start(input: AgentStartInput): Promise<unknown> {
     if (
       !input.taskTitle?.trim() ||
@@ -616,17 +958,9 @@ export class AgentManager implements AgentController {
         'Task title or prompt is invalid.',
       );
     }
-    const client = await this.#ensureClient();
-    const workspace = await this.#options.resolveWorkspace(
+    const workspace = await this.#resolveAuthorized(
       input.workspaceId,
       input.relativeCwd,
-    );
-    const key = await repoKey(workspace.cwd, workspace.workspaceRoot);
-    const choice = await this.#model(
-      client,
-      input.model,
-      input.reasoningEffort,
-      input.invocationRationale,
     );
     const timestamp = now();
     const initial: AgentTask = {
@@ -635,16 +969,25 @@ export class AgentManager implements AgentController {
       workspaceId: input.workspaceId,
       workspaceName: workspace.workspaceName,
       relativeCwd: input.relativeCwd ?? '',
-      canonicalRepoRoot: key,
-      repo: path.basename(key),
+      canonicalWorkspaceRoot: workspace.canonicalRoot,
+      canonicalCwd: workspace.canonicalCwd,
+      workspaceAuthorizationGeneration: workspace.authorizationGeneration,
+      canonicalRepoRoot: workspace.repo,
+      repo: path.basename(workspace.repo),
       supervisionMode: input.supervisionMode ?? 'auto',
-      model: choice.model,
-      reasoningEffort: choice.effort,
       permissionPreset: 'auto',
       status: 'starting',
+      taskStatus: 'starting',
       terminal: false,
       writerReleased: false,
+      repoWriterReleased: false,
+      taskAppServerState: 'starting',
+      officialSessionReleased: false,
+      officialThreadLoadState: 'unknown',
       archived: false,
+      desktopHistoryReady: false,
+      workspaceAuthorizationStatus: 'authorized',
+      capabilityProfile: CAPABILITY_PROFILE,
       lifecycleIntegrity: 'confirmed',
       startedAt: timestamp,
       updatedAt: timestamp,
@@ -655,8 +998,8 @@ export class AgentManager implements AgentController {
       const conflict = [...this.#tasks.values()].find(
         (task) =>
           !task.archived &&
-          !task.writerReleased &&
-          task.canonicalRepoRoot === key,
+          !task.repoWriterReleased &&
+          task.canonicalRepoRoot === workspace.repo,
       );
       if (conflict) {
         throw new AgentError(
@@ -671,7 +1014,7 @@ export class AgentManager implements AgentController {
       }
       this.#tasks.set(initial.agentRef, initial);
       try {
-        await this.#inventory.write([...this.#tasks.values()]);
+        await this.#persistAll();
       } catch (error) {
         this.#tasks.delete(initial.agentRef);
         throw error;
@@ -679,9 +1022,20 @@ export class AgentManager implements AgentController {
     });
     let turnStartAttempted = false;
     try {
+      const client = await this.#createSession(initial.agentRef);
+      const choice = await this.#model(
+        client,
+        input.model,
+        input.reasoningEffort,
+        input.invocationRationale,
+      );
+      await this.#change(initial.agentRef, {
+        model: choice.model,
+        reasoningEffort: choice.effort,
+      });
       const started = await this.#threadStart(
         client,
-        workspace.cwd,
+        workspace.canonicalCwd,
         choice.model,
       );
       await this.#change(initial.agentRef, {
@@ -700,44 +1054,79 @@ export class AgentManager implements AgentController {
       );
       const turnId = string(object(response.turn).id);
       if (!turnId) throw new Error('Turn start returned no ID.');
-      const task = await this.#change(
-        initial.agentRef,
-        { turnId, status: 'running' },
+      return publicTask(
+        await this.#change(
+          initial.agentRef,
+          { turnId, turnStatus: 'inProgress', status: 'running' },
+          true,
+        ),
         true,
       );
-      return publicTask(task, true);
     } catch (error) {
       const code =
         error instanceof AgentError ? error.code : 'AGENT_START_FAILED';
-      const orphanThreadId =
-        error instanceof AgentError
-          ? string(error.details?.threadId)
-          : undefined;
-      await this.#change(initial.agentRef, {
-        ...(orphanThreadId ? { threadId: orphanThreadId } : {}),
-        status: turnStartAttempted ? 'unknown' : 'failed',
-        terminal: !turnStartAttempted,
-        writerReleased: !turnStartAttempted,
-        lifecycleIntegrity: turnStartAttempted ? 'uncertain' : 'confirmed',
-        ...(turnStartAttempted ? {} : { terminalAt: now() }),
-        latestError: turnStartAttempted ? 'TURN_START_UNCERTAIN' : code,
-      });
+      if (turnStartAttempted) {
+        await this.#change(initial.agentRef, {
+          status: 'unknown',
+          lifecycleIntegrity: 'uncertain',
+          latestError: 'TURN_START_UNCERTAIN',
+        });
+      } else {
+        await this.#change(initial.agentRef, {
+          status: 'failed',
+          turnStatus: 'failed',
+          terminal: true,
+          terminalAt: now(),
+          latestError: code,
+        });
+        await this.#releaseSession(initial.agentRef);
+      }
       throw error;
     }
   }
 
-  async #refresh(ref: string, client: AppServerPort): Promise<AgentTask> {
+  async #recordTerminal(
+    ref: string,
+    mapped: AgentStatus,
+    officialTurnStatus: string,
+    turn: Record<string, unknown>,
+  ): Promise<AgentTask> {
+    const task = this.#require(ref);
+    if (!task.terminal) {
+      await this.#change(
+        ref,
+        {
+          status: mapped,
+          turnStatus: officialTurnStatus,
+          terminal: isTerminal(mapped),
+          repoWriterReleased: false,
+          officialSessionReleased: false,
+          taskAppServerState: 'tearing_down',
+          terminalAt: now(),
+          finalResult: finalMessage(turn) ?? task.finalResult,
+          latestError:
+            mapped === 'failed' ? 'CODEX_TURN_FAILED' : task.latestError,
+          pendingApproval: undefined,
+          lifecycleIntegrity: mapped === 'unknown' ? 'uncertain' : 'confirmed',
+          lifecycleDiagnostics: diagnostics(
+            task,
+            'official_terminal_persisted',
+          ),
+        },
+        true,
+      );
+    }
+    return await this.#releaseSession(ref);
+  }
+
+  async #refreshActive(ref: string, client: AppServerPort): Promise<AgentTask> {
     const task = this.#require(ref);
     if (!task.threadId || task.archived || task.terminal) return task;
     const read = object(
       await client.request('thread/read', { threadId: task.threadId }),
     );
-    const thread = object(read.thread);
-    if (thread.id !== task.threadId) {
-      throw new AgentError(
-        'AGENT_STATE_UNKNOWN',
-        'Official thread identity mismatch.',
-      );
+    if (object(read.thread).id !== task.threadId) {
+      throw new AgentError('AGENT_STATE_UNKNOWN', 'Official thread mismatch.');
     }
     const turns = object(
       await client.request('thread/turns/list', {
@@ -746,10 +1135,11 @@ export class AgentManager implements AgentController {
         itemsView: 'full',
       }),
     );
-    const entries = Array.isArray(turns.data) ? turns.data : [];
-    const turn = entries.map(object).find((entry) => entry.id === task.turnId);
+    const turn = (Array.isArray(turns.data) ? turns.data : [])
+      .map(object)
+      .find((entry) => entry.id === task.turnId);
     if (!turn) {
-      return this.#change(ref, {
+      return await this.#change(ref, {
         status: 'unknown',
         lifecycleIntegrity: 'uncertain',
         latestError: 'TURN_READBACK_MISSING',
@@ -761,59 +1151,162 @@ export class AgentManager implements AgentController {
       status === 'failed' ||
       status === 'interrupted'
     ) {
-      const mapped: AgentStatus =
+      return await this.#recordTerminal(
+        ref,
         status === 'completed'
           ? 'completed'
           : status === 'interrupted'
             ? 'cancelled'
-            : 'failed';
-      return this.#change(ref, {
-        status: mapped,
-        terminal: true,
-        writerReleased: true,
-        terminalAt: now(),
-        finalResult: finalMessage(turn) ?? task.finalResult,
-        latestError:
-          status === 'failed' ? 'CODEX_TURN_FAILED' : task.latestError,
-        lifecycleIntegrity: 'confirmed',
-        pendingApproval: undefined,
-      });
+            : 'failed',
+        status,
+        turn,
+      );
     }
     if (status === 'inProgress') {
-      if (task.writerReleased) {
-        return this.#change(ref, {
-          status: 'unknown',
-          lifecycleIntegrity: 'uncertain',
-          latestError: 'LIFECYCLE_INTEGRITY_UNCERTAIN',
-        });
-      }
-      return task.status === 'unknown' &&
-        !task.pendingInteraction &&
-        !task.pendingApproval &&
-        object(thread.status).type === 'active'
-        ? this.#change(ref, {
+      return task.status === 'unknown' && !task.pendingApproval
+        ? await this.#change(ref, {
             status: 'running',
+            turnStatus: status,
             lifecycleIntegrity: 'confirmed',
             latestError: undefined,
           })
         : task;
     }
-    return this.#change(ref, {
+    return await this.#change(ref, {
       status: 'unknown',
+      turnStatus: status,
       lifecycleIntegrity: 'uncertain',
       latestError: 'TURN_STATUS_UNKNOWN',
     });
   }
 
-  async list(input: AgentListInput = {}): Promise<unknown> {
-    if (
-      this.#options.config.enabled &&
-      [...this.#tasks.values()].some((task) => !task.terminal && !task.archived)
-    ) {
-      await this.#ensureClient().catch(async () => {
-        await this.#markActiveUnknown();
+  async #metadataClient(): Promise<AppServerPort> {
+    const args = await this.#launchArgs();
+    const holder: { client?: AppServerPort } = {};
+    const callbacks: AppServerCallbacks = {
+      onNotification: () => undefined,
+      onRequest: (id) =>
+        holder.client?.respondError(
+          id,
+          -32601,
+          'Metadata session is read-only.',
+        ),
+      onCrash: () => undefined,
+    };
+    const client =
+      this.#options.clientFactory?.(callbacks, {
+        agentRef: 'metadata',
+        args,
+      }) ??
+      new ManagedAppServerClient({
+        executable: this.#options.config.codexExecutable ?? '',
+        launchArgs: args,
+        ...(this.#options.environment
+          ? { environment: this.#options.environment }
+          : {}),
+        ...callbacks,
       });
+    holder.client = client;
+    await client.start();
+    return client;
+  }
+
+  async #readOfficialInventory(
+    client: AppServerPort,
+  ): Promise<Map<string, OfficialThreadMetadata>> {
+    const result = new Map<string, OfficialThreadMetadata>();
+    for (const archived of [false, true]) {
+      let cursor: string | undefined;
+      for (let page = 0; page < MAX_RECONCILE_PAGES; page++) {
+        const response = object(
+          await client.request(
+            'thread/list',
+            {
+              archived,
+              limit: 100,
+              useStateDbOnly: true,
+              sourceKinds: ['appServer', 'unknown'],
+              sortKey: 'updated_at',
+              sortDirection: 'desc',
+              ...(cursor ? { cursor } : {}),
+            },
+            METADATA_TIMEOUT_MS,
+          ),
+        );
+        for (const raw of Array.isArray(response.data) ? response.data : []) {
+          const thread = object(raw);
+          const id = string(thread.id);
+          if (id) result.set(id, { thread, archived });
+        }
+        cursor = string(response.nextCursor);
+        if (!cursor) break;
+      }
     }
+    return result;
+  }
+
+  async #reconcileMany(refs: readonly string[]): Promise<void> {
+    if (refs.length === 0 || !this.#options.config.enabled) return;
+    let client: AppServerPort | undefined;
+    try {
+      client = await this.#metadataClient();
+      const official = await this.#readOfficialInventory(client);
+      for (const ref of refs) {
+        const task = this.#tasks.get(ref);
+        if (!task?.threadId || this.#sessions.has(ref)) continue;
+        const found = official.get(task.threadId);
+        if (!found) {
+          await this.#change(ref, {
+            officialThreadLoadState: 'unknown',
+            lifecycleDiagnostics: diagnostics(
+              task,
+              'official_metadata_not_found',
+            ),
+          });
+          continue;
+        }
+        const section = object(found.thread.section);
+        const officialName = string(found.thread.name);
+        const officialSection = string(section.name);
+        await this.#change(ref, {
+          archived: found.archived,
+          officialThreadLoadState:
+            string(object(found.thread.status).type) === 'notLoaded'
+              ? 'notLoaded'
+              : 'unknown',
+          desktopMirror: {
+            status:
+              found.thread.name === threadDisplayName(task.taskTitle) &&
+              section.name === this.#options.config.sectionName
+                ? 'confirmed'
+                : 'degraded',
+            ...(officialName ? { name: officialName } : {}),
+            ...(officialSection ? { section: officialSection } : {}),
+          },
+        });
+      }
+    } catch {
+      for (const ref of refs) {
+        const task = this.#tasks.get(ref);
+        if (!task) continue;
+        await this.#change(ref, {
+          lifecycleDiagnostics: diagnostics(
+            task,
+            'official_reconcile_unavailable',
+          ),
+        });
+      }
+    } finally {
+      await client?.close().catch(() => undefined);
+    }
+  }
+
+  async list(input: AgentListInput = {}): Promise<unknown> {
+    const recent = [...this.#tasks.values()]
+      .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))
+      .slice(0, 100)
+      .map((task) => task.agentRef);
+    await this.#reconcileMany(recent);
     const limit = Math.min(Math.max(input.limit ?? 20, 1), 50);
     const tasks = [...this.#tasks.values()]
       .filter((task) => !task.archived)
@@ -837,10 +1330,10 @@ export class AgentManager implements AgentController {
 
   async show(input: AgentRefInput): Promise<unknown> {
     let task = this.#require(input.agentRef);
-    if (!task.terminal && task.threadId && this.#options.config.enabled) {
+    const client = this.#sessions.get(task.agentRef);
+    if (!task.terminal && client) {
       try {
-        const client = await this.#ensureClient();
-        task = await this.#refresh(task.agentRef, client);
+        task = await this.#refreshActive(task.agentRef, client);
       } catch {
         task = await this.#change(task.agentRef, {
           status: 'unknown',
@@ -848,6 +1341,9 @@ export class AgentManager implements AgentController {
           latestError: 'OFFICIAL_READBACK_UNAVAILABLE',
         });
       }
+    } else {
+      await this.#reconcileMany([task.agentRef]);
+      task = this.#require(task.agentRef);
     }
     return publicTask(task, true);
   }
@@ -881,17 +1377,16 @@ export class AgentManager implements AgentController {
       });
     }
     task = this.#require(input.agentRef);
-    if (!task.terminal && task.threadId && this.#options.config.enabled) {
-      try {
-        const client = await this.#ensureClient();
-        task = await this.#refresh(task.agentRef, client);
-      } catch {
-        task = await this.#change(task.agentRef, {
-          status: 'unknown',
-          lifecycleIntegrity: 'uncertain',
-          latestError: 'OFFICIAL_READBACK_UNAVAILABLE',
-        });
-      }
+    const client = this.#sessions.get(task.agentRef);
+    if (!task.terminal && client) {
+      task = await this.#refreshActive(task.agentRef, client).catch(
+        async () =>
+          await this.#change(task.agentRef, {
+            status: 'unknown',
+            lifecycleIntegrity: 'uncertain',
+            latestError: 'OFFICIAL_READBACK_UNAVAILABLE',
+          }),
+      );
     }
     return publicTask(task, true);
   }
@@ -903,57 +1398,24 @@ export class AgentManager implements AgentController {
     ) {
       throw new AgentError('AGENT_UNAVAILABLE', 'Message is invalid.');
     }
-    let task = this.#require(input.agentRef);
-    if (!task.threadId || task.archived || task.status !== 'completed') {
-      throw new AgentError('AGENT_NOT_IDLE', 'Agent is not idle.');
-    }
-    const client = await this.#ensureClient();
-    const read = object(
-      await client.request('thread/read', { threadId: task.threadId }),
-    );
-    if (object(object(read.thread).status).type !== 'idle') {
-      throw new AgentError('AGENT_NOT_IDLE', 'Official thread is not idle.');
-    }
-    const resumed = object(
-      await client.request('thread/resume', {
-        threadId: task.threadId,
-        permissions: ':workspace',
-        approvalPolicy: 'on-request',
-        approvalsReviewer: 'auto_review',
-        excludeTurns: true,
-      }),
-    );
+    let task = await this.#authorizeTask(input.agentRef);
+    await this.#reconcileMany([task.agentRef]);
+    task = this.#require(task.agentRef);
     if (
-      string(object(resumed.activePermissionProfile).id) !== ':workspace' ||
-      resumed.approvalPolicy !== 'on-request' ||
-      resumed.approvalsReviewer !== 'auto_review'
+      !task.threadId ||
+      task.archived ||
+      !task.officialSessionReleased ||
+      !task.repoWriterReleased ||
+      (!task.terminal && task.status !== 'unknown')
     ) {
-      throw new AgentError(
-        'PERMISSION_PROFILE_MISMATCH',
-        'Resumed thread permissions differ from the auto preset.',
-      );
-    }
-    const choice =
-      input.model === undefined && input.reasoningEffort === undefined
-        ? { model: task.model ?? '', effort: task.reasoningEffort ?? '' }
-        : await this.#model(
-            client,
-            input.model ?? task.model,
-            input.reasoningEffort ?? task.reasoningEffort,
-            input.invocationRationale,
-          );
-    if (!choice.model || !choice.effort) {
-      throw new AgentError(
-        'AGENT_UNAVAILABLE',
-        'Owned thread has no model selection.',
-      );
+      throw new AgentError('AGENT_NOT_IDLE', 'Agent is not resumable.');
     }
     await this.#mutate(async () => {
       const conflict = [...this.#tasks.values()].find(
         (other) =>
           other.agentRef !== task.agentRef &&
           !other.archived &&
-          !other.writerReleased &&
+          !other.repoWriterReleased &&
           other.canonicalRepoRoot === task.canonicalRepoRoot,
       );
       if (conflict) {
@@ -970,17 +1432,59 @@ export class AgentManager implements AgentController {
       task = {
         ...this.#require(input.agentRef),
         status: 'starting',
+        taskStatus: 'starting',
         terminal: false,
+        repoWriterReleased: false,
         writerReleased: false,
+        taskAppServerState: 'starting',
+        officialSessionReleased: false,
+        officialThreadLoadState: 'unknown',
+        desktopHistoryReady: false,
         terminalAt: undefined,
         finalResult: undefined,
         latestError: undefined,
         updatedAt: now(),
       };
       this.#tasks.set(task.agentRef, task);
-      await this.#inventory.write([...this.#tasks.values()]);
+      await this.#persistAll();
     });
+    let client: AppServerPort | undefined;
     try {
+      client = await this.#createSession(task.agentRef);
+      const resumed = object(
+        await client.request('thread/resume', {
+          threadId: task.threadId,
+          permissions: ':workspace',
+          approvalPolicy: 'on-request',
+          approvalsReviewer: 'auto_review',
+          excludeTurns: true,
+        }),
+      );
+      if (
+        string(object(resumed.activePermissionProfile).id) !== ':workspace' ||
+        resumed.approvalPolicy !== 'on-request' ||
+        resumed.approvalsReviewer !== 'auto_review'
+      ) {
+        throw new AgentError(
+          'PERMISSION_PROFILE_MISMATCH',
+          'Resumed thread permissions differ from the auto preset.',
+        );
+      }
+      const choice =
+        input.model === undefined && input.reasoningEffort === undefined
+          ? { model: task.model ?? '', effort: task.reasoningEffort ?? '' }
+          : await this.#model(
+              client,
+              input.model ?? task.model,
+              input.reasoningEffort ?? task.reasoningEffort,
+              input.invocationRationale,
+            );
+      if (!choice.model || !choice.effort) {
+        throw new AgentError(
+          'AGENT_UNAVAILABLE',
+          'Owned thread has no model selection.',
+        );
+      }
       const response = object(
         await client.request('turn/start', {
           threadId: task.threadId,
@@ -996,6 +1500,7 @@ export class AgentManager implements AgentController {
           task.agentRef,
           {
             turnId,
+            turnStatus: 'inProgress',
             model: choice.model,
             reasoningEffort: choice.effort,
             status: 'running',
@@ -1004,16 +1509,14 @@ export class AgentManager implements AgentController {
         ),
         true,
       );
-    } catch {
+    } catch (error) {
       await this.#change(task.agentRef, {
         status: 'unknown',
         lifecycleIntegrity: 'uncertain',
-        latestError: 'TURN_START_UNCERTAIN',
+        latestError: 'TURN_RESUME_UNCERTAIN',
       });
-      throw new AgentError(
-        'AGENT_STATE_UNKNOWN',
-        'Turn start could not be confirmed.',
-      );
+      if (client) await this.#releaseSession(task.agentRef, client);
+      throw error;
     }
   }
 
@@ -1021,7 +1524,8 @@ export class AgentManager implements AgentController {
     input: AgentApprovalInput,
     decision: 'accept' | 'decline',
   ): Promise<unknown> {
-    const task = this.#require(input.agentRef);
+    let task = this.#require(input.agentRef);
+    if (decision === 'accept') task = await this.#authorizeTask(task.agentRef);
     if (task.terminal || task.archived || !task.pendingApproval?.actionable) {
       throw new AgentError(
         'AGENT_APPROVAL_STALE',
@@ -1035,14 +1539,15 @@ export class AgentManager implements AgentController {
       );
     }
     const handle = this.#handles.get(input.approvalRequestId);
+    const client = this.#sessions.get(task.agentRef);
     if (
       !handle ||
+      !client ||
       handle.threadId !== task.threadId ||
       handle.turnId !== task.turnId
     ) {
       throw new AgentError('AGENT_APPROVAL_STALE', 'Approval handle was lost.');
     }
-    const client = await this.#ensureClient();
     this.#handles.delete(input.approvalRequestId);
     if (handle.method === 'item/permissions/requestApproval') {
       if (decision === 'accept') {
@@ -1079,71 +1584,116 @@ export class AgentManager implements AgentController {
 
   async cancel(input: AgentRefInput): Promise<unknown> {
     const task = this.#require(input.agentRef);
-    if (task.terminal || !task.threadId || !task.turnId) {
+    const client = this.#sessions.get(task.agentRef);
+    if (task.terminal || !task.threadId || !task.turnId || !client) {
       throw new AgentError('AGENT_NOT_IDLE', 'Agent has no active turn.');
     }
-    const client = await this.#ensureClient();
     await client.request('turn/interrupt', {
       threadId: task.threadId,
       turnId: task.turnId,
     });
-    return publicTask(await this.#refresh(task.agentRef, client), true);
+    return publicTask(await this.#refreshActive(task.agentRef, client), true);
   }
 
   async archive(input: AgentRefInput): Promise<unknown> {
-    const task = this.#require(input.agentRef);
-    if (!task.terminal || !task.writerReleased || !task.threadId) {
-      throw new AgentError('AGENT_NOT_TERMINAL', 'Agent task is not terminal.');
+    let task = this.#require(input.agentRef);
+    if (!task.terminal || !task.officialSessionReleased || !task.threadId) {
+      throw new AgentError(
+        'AGENT_NOT_TERMINAL',
+        'Agent task is not released terminal.',
+      );
     }
+    await this.#reconcileMany([task.agentRef]);
+    task = this.#require(task.agentRef);
     if (task.archived) return publicTask(task, true);
-    const client = await this.#ensureClient();
-    await client.request('thread/archive', { threadId: task.threadId });
-    return publicTask(
-      await this.#change(task.agentRef, { archived: true }),
-      true,
-    );
+    let client: AppServerPort | undefined;
+    try {
+      client = await this.#metadataClient();
+      await client.request('thread/archive', { threadId: task.threadId });
+      return publicTask(
+        await this.#change(task.agentRef, {
+          archived: true,
+          officialThreadLoadState: 'notLoaded',
+        }),
+        true,
+      );
+    } finally {
+      await client?.close().catch(() => undefined);
+    }
   }
 
-  async #notification(method: string, params: unknown): Promise<void> {
+  async revokeWorkspace(workspaceId: string): Promise<void> {
+    const affected = [...this.#tasks.values()].filter(
+      (task) => task.workspaceId === workspaceId && !task.archived,
+    );
+    for (const task of affected) {
+      await this.#change(task.agentRef, {
+        workspaceAuthorizationStatus: 'revoked',
+        latestError: 'WORKSPACE_AUTH_REVOKED',
+        lifecycleDiagnostics: diagnostics(task, 'workspace_revoked_by_admin'),
+      });
+      const client = this.#sessions.get(task.agentRef);
+      if (!task.terminal && client && task.threadId && task.turnId) {
+        await client
+          .request(
+            'turn/interrupt',
+            { threadId: task.threadId, turnId: task.turnId },
+            3_000,
+          )
+          .catch(() => undefined);
+      }
+      if (!task.terminal) {
+        await this.#change(task.agentRef, {
+          status: 'cancelled',
+          turnStatus: 'interrupted',
+          terminal: true,
+          terminalAt: now(),
+          repoWriterReleased: false,
+        });
+      }
+      if (client) await this.#releaseSession(task.agentRef, client);
+      else {
+        await this.#change(task.agentRef, {
+          taskAppServerState: 'stopped',
+          officialSessionReleased: true,
+          officialThreadLoadState: 'notLoaded',
+          repoWriterReleased: true,
+        });
+      }
+    }
+  }
+
+  async #notification(
+    ref: string,
+    method: string,
+    params: unknown,
+  ): Promise<void> {
+    const task = this.#tasks.get(ref);
+    if (!task) return;
     const event = object(params);
     const threadId = string(event.threadId);
-    if (!threadId) return;
-    const task = [...this.#tasks.values()].find(
-      (entry) => entry.threadId === threadId && !entry.archived,
-    );
-    if (!task) return;
+    if (threadId && task.threadId && threadId !== task.threadId) return;
     if (method === 'turn/completed') {
       const turn = object(event.turn);
       if (turn.id !== task.turnId) return;
-      const status = turnStatus(turn);
-      const mapped: AgentStatus =
+      const status = turnStatus(turn) ?? 'unknown';
+      await this.#recordTerminal(
+        ref,
         status === 'completed'
           ? 'completed'
           : status === 'interrupted'
             ? 'cancelled'
             : status === 'failed'
               ? 'failed'
-              : 'unknown';
-      await this.#change(
-        task.agentRef,
-        {
-          status: mapped,
-          terminal: isTerminal(mapped),
-          writerReleased: isTerminal(mapped),
-          ...(isTerminal(mapped) ? { terminalAt: now() } : {}),
-          finalResult: finalMessage(turn) ?? task.finalResult,
-          pendingApproval: undefined,
-          latestError:
-            mapped === 'failed' ? 'CODEX_TURN_FAILED' : task.latestError,
-          lifecycleIntegrity: mapped === 'unknown' ? 'uncertain' : 'confirmed',
-        },
-        true,
+              : 'unknown',
+        status,
+        turn,
       );
       return;
     }
     if (method === 'item/autoApprovalReview/completed') {
       await this.#change(
-        task.agentRef,
+        ref,
         {
           lastAutoReview: {
             decision: bounded(
@@ -1173,56 +1723,40 @@ export class AgentManager implements AgentController {
       method === 'item/completed' ||
       method === 'thread/status/changed'
     ) {
-      await this.#change(task.agentRef, {}, true);
+      await this.#change(ref, {}, true);
     }
   }
 
   async #request(
+    ref: string,
+    client: AppServerPort | undefined,
     id: string | number,
     method: string,
     params: unknown,
   ): Promise<void> {
+    const task = this.#tasks.get(ref);
     const data = object(params);
-    const threadId = string(data.threadId);
-    const client = this.#client;
     if (method === 'mcpServer/elicitation/request') {
       client?.respondError(
         id,
         -32601,
-        'MCP elicitation requires native handling.',
+        'MCP elicitation is disabled by profile.',
       );
-      const candidates = [...this.#tasks.values()].filter(
-        (entry) =>
-          !entry.archived &&
-          !entry.terminal &&
-          (!threadId || entry.threadId === threadId),
-      );
-      for (const candidate of candidates) {
-        await this.#change(candidate.agentRef, {
-          status: candidates.length === 1 ? 'awaiting_interaction' : 'unknown',
-          ...(candidates.length === 1
-            ? {}
-            : {
-                lifecycleIntegrity: 'uncertain' as const,
-                latestError: 'ELICITATION_OWNER_AMBIGUOUS',
-              }),
+      if (task && !task.terminal) {
+        await this.#change(ref, {
+          status: 'awaiting_interaction',
           pendingInteraction: {
             kind: 'mcp_elicitation',
-            summary: 'MCP elicitation requires native user handling.',
+            summary: 'Unexpected MCP elicitation was declined.',
           },
+          lifecycleIntegrity: 'uncertain',
+          latestError: 'CAPABILITY_PROFILE_VIOLATION',
         });
       }
       return;
     }
-    const task = [...this.#tasks.values()].find(
-      (entry) => entry.threadId === threadId && !entry.archived,
-    );
-    if (!client || !task || !threadId || task.terminal) {
-      client?.respondError(
-        id,
-        -32601,
-        'Unknown or terminal Localink Agent thread.',
-      );
+    if (!client || !task || task.terminal || data.threadId !== task.threadId) {
+      client?.respondError(id, -32601, 'Unknown or terminal Agent thread.');
       return;
     }
     if (string(data.turnId) !== task.turnId) {
@@ -1239,7 +1773,7 @@ export class AgentManager implements AgentController {
             : undefined;
     if (!kind) {
       client.respondError(id, -32601, 'Unsupported App Server interaction.');
-      await this.#change(task.agentRef, {
+      await this.#change(ref, {
         status: 'awaiting_interaction',
         pendingInteraction: {
           kind: 'unknown',
@@ -1254,10 +1788,10 @@ export class AgentManager implements AgentController {
       requestId: id,
       method,
       params: data,
-      threadId,
-      turnId: string(data.turnId) ?? '',
+      threadId: task.threadId ?? '',
+      turnId: task.turnId ?? '',
     });
-    await this.#change(task.agentRef, {
+    await this.#change(ref, {
       status: 'awaiting_approval',
       pendingApproval: {
         approvalRequestId,

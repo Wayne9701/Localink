@@ -7,9 +7,12 @@ const MAX_PENDING_REQUESTS = 128;
 const DEFAULT_REQUEST_TIMEOUT_MS = 15_000;
 const MAX_REQUEST_TIMEOUT_MS = 60_000;
 const CLOSE_TIMEOUT_MS = 2_000;
+const PROCESS_GROUP_VERIFY_ATTEMPTS = 20;
+const PROCESS_GROUP_VERIFY_INTERVAL_MS = 50;
 
 export interface ManagedAppServerClientOptions {
   executable: string;
+  launchArgs?: readonly string[];
   environment?: NodeJS.ProcessEnv;
   onNotification?: (method: string, params: unknown) => void;
   onRequest?: (id: string | number, method: string, params: unknown) => void;
@@ -88,11 +91,18 @@ export class ManagedAppServerClient {
     this.#stdoutBuffer = '';
     this.#stderrTail = '';
     this.#crashReported = false;
-    const child = spawn(this.#options.executable, ['app-server', '--stdio'], {
-      shell: false,
-      stdio: ['pipe', 'pipe', 'pipe'],
-      ...(this.#options.environment ? { env: this.#options.environment } : {}),
-    });
+    const child = spawn(
+      this.#options.executable,
+      [...(this.#options.launchArgs ?? []), 'app-server', '--stdio'],
+      {
+        shell: false,
+        stdio: ['pipe', 'pipe', 'pipe'],
+        detached: process.platform !== 'win32',
+        ...(this.#options.environment
+          ? { env: this.#options.environment }
+          : {}),
+      },
+    );
     this.#child = child;
     child.stdout.setEncoding('utf8');
     child.stdout.on('data', (chunk: string) => this.#receive(chunk));
@@ -199,6 +209,62 @@ export class ManagedAppServerClient {
       id,
       error: { code, message: message.slice(0, 500) },
     });
+  }
+
+  processId(): number | undefined {
+    return this.#child?.pid;
+  }
+
+  #signalOwnedTree(
+    child: ChildProcessWithoutNullStreams,
+    signal: NodeJS.Signals,
+  ): void {
+    const pid = child.pid;
+    if (pid === undefined) return;
+    try {
+      if (process.platform !== 'win32') process.kill(-pid, signal);
+      else child.kill(signal);
+    } catch (error) {
+      if (
+        typeof error !== 'object' ||
+        error === null ||
+        !('code' in error) ||
+        error.code !== 'ESRCH'
+      ) {
+        if (
+          typeof error === 'object' &&
+          error !== null &&
+          'code' in error &&
+          error.code === 'EPERM'
+        ) {
+          child.kill(signal);
+          return;
+        }
+        throw error;
+      }
+    }
+  }
+
+  #ownedTreeAlive(pid: number): boolean {
+    try {
+      process.kill(process.platform === 'win32' ? pid : -pid, 0);
+      return true;
+    } catch (error) {
+      if (
+        typeof error === 'object' &&
+        error !== null &&
+        'code' in error &&
+        error.code === 'EPERM'
+      ) {
+        return true;
+      }
+      return !(
+        typeof error === 'object' &&
+        error !== null &&
+        'code' in error &&
+        error.code === 'ESRCH'
+      );
+    }
   }
 
   #write(message: Record<string, unknown>): void {
@@ -324,9 +390,9 @@ export class ManagedAppServerClient {
     this.#state = 'closing';
     this.#rejectPending(reason);
     this.#reportCrash(reason);
-    child.kill('SIGTERM');
+    this.#signalOwnedTree(child, 'SIGTERM');
     this.#forceKillTimer = setTimeout(() => {
-      if (this.#child === child) child.kill('SIGKILL');
+      if (this.#child === child) this.#signalOwnedTree(child, 'SIGKILL');
     }, CLOSE_TIMEOUT_MS);
   }
 
@@ -389,15 +455,32 @@ export class ManagedAppServerClient {
       }
       child.once('close', () => resolve());
     });
+    const pid = child.pid;
     if (!child.stdin.destroyed) child.stdin.end();
-    child.kill('SIGTERM');
-    const timer = setTimeout(() => child.kill('SIGKILL'), CLOSE_TIMEOUT_MS);
+    this.#signalOwnedTree(child, 'SIGTERM');
+    const timer = setTimeout(
+      () => this.#signalOwnedTree(child, 'SIGKILL'),
+      CLOSE_TIMEOUT_MS,
+    );
     try {
       await stopped;
     } finally {
       clearTimeout(timer);
       if (this.#child === child) this.#child = null;
       this.#state = 'idle';
+    }
+    if (pid !== undefined && process.platform !== 'win32') {
+      for (
+        let attempt = 0;
+        attempt < PROCESS_GROUP_VERIFY_ATTEMPTS;
+        attempt++
+      ) {
+        if (!this.#ownedTreeAlive(pid)) return;
+        await new Promise((resolve) =>
+          setTimeout(resolve, PROCESS_GROUP_VERIFY_INTERVAL_MS),
+        );
+      }
+      throw new Error('App Server owned process tree did not exit');
     }
   }
 }

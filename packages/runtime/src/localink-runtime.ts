@@ -14,6 +14,7 @@ import {
   type AgentRuntimeConfig,
 } from '@localink/codex-agent';
 import path from 'node:path';
+import { createHash } from 'node:crypto';
 import {
   CONTRACT_VERSION_V1,
   LOCALINK_VERSION,
@@ -338,6 +339,7 @@ export class LocalinkRuntime {
         .filter((workspace) => workspace.id !== workspaceId);
       await this.#persist(remaining);
       this.workspaces.remove(workspaceId);
+      await this.#agents?.revokeWorkspace?.(workspaceId);
       return record;
     });
   }
@@ -644,6 +646,9 @@ export class LocalinkRuntime {
             cwd: await this.workspaces.resolveCwd(workspaceId, relativeCwd),
             workspaceRoot: workspace.root,
             workspaceName: workspace.name,
+            authorizationGeneration: createHash('sha256')
+              .update(this.#workspaceSnapshotKey)
+              .digest('hex'),
           };
         },
       });
@@ -678,8 +683,17 @@ export class LocalinkRuntime {
     const records = config?.workspaces ?? [];
     const nextKey = JSON.stringify(records);
     if (nextKey === this.#workspaceSnapshotKey) return;
+    const previousIds = new Set(
+      this.workspaces.list().map((workspace) => workspace.id),
+    );
     await this.workspaces.replaceAllValidated(records);
     this.#workspaceSnapshotKey = nextKey;
+    const currentIds = new Set(records.map((workspace) => workspace.id));
+    for (const workspaceId of previousIds) {
+      if (!currentIds.has(workspaceId)) {
+        await this.#agents?.revokeWorkspace?.(workspaceId);
+      }
+    }
   }
 
   #mutate<T>(operation: () => Promise<T>): Promise<T> {
