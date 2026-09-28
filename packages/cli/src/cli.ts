@@ -27,6 +27,7 @@ import {
   waitForControlPlaneReadiness,
   waitForLocalStartup,
 } from './release-readiness.js';
+import { readReleaseToolCount } from './release-tool-count.js';
 import {
   httpOptionsFromEnv,
   PROTOCOL_VERSION,
@@ -675,6 +676,7 @@ async function tunnelControlPlaneProbe(): Promise<boolean> {
 
 async function waitForManagedLocalStartup(
   context: InstallationContext,
+  expectedToolCount: number,
 ): Promise<void> {
   const controller = new LocalServiceController(context);
   await waitForLocalStartup(
@@ -696,7 +698,7 @@ async function waitForManagedLocalStartup(
       };
     },
     {
-      expectedToolCount: TOOL_NAMES.length,
+      expectedToolCount,
       timeoutMs: 20_000,
       intervalMs: 250,
     },
@@ -705,6 +707,7 @@ async function waitForManagedLocalStartup(
 
 async function waitForManagedCoreStartup(
   context: InstallationContext,
+  expectedToolCount: number,
 ): Promise<void> {
   const controller = new LocalServiceController(context);
   await waitForCoreStartup(
@@ -723,7 +726,7 @@ async function waitForManagedCoreStartup(
       };
     },
     {
-      expectedToolCount: TOOL_NAMES.length,
+      expectedToolCount,
       timeoutMs: 20_000,
       intervalMs: 250,
     },
@@ -732,6 +735,7 @@ async function waitForManagedCoreStartup(
 
 async function waitForManagedControlPlane(
   context: InstallationContext,
+  expectedToolCount: number,
 ): Promise<void> {
   const controller = new LocalServiceController(context);
   await waitForControlPlaneReadiness(
@@ -741,7 +745,7 @@ async function waitForManagedControlPlane(
         controller.status('localink-tunnel'),
       ]);
       const coreMcpReady =
-        mcp.readiness === 'ready' && mcp.toolCount === TOOL_NAMES.length;
+        mcp.readiness === 'ready' && mcp.toolCount === expectedToolCount;
       if (!coreMcpReady || !tunnel.processRunning) {
         return {
           coreMcpReady,
@@ -764,6 +768,7 @@ async function waitForManagedControlPlane(
 
 async function activateManagedContext(
   context: InstallationContext,
+  expectedToolCount: number,
 ): Promise<void> {
   const requireTunnel = await tunnelCanRun();
   if (!requireTunnel) {
@@ -776,12 +781,15 @@ async function activateManagedContext(
     rebootstrapCore: async () => {
       await controller.rebootstrap(false);
     },
-    waitForCore: async () => waitForManagedCoreStartup(context),
+    waitForCore: async () =>
+      waitForManagedCoreStartup(context, expectedToolCount),
     bootstrapTunnel: async () => {
       await controller.bootstrapTunnel();
     },
-    waitForLocalServices: async () => waitForManagedLocalStartup(context),
-    waitForControlPlane: async () => waitForManagedControlPlane(context),
+    waitForLocalServices: async () =>
+      waitForManagedLocalStartup(context, expectedToolCount),
+    waitForControlPlane: async () =>
+      waitForManagedControlPlane(context, expectedToolCount),
   });
 }
 
@@ -818,16 +826,26 @@ async function handleRelease(args: readonly string[]): Promise<boolean> {
     root: stateRoot(),
     hooks: {
       beforeSwitch: verifyPackagedRuntime,
-      activate: async () => activateManagedContext(stableContext),
+      activate: async (releasePath) =>
+        activateManagedContext(
+          stableContext,
+          await readReleaseToolCount(releasePath),
+        ),
       restorePrior: async ({ currentReleaseId }) => {
         try {
           // A prior release pointer means the managed arrangement is the
           // stable launcher/current prefix, even if an administrator invoked
           // this command from a checkout. A first install has no pointer, so
           // it restores the pre-release (typically checkout) arrangement.
-          await activateManagedContext(
-            currentReleaseId === undefined ? priorContext : stableContext,
-          );
+          const restoreContext =
+            currentReleaseId === undefined ? priorContext : stableContext;
+          const expectedToolCount =
+            currentReleaseId === undefined
+              ? TOOL_NAMES.length
+              : await readReleaseToolCount(
+                  path.join(stateRoot(), 'app', 'releases', currentReleaseId),
+                );
+          await activateManagedContext(restoreContext, expectedToolCount);
         } catch {
           throw new ReleaseReadinessError(
             'ROLLBACK_READINESS_FAILED',
