@@ -33,6 +33,7 @@ export const EXTERNAL_MCP_LIMITS = {
   schemaBytes: 64 * 1024,
   connectTimeoutMs: 5_000,
   stdioConnectTimeoutMs: 15_000,
+  stdioListTimeoutMs: 15_000,
   callTimeoutMs: 30_000,
   transportBufferBytes: 1024 * 1024,
   richMetadataBytes: 64 * 1024,
@@ -498,6 +499,12 @@ function providerConnectTimeoutMs(provider: ExternalMcpProvider): number {
     : EXTERNAL_MCP_LIMITS.connectTimeoutMs;
 }
 
+function providerListTimeoutMs(provider: ExternalMcpProvider): number {
+  return provider.transport === 'stdio'
+    ? EXTERNAL_MCP_LIMITS.stdioListTimeoutMs
+    : EXTERNAL_MCP_LIMITS.connectTimeoutMs;
+}
+
 async function assertExecutable(command: string): Promise<void> {
   const info = await stat(command);
   if (!info.isFile()) throw new Error('not-file');
@@ -780,7 +787,7 @@ export class ExternalMcpManager {
       const listedTools = (
         await within(
           client.listTools(),
-          EXTERNAL_MCP_LIMITS.connectTimeoutMs,
+          providerListTimeoutMs(provider),
           'provider-list-timeout',
         )
       ).tools;
