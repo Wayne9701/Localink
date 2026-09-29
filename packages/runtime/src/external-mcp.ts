@@ -44,6 +44,7 @@ const LOOPBACK_HOSTS = new Set(['localhost', '127.0.0.1', '::1', '[::1]']);
 const SECRET_ARGUMENT =
   /(?:^|[-_])(token|cookie|password|passwd|api[-_]?key|client[-_]?secret|oauth)(?:$|[=_-])/iu;
 const EXACT_TOOL_NAME = /^[A-Za-z0-9][A-Za-z0-9._:/-]*$/u;
+const STDIO_STDERR_CAPTURE_BYTES = 4 * 1024;
 
 export type ExternalMcpRiskTier = 0 | 1 | 2;
 export type ExternalMcpToolRiskOverrides = Readonly<
@@ -117,6 +118,8 @@ interface ProviderConnection {
   readonly client: Client;
   readonly transport: Transport;
 }
+
+type StdioInitializationStage = 'spawn' | 'connect' | 'list';
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
@@ -512,6 +515,55 @@ async function within<T>(
   }
 }
 
+function captureStdioStderr(transport: StdioClientTransport): void {
+  const stderr = transport.stderr;
+  if (stderr === null) return;
+  const chunks: Buffer[] = [];
+  let capturedBytes = 0;
+  stderr.on('data', (chunk: Buffer | string) => {
+    if (capturedBytes >= STDIO_STDERR_CAPTURE_BYTES) return;
+    const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+    const remaining = STDIO_STDERR_CAPTURE_BYTES - capturedBytes;
+    const captured = buffer.subarray(0, remaining);
+    chunks.push(captured);
+    capturedBytes += captured.length;
+  });
+  stderr.on('error', () => undefined);
+}
+
+function isSpawnError(error: unknown): boolean {
+  if (!isRecord(error) || typeof error.code !== 'string') return false;
+  return [
+    'EACCES',
+    'EAGAIN',
+    'EMFILE',
+    'ENFILE',
+    'ENOENT',
+    'ENOMEM',
+    'EPERM',
+  ].includes(error.code);
+}
+
+function initializationReasonCode(
+  provider: ExternalMcpProvider,
+  stage: StdioInitializationStage | undefined,
+  error: unknown,
+): string {
+  if (provider.transport !== 'stdio' || stage === undefined)
+    return 'PROVIDER_UNAVAILABLE';
+  if (stage === 'spawn' || (stage === 'connect' && isSpawnError(error)))
+    return 'PROVIDER_SPAWN_FAILED';
+  if (stage === 'connect') {
+    return error instanceof Error &&
+      error.message === 'provider-connect-timeout'
+      ? 'PROVIDER_CONNECT_TIMEOUT'
+      : 'PROVIDER_CONNECT_FAILED';
+  }
+  return error instanceof Error && error.message === 'provider-list-timeout'
+    ? 'PROVIDER_LIST_TIMEOUT'
+    : 'PROVIDER_LIST_FAILED';
+}
+
 function safeToolSegment(name: string): string {
   const normalized = name
     .toLocaleLowerCase()
@@ -675,21 +727,28 @@ export class ExternalMcpManager {
       return;
     }
     let connection: ProviderConnection | undefined;
+    let initializationStage: StdioInitializationStage | undefined;
     try {
-      if (provider.transport === 'stdio')
+      if (provider.transport === 'stdio') {
+        initializationStage = 'spawn';
         await assertExecutable(provider.command);
-      const transport: Transport =
-        provider.transport === 'loopback-http'
-          ? new StreamableHTTPClientTransport(new URL(provider.url), {
-              fetch: loopbackFetch,
-            })
-          : new StdioClientTransport({
-              command: provider.command,
-              args: [...provider.args],
-              env: providerEnvironment(this.#environment),
-              stderr: 'pipe',
-              maxBufferSize: externalMcpTransportBufferBytes(provider),
-            });
+      }
+      let transport: Transport;
+      if (provider.transport === 'loopback-http') {
+        transport = new StreamableHTTPClientTransport(new URL(provider.url), {
+          fetch: loopbackFetch,
+        });
+      } else {
+        const stdioTransport = new StdioClientTransport({
+          command: provider.command,
+          args: [...provider.args],
+          env: providerEnvironment(this.#environment),
+          stderr: 'pipe',
+          maxBufferSize: externalMcpTransportBufferBytes(provider),
+        });
+        captureStdioStderr(stdioTransport);
+        transport = stdioTransport;
+      }
       const client = new Client(
         {
           name: `localink-provider-${provider.id}`,
@@ -703,11 +762,13 @@ export class ExternalMcpManager {
         },
       );
       connection = { client, transport };
+      if (provider.transport === 'stdio') initializationStage = 'connect';
       await within(
         client.connect(transport),
         EXTERNAL_MCP_LIMITS.connectTimeoutMs,
         'provider-connect-timeout',
       );
+      if (provider.transport === 'stdio') initializationStage = 'list';
       const listedTools = (
         await within(
           client.listTools(),
@@ -801,7 +862,7 @@ export class ExternalMcpManager {
       status.skippedTools = skippedTools;
       this.#connections.set(provider.id, connection);
       this.#statuses.push(status);
-    } catch {
+    } catch (error) {
       if (connection !== undefined) await closeConnection(connection);
       this.#statuses.push({
         id: provider.id,
@@ -811,7 +872,11 @@ export class ExternalMcpManager {
         eligibleProjectedTools: 0,
         projectedToolsByTier: emptyTierCounts(),
         skippedTools: 0,
-        reasonCode: 'PROVIDER_UNAVAILABLE',
+        reasonCode: initializationReasonCode(
+          provider,
+          initializationStage,
+          error,
+        ),
       });
     }
   }

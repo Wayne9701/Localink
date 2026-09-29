@@ -35,6 +35,31 @@ const stdioFixture = fileURLToPath(
   new URL('./external-mcp-stdio-fixture.js', import.meta.url),
 );
 
+const listTimeoutProvider = [
+  "let buffer = '';",
+  'const send = (message) => process.stdout.write(`${JSON.stringify(message)}\\n`);',
+  "process.stdin.setEncoding('utf8');",
+  "process.stdin.on('data', (chunk) => {",
+  '  buffer += chunk;',
+  "  for (let newline; (newline = buffer.indexOf('\\n')) >= 0;) {",
+  '    const line = buffer.slice(0, newline);',
+  '    buffer = buffer.slice(newline + 1);',
+  '    if (!line) continue;',
+  '    const request = JSON.parse(line);',
+  "    if (request.method === 'server/discover') { send({ jsonrpc: '2.0', id: request.id, error: { code: -32601, message: 'method not found' } }); continue; }",
+  "    if (request.method === 'initialize') {",
+  "      send({ jsonrpc: '2.0', id: request.id, result: { protocolVersion: request.params.protocolVersion, capabilities: { tools: {} }, serverInfo: { name: 'list-timeout', version: '1.0.0' } } });",
+  '    }',
+  '  }',
+  '});',
+  'setInterval(() => undefined, 1000);',
+].join('\n');
+
+const listFailureProvider = listTimeoutProvider.replace(
+  "    if (request.method === 'initialize') {",
+  "    if (request.method === 'tools/list') { send({ jsonrpc: '2.0', id: request.id, error: { code: -32603, message: 'list failure' } }); continue; }\n    if (request.method === 'initialize') {",
+);
+
 async function withTemp(
   worker: (root: string) => Promise<void>,
 ): Promise<void> {
@@ -599,6 +624,96 @@ test('stdio bridge projects annotated tools, isolates environment, and reaps chi
       }
     }
     assert.fail('stdio provider child remained alive after runtime close');
+  });
+});
+
+test('stdio initialization reports safe diagnostic reason codes only', async () => {
+  await withTemp(async (root) => {
+    const stateRoot = path.join(root, 'state');
+    const setup = await createLocalinkRuntime({ stateRoot });
+    await setup.close();
+    await mkdir(path.join(stateRoot, 'config'), { recursive: true });
+    await writeFile(
+      path.join(stateRoot, 'config', 'external-mcp.json'),
+      JSON.stringify({
+        version: 1,
+        providers: [
+          {
+            id: 'spawn-failure',
+            transport: 'stdio',
+            command: path.join(root, 'missing-executable'),
+            args: [],
+            enabled: true,
+          },
+          {
+            id: 'connect-timeout',
+            transport: 'stdio',
+            command: process.execPath,
+            args: ['-e', 'setInterval(() => undefined, 1000)'],
+            enabled: true,
+          },
+          {
+            id: 'connect-failure',
+            transport: 'stdio',
+            command: process.execPath,
+            args: [
+              '-e',
+              "process.stderr.write('MCP_STDERR_NOT_PUBLIC\\n'); process.exit(1);",
+            ],
+            enabled: true,
+          },
+          {
+            id: 'list-timeout',
+            transport: 'stdio',
+            command: process.execPath,
+            args: ['-e', listTimeoutProvider],
+            enabled: true,
+          },
+          {
+            id: 'list-failure',
+            transport: 'stdio',
+            command: process.execPath,
+            args: ['-e', listFailureProvider],
+            enabled: true,
+          },
+          {
+            id: 'success',
+            transport: 'stdio',
+            command: process.execPath,
+            args: [stdioFixture, path.join(root, 'success.pid')],
+            enabled: true,
+          },
+        ],
+      }),
+    );
+    const runtime = await createLocalinkRuntime({ stateRoot });
+    try {
+      const health = (await runtime.health()).sharedAssets.externalMcp;
+      assert.deepEqual(
+        Object.fromEntries(
+          health.providers.map((provider) => [
+            provider.id,
+            provider.reasonCode,
+          ]),
+        ),
+        {
+          'connect-failure': 'PROVIDER_CONNECT_FAILED',
+          'connect-timeout': 'PROVIDER_CONNECT_TIMEOUT',
+          'list-failure': 'PROVIDER_LIST_FAILED',
+          'list-timeout': 'PROVIDER_LIST_TIMEOUT',
+          'spawn-failure': 'PROVIDER_SPAWN_FAILED',
+          success: undefined,
+        },
+      );
+      assert.equal(health.readyProviders, 1);
+      assert.equal(health.degradedProviders, 5);
+      assert.equal(
+        JSON.stringify(health).includes('MCP_STDERR_NOT_PUBLIC'),
+        false,
+      );
+    } finally {
+      await runtime.close();
+    }
   });
 });
 
