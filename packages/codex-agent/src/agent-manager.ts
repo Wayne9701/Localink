@@ -41,6 +41,15 @@ const DEFAULT_WAIT_MS = 8_000;
 const METADATA_TIMEOUT_MS = 5_000;
 const MAX_RECONCILE_PAGES = 10;
 const THREAD_NAME_PREFIX = '[Localink] ';
+const AGENT_EXECUTION_CONTRACT = [
+  '<localink_execution_contract>',
+  'Keep verbose test stdout/stderr in a temporary or workspace file.',
+  'Return only PASS/FAIL, exit code, and a bounded tail or summary in commentary and final output.',
+  'Do not dump complete long test logs, large diffs, or large JSON/API responses; use a diff stat plus targeted excerpts and return the saved path when full output must be retained.',
+  'Do not build, install, activate, or roll back a Localink release; do not bootstrap or restart Localink services; and do not mutate launchctl entries for com.localink.*. Deployment belongs to an external supervisor after this Agent is terminal.',
+  'Commit or push only when the user task explicitly authorizes it.',
+  '</localink_execution_contract>',
+].join('\n');
 const ACTIVE = new Set<AgentStatus>([
   'starting',
   'running',
@@ -99,6 +108,10 @@ function bounded(value: string, maxBytes: number): string {
     : `${bytes.subarray(0, maxBytes).toString('utf8')}…`;
 }
 
+function executionPrompt(value: string): string {
+  return `${value.trimEnd()}\n\n${AGENT_EXECUTION_CONTRACT}`;
+}
+
 function now(): string {
   return new Date().toISOString();
 }
@@ -139,7 +152,10 @@ function action(task: AgentTask): string {
   if (task.workspaceAuthorizationStatus === 'revoked') return 'cleanup_only';
   if (task.pendingApproval?.actionable) return 'handle_approval';
   if (task.pendingInteraction) return 'handoff_to_user';
-  if (task.terminal) return 'verify_terminal';
+  if (task.terminal)
+    return task.lifecycleIntegrity === 'recovery_failed' && !task.archived
+      ? 'archive'
+      : 'verify_terminal';
   if (task.status === 'unknown') return 'diagnose_uncertain';
   if (task.supervisionMode === 'detached') return 'handoff_to_user';
   return 'wait_bounded';
@@ -403,6 +419,7 @@ export class AgentManager implements AgentController {
   }
 
   async #recoverPersisted(): Promise<void> {
+    const releasedNonterminal: string[] = [];
     for (const task of [...this.#tasks.values()]) {
       let released = true;
       if (task.taskAppServerPid !== undefined) {
@@ -427,7 +444,7 @@ export class AgentManager implements AgentController {
           workspaceAuthorizationStatus: 'unknown',
           lifecycleIntegrity: 'uncertain',
           latestError: released
-            ? 'RECOVERY_SESSION_NOT_REATTACHED'
+            ? (task.latestError ?? 'RECOVERY_SESSION_NOT_REATTACHED')
             : 'TASK_APP_SERVER_RELEASE_PENDING',
           lifecycleDiagnostics: diagnostics(
             task,
@@ -438,6 +455,7 @@ export class AgentManager implements AgentController {
           updatedAt: now(),
           nextSeq: task.nextSeq + 1,
         });
+        if (released) releasedNonterminal.push(task.agentRef);
       } else if (!task.officialSessionReleased || !released) {
         this.#tasks.set(task.agentRef, {
           ...task,
@@ -463,6 +481,11 @@ export class AgentManager implements AgentController {
       }
     }
     await this.#persistAll();
+    await this.#finalizeReleasedRecovery(
+      releasedNonterminal,
+      'RECOVERY_SESSION_NOT_REATTACHED',
+      'startup_recovery',
+    );
   }
 
   async #terminateProcessGroup(pid: number): Promise<void> {
@@ -610,11 +633,14 @@ export class AgentManager implements AgentController {
       await this.#releaseSession(ref, client);
       return;
     }
+    const latestError = reason.includes('stdout line limit exceeded')
+      ? 'APP_SERVER_PROTOCOL_LIMIT_EXCEEDED'
+      : 'TASK_APP_SERVER_CRASH';
     await this.#change(ref, {
       status: task.terminal ? task.status : 'unknown',
       taskAppServerState: 'crashed',
       lifecycleIntegrity: 'uncertain',
-      latestError: 'TASK_APP_SERVER_CRASH',
+      latestError,
       pendingApproval: task.pendingApproval
         ? { ...task.pendingApproval, actionable: false }
         : undefined,
@@ -625,6 +651,11 @@ export class AgentManager implements AgentController {
     });
     this.#clearTaskHandles(ref);
     await this.#releaseSession(ref, client);
+    await this.#finalizeReleasedRecovery(
+      [ref],
+      latestError,
+      'app_server_crash_recovery',
+    );
   }
 
   #handlesFor(ref: string): string[] {
@@ -1093,7 +1124,13 @@ export class AgentManager implements AgentController {
       const response = object(
         await client.request('turn/start', {
           threadId: started.threadId,
-          input: [{ type: 'text', text: input.prompt, text_elements: [] }],
+          input: [
+            {
+              type: 'text',
+              text: executionPrompt(input.prompt),
+              text_elements: [],
+            },
+          ],
           model: choice.model,
           effort: choice.effort,
         }),
@@ -1163,6 +1200,137 @@ export class AgentManager implements AgentController {
       );
     }
     return await this.#releaseSession(ref);
+  }
+
+  #releasedRecoveryCandidate(task: AgentTask): boolean {
+    return (
+      !task.terminal &&
+      !this.#sessions.has(task.agentRef) &&
+      task.taskAppServerPid === undefined &&
+      task.taskAppServerState === 'stopped' &&
+      task.officialSessionReleased &&
+      task.repoWriterReleased
+    );
+  }
+
+  async #recordReleasedOfficialTerminal(
+    ref: string,
+    officialTurnStatus: 'completed' | 'failed' | 'interrupted',
+    turn: Record<string, unknown>,
+  ): Promise<AgentTask> {
+    const task = this.#require(ref);
+    const mapped: AgentStatus =
+      officialTurnStatus === 'completed'
+        ? 'completed'
+        : officialTurnStatus === 'interrupted'
+          ? 'cancelled'
+          : 'failed';
+    return await this.#change(
+      ref,
+      {
+        status: mapped,
+        turnStatus: officialTurnStatus,
+        terminal: true,
+        terminalAt: task.terminalAt ?? now(),
+        finalResult: finalMessage(turn) ?? task.finalResult,
+        latestError:
+          mapped === 'failed' ? 'CODEX_TURN_FAILED' : task.latestError,
+        pendingApproval: undefined,
+        pendingInteraction: undefined,
+        lifecycleIntegrity: 'confirmed',
+        lifecycleDiagnostics: diagnostics(
+          task,
+          'official_terminal_reconciled_after_release',
+        ),
+      },
+      true,
+    );
+  }
+
+  async #finalizeReleasedRecovery(
+    refs: readonly string[],
+    fallbackError: string,
+    diagnosticPrefix: string,
+  ): Promise<void> {
+    const candidates = refs
+      .map((ref) => this.#tasks.get(ref))
+      .filter(
+        (task): task is AgentTask =>
+          task !== undefined && this.#releasedRecoveryCandidate(task),
+      );
+    if (candidates.length === 0) return;
+
+    const unresolved = new Set(candidates.map((task) => task.agentRef));
+    let client: AppServerPort | undefined;
+    try {
+      if (this.#options.config.enabled) {
+        client = await this.#metadataClient();
+        for (const candidate of candidates) {
+          if (!candidate.threadId || !candidate.turnId) continue;
+          try {
+            const turns = object(
+              await client.request(
+                'thread/turns/list',
+                {
+                  threadId: candidate.threadId,
+                  limit: 20,
+                  itemsView: 'full',
+                },
+                METADATA_TIMEOUT_MS,
+              ),
+            );
+            const turn = (Array.isArray(turns.data) ? turns.data : [])
+              .map(object)
+              .find((entry) => entry.id === candidate.turnId);
+            const status = turnStatus(turn);
+            if (
+              turn &&
+              (status === 'completed' ||
+                status === 'failed' ||
+                status === 'interrupted')
+            ) {
+              await this.#recordReleasedOfficialTerminal(
+                candidate.agentRef,
+                status,
+                turn,
+              );
+              unresolved.delete(candidate.agentRef);
+            }
+          } catch {
+            // Fall through to the explicit local recovery failure below.
+          }
+        }
+      }
+    } catch {
+      // The official read is best-effort and bounded. Once all owned resources
+      // are released, Localink must still converge to a terminal state.
+    } finally {
+      await client?.close().catch(() => undefined);
+    }
+
+    for (const ref of unresolved) {
+      const task = this.#require(ref);
+      if (!this.#releasedRecoveryCandidate(task)) continue;
+      const preservedError =
+        task.latestError &&
+        task.latestError !== 'TASK_APP_SERVER_RELEASE_PENDING'
+          ? task.latestError
+          : fallbackError;
+      await this.#change(ref, {
+        status: 'failed',
+        turnStatus: 'failed',
+        terminal: true,
+        terminalAt: now(),
+        pendingApproval: undefined,
+        pendingInteraction: undefined,
+        lifecycleIntegrity: 'recovery_failed',
+        latestError: preservedError,
+        lifecycleDiagnostics: diagnostics(
+          task,
+          `${diagnosticPrefix}:terminalized_released_task`,
+        ),
+      });
+    }
   }
 
   async #refreshActive(ref: string, client: AppServerPort): Promise<AgentTask> {
@@ -1377,7 +1545,7 @@ export class AgentManager implements AgentController {
   async show(input: AgentRefInput): Promise<unknown> {
     let task = this.#require(input.agentRef);
     const client = this.#sessions.get(task.agentRef);
-    if (!task.terminal && client) {
+    if (!task.terminal && client && task.taskAppServerState === 'running') {
       try {
         task = await this.#refreshActive(task.agentRef, client);
       } catch {
@@ -1424,7 +1592,7 @@ export class AgentManager implements AgentController {
     }
     task = this.#require(input.agentRef);
     const client = this.#sessions.get(task.agentRef);
-    if (!task.terminal && client) {
+    if (!task.terminal && client && task.taskAppServerState === 'running') {
       task = await this.#refreshActive(task.agentRef, client).catch(
         async () =>
           await this.#change(task.agentRef, {
@@ -1444,12 +1612,20 @@ export class AgentManager implements AgentController {
     ) {
       throw new AgentError('AGENT_UNAVAILABLE', 'Message is invalid.');
     }
-    let task = await this.#authorizeTask(input.agentRef);
+    let task = this.#require(input.agentRef);
+    if (task.lifecycleIntegrity === 'recovery_failed') {
+      throw new AgentError(
+        'AGENT_NOT_IDLE',
+        'A terminal recovery failure cannot be resumed.',
+      );
+    }
+    task = await this.#authorizeTask(input.agentRef);
     await this.#reconcileMany([task.agentRef]);
     task = this.#require(task.agentRef);
     if (
       !task.threadId ||
       task.archived ||
+      task.lifecycleIntegrity === 'recovery_failed' ||
       !task.officialSessionReleased ||
       !task.repoWriterReleased ||
       (!task.terminal && task.status !== 'unknown')
@@ -1534,7 +1710,13 @@ export class AgentManager implements AgentController {
       const response = object(
         await client.request('turn/start', {
           threadId: task.threadId,
-          input: [{ type: 'text', text: input.message, text_elements: [] }],
+          input: [
+            {
+              type: 'text',
+              text: executionPrompt(input.message),
+              text_elements: [],
+            },
+          ],
           model: choice.model,
           effort: choice.effort,
         }),
@@ -1561,7 +1743,14 @@ export class AgentManager implements AgentController {
         lifecycleIntegrity: 'uncertain',
         latestError: 'TURN_RESUME_UNCERTAIN',
       });
-      if (client) await this.#releaseSession(task.agentRef, client);
+      if (client) {
+        await this.#releaseSession(task.agentRef, client);
+        await this.#finalizeReleasedRecovery(
+          [task.agentRef],
+          'TURN_RESUME_UNCERTAIN',
+          'turn_resume_recovery',
+        );
+      }
       throw error;
     }
   }
@@ -1724,9 +1913,19 @@ export class AgentManager implements AgentController {
   }
 
   async cancel(input: AgentRefInput): Promise<unknown> {
-    const task = this.#require(input.agentRef);
+    let task = this.#require(input.agentRef);
+    if (task.terminal) return publicTask(task, true);
     const client = this.#sessions.get(task.agentRef);
-    if (task.terminal || !task.threadId || !task.turnId || !client) {
+    if (!client && this.#releasedRecoveryCandidate(task)) {
+      await this.#finalizeReleasedRecovery(
+        [task.agentRef],
+        'RECOVERY_SESSION_NOT_REATTACHED',
+        'stale_cancel',
+      );
+      task = this.#require(task.agentRef);
+      if (task.terminal) return publicTask(task, true);
+    }
+    if (!task.threadId || !task.turnId || !client) {
       throw new AgentError('AGENT_NOT_IDLE', 'Agent has no active turn.');
     }
     await client.request('turn/interrupt', {

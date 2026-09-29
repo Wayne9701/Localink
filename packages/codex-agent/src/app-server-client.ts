@@ -1,8 +1,11 @@
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 
-const MAX_LINE_BYTES = 1024 * 1024;
+// Codex can legitimately emit multi-megabyte JSON-RPC envelopes for large
+// tool results and diffs. Keep framing bounded independently from Localink's
+// much smaller persisted/public projections.
+const MAX_PROTOCOL_MESSAGE_BYTES = 8 * 1024 * 1024;
 const MAX_STDERR_CHARS = 32 * 1024;
-const MAX_STDIN_BUFFER_BYTES = 2 * 1024 * 1024;
+const MAX_STDIN_BUFFER_BYTES = MAX_PROTOCOL_MESSAGE_BYTES;
 const MAX_PENDING_REQUESTS = 128;
 const DEFAULT_REQUEST_TIMEOUT_MS = 15_000;
 const MAX_REQUEST_TIMEOUT_MS = 60_000;
@@ -275,7 +278,7 @@ export class ManagedAppServerClient {
     const encoded = JSON.stringify(message) + '\n';
     const bytes = Buffer.byteLength(encoded);
     if (
-      bytes > MAX_LINE_BYTES ||
+      bytes > MAX_PROTOCOL_MESSAGE_BYTES ||
       child.stdin.writableLength + bytes > MAX_STDIN_BUFFER_BYTES
     ) {
       throw new Error('App Server stdin buffer limit reached');
@@ -287,7 +290,7 @@ export class ManagedAppServerClient {
     if (this.#isClosing()) return;
     this.#stdoutBuffer += chunk;
     if (
-      Buffer.byteLength(this.#stdoutBuffer) > MAX_LINE_BYTES &&
+      Buffer.byteLength(this.#stdoutBuffer) > MAX_PROTOCOL_MESSAGE_BYTES &&
       !this.#stdoutBuffer.includes('\n')
     ) {
       this.#protocolFailure('App Server stdout line limit exceeded');
@@ -298,7 +301,7 @@ export class ManagedAppServerClient {
       if (newline < 0) break;
       const line = this.#stdoutBuffer.slice(0, newline);
       this.#stdoutBuffer = this.#stdoutBuffer.slice(newline + 1);
-      if (Buffer.byteLength(line) > MAX_LINE_BYTES) {
+      if (Buffer.byteLength(line) > MAX_PROTOCOL_MESSAGE_BYTES) {
         this.#protocolFailure('App Server stdout line limit exceeded');
         return;
       }
@@ -313,7 +316,7 @@ export class ManagedAppServerClient {
       this.#dispatch(message);
       if (this.#isClosing()) return;
     }
-    if (Buffer.byteLength(this.#stdoutBuffer) > MAX_LINE_BYTES) {
+    if (Buffer.byteLength(this.#stdoutBuffer) > MAX_PROTOCOL_MESSAGE_BYTES) {
       this.#protocolFailure('App Server stdout line limit exceeded');
     }
   }

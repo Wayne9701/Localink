@@ -38,10 +38,12 @@ readline.createInterface({input:process.stdin}).on('line', line => {
     process.exit(9);
   } else if (message.method === 'rpc-error') {
     send({jsonrpc:'2.0', id:message.id, error:{code:-32602, message:'fixture invalid params'}});
+  } else if (message.method === 'large-valid') {
+    send({jsonrpc:'2.0', id:message.id, result:{payload:'x'.repeat(2 * 1024 * 1024)}});
   } else if (message.method === 'oversize') {
     ignoreTerm = true;
     setInterval(() => {}, 1000);
-    process.stdout.write('x'.repeat(1024 * 1024 + 1));
+    process.stdout.write('x'.repeat(8 * 1024 * 1024 + 1));
   }
 });
 `;
@@ -195,6 +197,26 @@ test('RPC errors preserve official error code and malformed output cannot orphan
     assert.equal(typeof pid, 'number');
     const alive = spawnSync('/bin/kill', ['-0', String(pid)]);
     assert.notEqual(alive.status, 0);
+  } finally {
+    await client.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test('a valid two-megabyte JSON-RPC line is dispatched without crashing', async () => {
+  const { directory, executable } = await fixture();
+  const crashes: string[] = [];
+  const client = new ManagedAppServerClient({
+    executable,
+    onCrash: (reason) => crashes.push(reason),
+  });
+  try {
+    await client.start();
+    const result = (await client.request('large-valid', {})) as {
+      payload: string;
+    };
+    assert.equal(Buffer.byteLength(result.payload), 2 * 1024 * 1024);
+    assert.deepEqual(crashes, []);
   } finally {
     await client.close();
     await rm(directory, { recursive: true, force: true });

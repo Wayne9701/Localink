@@ -220,6 +220,10 @@ class FakeServer implements AppServerPort {
     });
   }
 
+  crash(reason = 'fixture App Server crash'): void {
+    this.callbacks.onCrash(reason);
+  }
+
   requestApproval(): void {
     const thread = [...this.state.threads.values()].find((candidate) =>
       candidate.turns.some((turn) => turn.status === 'inProgress'),
@@ -414,6 +418,56 @@ test('each active Agent owns one task App Server and different repos run in para
   }
 });
 
+test('execution contract is a stable suffix that preserves start and send user tasks', async () => {
+  const state = await fixture();
+  try {
+    const started = receipt(
+      await state.manager.start({
+        workspaceId: 'a',
+        taskTitle: 'Contract',
+        prompt: 'Exact user start task',
+      }),
+    );
+    const firstServer = state.official.latest(String(started.agentRef));
+    const firstTurn = firstServer.calls.find(
+      (call) => call.method === 'turn/start',
+    );
+    const firstText = String(
+      ((firstTurn?.params.input as Array<Record<string, unknown>>)[0] ?? {})
+        .text,
+    );
+    assert.ok(firstText.startsWith('Exact user start task\n\n'));
+    assert.ok(firstText.endsWith('</localink_execution_contract>'));
+    assert.match(firstText, /Keep verbose test stdout\/stderr/);
+    assert.match(firstText, /external supervisor after this Agent is terminal/);
+
+    firstServer.complete();
+    await eventually(
+      () =>
+        state.manager.show({
+          agentRef: String(started.agentRef),
+        }) as Promise<Receipt>,
+      (value) => value.officialSessionReleased === true,
+    );
+    await state.manager.send({
+      agentRef: String(started.agentRef),
+      message: 'Exact follow-up task',
+    });
+    const resumedServer = state.official.latest(String(started.agentRef));
+    const resumedTurn = resumedServer.calls.find(
+      (call) => call.method === 'turn/start',
+    );
+    const resumedText = String(
+      ((resumedTurn?.params.input as Array<Record<string, unknown>>)[0] ?? {})
+        .text,
+    );
+    assert.ok(resumedText.startsWith('Exact follow-up task\n\n'));
+    assert.ok(resumedText.endsWith('</localink_execution_contract>'));
+  } finally {
+    await state.cleanup();
+  }
+});
+
 test('terminal persists before teardown and releases the repo only after process exit', async () => {
   const state = await fixture();
   try {
@@ -447,6 +501,115 @@ test('terminal persists before teardown and releases the repo only after process
     await state.cleanup();
   }
 });
+
+test('large official output is bounded in public receipts and durable inventory', async () => {
+  const state = await fixture();
+  try {
+    const started = receipt(
+      await state.manager.start({
+        workspaceId: 'a',
+        taskTitle: 'Large result',
+        prompt: 'Return a large fixture result',
+      }),
+    );
+    state.official
+      .latest(String(started.agentRef))
+      .complete('x'.repeat(2 * 1024 * 1024));
+    const done = await eventually(
+      () =>
+        state.manager.show({
+          agentRef: String(started.agentRef),
+        }) as Promise<Receipt>,
+      (value) => value.officialSessionReleased === true,
+    );
+    assert.ok(Buffer.byteLength(String(done.finalResult)) <= 4100);
+    const inventory = await readFile(
+      path.join(state.root, 'state', 'codex-agent-inventory.json'),
+    );
+    assert.ok(inventory.byteLength < 64 * 1024);
+  } finally {
+    await state.cleanup();
+  }
+});
+
+test('protocol crash releases ownership and terminalizes as bounded recovery failure', async () => {
+  const state = await fixture();
+  try {
+    const started = receipt(
+      await state.manager.start({
+        workspaceId: 'a',
+        taskTitle: 'Protocol crash',
+        prompt: 'Stay active until the fixture crashes',
+      }),
+    );
+    const server = state.official.latest(String(started.agentRef));
+    server.crash('App Server stdout line limit exceeded');
+    const failed = await eventually(
+      () =>
+        state.manager.show({
+          agentRef: String(started.agentRef),
+        }) as Promise<Receipt>,
+      (value) => value.terminal === true,
+    );
+    assert.equal(failed.status, 'failed');
+    assert.equal(failed.taskStatus, 'failed');
+    assert.equal(failed.turnStatus, 'failed');
+    assert.equal(failed.lifecycleIntegrity, 'recovery_failed');
+    assert.equal(failed.latestError, 'APP_SERVER_PROTOCOL_LIMIT_EXCEEDED');
+    assert.equal(failed.officialSessionReleased, true);
+    assert.equal(failed.repoWriterReleased, true);
+    assert.equal(failed.taskAppServerState, 'stopped');
+    assert.equal(failed.recommendedAction, 'archive');
+    assert.equal(server.closes, 1);
+  } finally {
+    await state.cleanup();
+  }
+});
+
+for (const officialStatus of ['completed', 'failed', 'interrupted'] as const) {
+  test(`official ${officialStatus} truth wins after App Server loss`, async () => {
+    const state = await fixture();
+    try {
+      const started = receipt(
+        await state.manager.start({
+          workspaceId: 'a',
+          taskTitle: `Official ${officialStatus}`,
+          prompt: 'Lose the transport after official termination',
+        }),
+      );
+      const server = state.official.latest(String(started.agentRef));
+      const turn = server.thread(String(started.threadId)).turns.at(-1);
+      assert.ok(turn);
+      turn.status = officialStatus;
+      turn.items = [
+        { type: 'agentMessage', text: `OFFICIAL_${officialStatus}` },
+      ];
+      server.crash('fixture transport loss');
+      const terminal = await eventually(
+        () =>
+          state.manager.show({
+            agentRef: String(started.agentRef),
+          }) as Promise<Receipt>,
+        (value) => value.terminal === true,
+      );
+      assert.equal(
+        terminal.status,
+        officialStatus === 'completed'
+          ? 'completed'
+          : officialStatus === 'interrupted'
+            ? 'cancelled'
+            : 'failed',
+      );
+      assert.equal(terminal.turnStatus, officialStatus);
+      assert.equal(terminal.lifecycleIntegrity, 'confirmed');
+      assert.equal(terminal.finalResult, `OFFICIAL_${officialStatus}`);
+      assert.equal(terminal.officialSessionReleased, true);
+      assert.equal(terminal.repoWriterReleased, true);
+    } finally {
+      await state.cleanup();
+    }
+  });
+}
 
 test('teardown failure keeps the same-repo writer lock and blocks archive', async () => {
   const state = await fixture();
@@ -901,7 +1064,7 @@ test('terminal list/show reconcile external archive and unarchive without loadin
   }
 });
 
-test('restart normalizes persisted fake-running work without duplicating the task', async () => {
+test('restart reconciles persisted released work once and terminalizes stale ownership', async () => {
   const state = await fixture();
   let recovered: AgentManager | undefined;
   try {
@@ -912,15 +1075,95 @@ test('restart normalizes persisted fake-running work without duplicating the tas
         prompt: 'Remain running',
       }),
     );
+    await state.manager.close();
     recovered = await AgentManager.create(state.options);
     const shown = receipt(
       await recovered.show({ agentRef: String(started.agentRef) }),
     );
-    assert.equal(shown.status, 'unknown');
+    assert.equal(shown.status, 'failed');
+    assert.equal(shown.taskStatus, 'failed');
+    assert.equal(shown.turnStatus, 'failed');
+    assert.equal(shown.terminal, true);
+    assert.equal(shown.lifecycleIntegrity, 'recovery_failed');
+    assert.equal(shown.latestError, 'MANAGER_SHUTDOWN_INTERRUPTED');
     assert.equal(shown.officialSessionReleased, true);
     assert.equal(shown.repoWriterReleased, true);
+    assert.equal(shown.taskAppServerState, 'stopped');
+    assert.equal(shown.recommendedAction, 'archive');
     const listed = receipt(await recovered.list({}));
     assert.equal((listed.items as unknown[]).length, 1);
+    const recoveryServers = state.official.servers.filter(
+      (server) => server.agentRef === 'metadata',
+    );
+    assert.ok(recoveryServers.length >= 1);
+    assert.equal(
+      recoveryServers.some((server) =>
+        server.calls.some(
+          (call) =>
+            call.method === 'thread/resume' || call.method === 'turn/interrupt',
+        ),
+      ),
+      false,
+    );
+  } finally {
+    await recovered?.close();
+    await state.manager.close();
+    await rm(state.root, { recursive: true, force: true });
+  }
+});
+
+test('persisted stale cancel is idempotent and the finalized task can archive', async () => {
+  const state = await fixture();
+  let recovered: AgentManager | undefined;
+  try {
+    const started = receipt(
+      await state.manager.start({
+        workspaceId: 'a',
+        taskTitle: 'Stale cancel',
+        prompt: 'Remain running until restart',
+      }),
+    );
+    await state.manager.close();
+    recovered = await AgentManager.create(state.options);
+
+    const firstCancel = receipt(
+      await recovered.cancel({ agentRef: String(started.agentRef) }),
+    );
+    const secondCancel = receipt(
+      await recovered.cancel({ agentRef: String(started.agentRef) }),
+    );
+    assert.equal(firstCancel.terminal, true);
+    assert.equal(firstCancel.status, 'failed');
+    assert.equal(firstCancel.lifecycleIntegrity, 'recovery_failed');
+    assert.equal(secondCancel.nextSeq, firstCancel.nextSeq);
+    await assert.rejects(
+      recovered.send({
+        agentRef: String(started.agentRef),
+        message: 'Must not resume released recovery failure',
+      }),
+      (error: unknown) =>
+        typeof error === 'object' &&
+        error !== null &&
+        'code' in error &&
+        error.code === 'AGENT_NOT_IDLE',
+    );
+    assert.equal(
+      state.official.servers.some((server) =>
+        server.calls.some(
+          (call) =>
+            call.method === 'thread/resume' || call.method === 'turn/interrupt',
+        ),
+      ),
+      false,
+    );
+
+    const archived = receipt(
+      await recovered.archive({ agentRef: String(started.agentRef) }),
+    );
+    assert.equal(archived.archived, true);
+    assert.equal(archived.terminal, true);
+    assert.equal(archived.officialSessionReleased, true);
+    assert.equal(archived.repoWriterReleased, true);
   } finally {
     await recovered?.close();
     await state.manager.close();

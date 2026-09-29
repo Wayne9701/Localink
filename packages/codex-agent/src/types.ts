@@ -145,7 +145,7 @@ export interface AgentTask {
         readonly observedAt: string;
       }
     | undefined;
-  readonly lifecycleIntegrity: 'confirmed' | 'uncertain';
+  readonly lifecycleIntegrity: 'confirmed' | 'uncertain' | 'recovery_failed';
   readonly startedAt: string;
   readonly updatedAt: string;
   readonly lastProgressAt?: string | undefined;
