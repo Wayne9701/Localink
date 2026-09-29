@@ -104,12 +104,12 @@ printf '%s\\n' 'singular https://example.invalid/${secret} - enabled Unknown'
             'localagent.run',
             'localfs.inspect',
             'localgit.status',
-            'bigquery.query',
+            'bigquery.find_list_table_ids',
             'lark.im_search',
             'apple.sales_report',
             'bilibili.video_metrics',
             'singular.report',
-            'browser.open',
+            'codex.browser_read',
           ],
         },
         {
@@ -153,7 +153,9 @@ printf '%s\\n' 'singular https://example.invalid/${secret} - enabled Unknown'
       '-c',
       'mcp_servers.engineering-bridge.enabled=false',
       '-c',
-      'apps.asdk_codexless.tools={ "codex.agent_show" = { enabled = false }, "codex.agent_start" = { enabled = false }, "codex.command_exec" = { enabled = false }, "codex.precise_edit" = { enabled = false }, "localagent.run" = { enabled = false }, "localfs.inspect" = { enabled = false }, "localgit.status" = { enabled = false } }',
+      'apps.asdk_codexless.default_tools_enabled=false',
+      '-c',
+      'apps.asdk_codexless.tools={ "apple.sales_report" = { enabled = true }, "bigquery.find_list_table_ids" = { enabled = true }, "bilibili.video_metrics" = { enabled = true }, "codex.browser_read" = { enabled = true }, "codex.command_exec_extra" = { enabled = true }, "lark.im_search" = { enabled = true }, "singular.report" = { enabled = true } }',
       '-c',
       'apps.asdk_devspace.default_tools_enabled=false',
       '-c',
@@ -193,15 +195,34 @@ printf '%s\\n' 'singular https://example.invalid/${secret} - enabled Unknown'
     );
     assert.equal(codexlessOverrides.length, 1);
     for (const allowed of [
-      'bigquery.query',
+      'bigquery.find_list_table_ids',
       'lark.im_search',
       'apple.sales_report',
       'bilibili.video_metrics',
       'singular.report',
-      'browser.open',
+      'codex.browser_read',
       'codex.command_exec_extra',
     ]) {
-      assert.equal(codexlessOverrides[0]?.includes(allowed), false);
+      assert.equal(
+        codexlessOverrides[0]?.includes(
+          `${JSON.stringify(allowed)} = { enabled = true }`,
+        ),
+        true,
+      );
+    }
+    for (const denied of [
+      'codex.agent_show',
+      'codex.agent_start',
+      'codex.command_exec',
+      'codex.precise_edit',
+      'localagent.run',
+      'localfs.inspect',
+      'localgit.status',
+    ]) {
+      assert.equal(
+        codexlessOverrides[0]?.includes(`${JSON.stringify(denied)} =`),
+        false,
+      );
     }
   } finally {
     await rm(root, { recursive: true, force: true });
@@ -252,7 +273,7 @@ printf '%s\\n' 'bigquery /bin/toolbox - - - enabled Unsupported'
   }
 });
 
-test('official app/read tool names generate one Codexless TOML table and retain no metadata', async () => {
+test('official app/read generates Codexless default deny plus one safe-tools table', async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'localink-profile-'));
   const executable = path.join(root, 'fake-codex');
   const secret = 'MUST_NOT_SURVIVE_APP_READ';
@@ -290,7 +311,12 @@ test('official app/read tool names generate one Codexless TOML table and retain 
             {
               name: 'bigquery.query',
               description: secret,
-              isEnabled: true,
+              isEnabled: false,
+            },
+            {
+              name: 'codex.browser_read',
+              description: secret,
+              isEnabled: false,
             },
           ],
         },
@@ -304,11 +330,13 @@ test('official app/read tool names generate one Codexless TOML table and retain 
       '-c',
       'mcp_servers.engineering-bridge.enabled=false',
       '-c',
-      'apps.dynamic_codexless.tools={ "codex.agent_start" = { enabled = false }, "codex.command_exec" = { enabled = false } }',
+      'apps.dynamic_codexless.default_tools_enabled=false',
+      '-c',
+      'apps.dynamic_codexless.tools={ "bigquery.query" = { enabled = true }, "codex.browser_read" = { enabled = true } }',
     ]);
     assert.equal(JSON.stringify(projection).includes(secret), false);
     assert.equal(
-      projection.launchArgs.some((arg) => arg.includes('bigquery.query')),
+      projection.launchArgs.some((arg) => arg.includes('codex.agent_start')),
       false,
     );
   } finally {
@@ -403,7 +431,7 @@ printf '%s\\n' 'bigquery /bin/toolbox - - - enabled Unsupported'
   }
 });
 
-test('capability projection fails closed on oversized Codexless tool metadata', async () => {
+test('capability projection fails closed on oversized Codexless tool count or launch arg', async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'localink-profile-'));
   const executable = path.join(root, 'fake-codex');
   await writeFile(
@@ -426,6 +454,26 @@ printf '%s\\n' 'bigquery /bin/toolbox - - - enabled Unsupported'
             { length: 1025 },
             (_, index) => `tool.${index}`,
           ),
+        },
+      ]),
+      (error: unknown) =>
+        typeof error === 'object' &&
+        error !== null &&
+        'code' in error &&
+        error.code === 'CAPABILITY_ISOLATION_UNAVAILABLE',
+    );
+    const maximumLengthToolNames = Array.from({ length: 1024 }, (_, index) => {
+      const prefix = `safe.${index}.`;
+      return prefix + 'x'.repeat(256 - Buffer.byteLength(prefix));
+    });
+    await assert.rejects(
+      projectCodexNativeCapabilities(executable, undefined, async () => [
+        {
+          id: 'dynamic_codexless',
+          runtimeName: 'Codexless',
+          enabled: true,
+          callable: true,
+          codexlessToolNames: maximumLengthToolNames,
         },
       ]),
       (error: unknown) =>

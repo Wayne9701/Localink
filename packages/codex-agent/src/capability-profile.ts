@@ -107,7 +107,12 @@ export async function projectCodexNativeCapabilities(
   const appLaunchArgs = restrictedApps.flatMap((app) => {
     const runtimeName = app.runtimeName.trim().toLowerCase();
     if (runtimeName === CODEXLESS_APP_NAME) {
-      return ['-c', codexlessToolsOverride(app)];
+      return [
+        '-c',
+        `apps.${app.id}.default_tools_enabled=false`,
+        '-c',
+        codexlessToolsOverride(app),
+      ];
     }
     if (DEFAULT_DISABLED_APP_NAMES.has(runtimeName)) {
       return ['-c', `apps.${app.id}.default_tools_enabled=false`];
@@ -335,9 +340,11 @@ function codexlessToolsOverride(app: InstalledCodexApp): string {
   if (app.codexlessToolNames === undefined) {
     throw isolationError('Codexless tool metadata is unavailable.');
   }
-  const deniedTools = app.codexlessToolNames.filter(isDeniedCodexlessTool);
-  const entries = deniedTools.map(
-    (name) => `${JSON.stringify(name)} = { enabled = false }`,
+  const safeTools = app.codexlessToolNames.filter(
+    (name) => !isDeniedCodexlessTool(name),
+  );
+  const entries = safeTools.map(
+    (name) => `${JSON.stringify(name)} = { enabled = true }`,
   );
   const override = `apps.${app.id}.tools={${entries.length > 0 ? ` ${entries.join(', ')} ` : ''}}`;
   if (Buffer.byteLength(override) > MAX_TOOLS_OVERRIDE_BYTES) {
