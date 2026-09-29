@@ -32,6 +32,7 @@ export const EXTERNAL_MCP_LIMITS = {
   totalArgumentBytes: 32 * 1024,
   schemaBytes: 64 * 1024,
   connectTimeoutMs: 5_000,
+  stdioConnectTimeoutMs: 15_000,
   callTimeoutMs: 30_000,
   transportBufferBytes: 1024 * 1024,
   richMetadataBytes: 64 * 1024,
@@ -491,6 +492,12 @@ function providerEnvironment(
   return selected;
 }
 
+function providerConnectTimeoutMs(provider: ExternalMcpProvider): number {
+  return provider.transport === 'stdio'
+    ? EXTERNAL_MCP_LIMITS.stdioConnectTimeoutMs
+    : EXTERNAL_MCP_LIMITS.connectTimeoutMs;
+}
+
 async function assertExecutable(command: string): Promise<void> {
   const info = await stat(command);
   if (!info.isFile()) throw new Error('not-file');
@@ -749,6 +756,7 @@ export class ExternalMcpManager {
         captureStdioStderr(stdioTransport);
         transport = stdioTransport;
       }
+      const connectTimeoutMs = providerConnectTimeoutMs(provider);
       const client = new Client(
         {
           name: `localink-provider-${provider.id}`,
@@ -757,7 +765,7 @@ export class ExternalMcpManager {
         {
           versionNegotiation: {
             mode: 'auto',
-            probe: { timeoutMs: EXTERNAL_MCP_LIMITS.connectTimeoutMs },
+            probe: { timeoutMs: connectTimeoutMs },
           },
         },
       );
@@ -765,7 +773,7 @@ export class ExternalMcpManager {
       if (provider.transport === 'stdio') initializationStage = 'connect';
       await within(
         client.connect(transport),
-        EXTERNAL_MCP_LIMITS.connectTimeoutMs,
+        connectTimeoutMs,
         'provider-connect-timeout',
       );
       if (provider.transport === 'stdio') initializationStage = 'list';
